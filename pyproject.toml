@@ -7,7 +7,7 @@ name = "aegra"
 version = "0.1.0"
 description = "Open source LangGraph Platform alternative - Self-hosted AI agent backend with FastAPI and PostgreSQL. Zero vendor lock-in, full control over your agent infrastructure."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 keywords = ["langgraph", "ai-agents", "self-hosted", "agent-backend", "fastapi", "postgresql", "langchain", "agent-protocol"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -28,21 +28,27 @@ maintainers = [
 dependencies = [
     "alembic>=1.16.4",
     "asyncpg>=0.30.0",
-    "fastapi>=0.116.1",
+    "fastapi",
     "greenlet>=3.2.3",
-    "langchain-openai>=1.0.3",
-    "langgraph>=1.0.3",
-    "langchain>=1.0.8",
-    "langgraph-checkpoint-postgres>=2.0.23",
+    "langchain-openai",
+    "langgraph",
+    "langchain",
+    "langgraph-checkpoint-postgres",
     "psycopg[binary]>=3.2.9",
     "pydantic>=2.11.7",
     "pyjwt>=2.10.1",
     "python-dotenv>=1.1.1",
     "sqlalchemy>=2.0.0",
     "uvicorn>=0.35.0",
-    "langfuse>=3.3.4",
+    "langfuse>=3.11",
     "structlog>=25.4.0",
     "asgi-correlation-id>=4.3.4",
+    "langchain-ollama",
+    "httpx[socks]>=0.28.1",
+    "deepagents",
+    "tavily-python>=0.7.16",
+    "llms-txt>=0.0.4",
+    "mcp>=1.24.0",
 ]
 
 [project.urls]
