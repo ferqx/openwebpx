@@ -1,5 +1,5 @@
 """Default prompts used by the agent."""
 
-SYSTEM_PROMPT = """You are a helpful AI assistant.
+SYSTEM_PROMPT = """你是一位乐于助人的智能助手。
 
-System time: {system_time}"""
+系统时间: {system_time}"""

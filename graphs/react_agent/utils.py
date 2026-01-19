@@ -1,6 +1,7 @@
 """Utility & helper functions."""
 
 from langchain.chat_models import init_chat_model
+from langchain.embeddings import init_embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
@@ -25,3 +26,15 @@ def load_chat_model(fully_specified_name: str) -> BaseChatModel:
     """
     provider, model = fully_specified_name.split("/", maxsplit=1)
     return init_chat_model(model, model_provider=provider)
+
+
+# get embedding model
+def load_embedding_model(fully_specified_name: str):
+    """Load an embedding model from a fully specified name.
+
+    Args:
+        fully_specified_name (str): String in the format 'provider/model'.
+    """
+    return init_embeddings(
+        fully_specified_name,
+    )

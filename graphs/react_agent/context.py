@@ -22,10 +22,20 @@ class Context:
     )
 
     model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="ollama/qwen3:30b-a3b",
+        default="openai/minimaxai/minimax-m2",
         metadata={
             "description": "The name of the language model to use for the agent's main interactions. "
             "Should be in the form: provider/model-name."
+        },
+    )
+
+    embedding_model: Annotated[
+        str, {"__template_metadata__": {"kind": "embedding"}}
+    ] = field(
+        default="ollama:qwen3-embedding:0.6b",
+        metadata={
+            "description": "The name of the embedding model to use for document embeddings. "
+            "Should be in the form: provider:model-name."
         },
     )
 

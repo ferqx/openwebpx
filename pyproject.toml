@@ -49,6 +49,14 @@ dependencies = [
     "tavily-python>=0.7.16",
     "llms-txt>=0.0.4",
     "mcp>=1.24.0",
+    "langchain-community>=0.4.1",
+    "requests>=2.32.5",
+    "tiktoken>=0.12.0",
+    "langchain-text-splitters>=1.1.0",
+    "python-gitlab>=7.0.0",
+    "qdrant-client>=1.16.2",
+    "langchain-classic>=1.0.0",
+    "langchain-qdrant>=1.1.0",
 ]
 
 [project.urls]
@@ -110,7 +118,7 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
