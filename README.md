@@ -25,11 +25,54 @@ Replace LangGraph Platform with your own infrastructure. Built with FastAPI + Po
 
 ## 🆕 What's New
 
+- **🗂️ [Semantic Store](docs/semantic-store.md)**: Vector embeddings with pgvector for semantic similarity search in your agent memory
+- **📦 [Dependencies Config](docs/dependencies.md)**: Add shared utility modules to Python path for graph imports
 - **🎨 LangGraph Studio Support**: Full compatibility with LangGraph Studio for visual graph debugging and development
 - **🤖 AG-UI / CopilotKit Support**: Seamless integration with AG-UI and CopilotKit-based clients for enhanced user experiences
 - **⬆️ LangGraph v1.0.0**: Upgraded to LangGraph and LangChain v1.0.0 with latest features and improvements
 - **🤝 Human-in-the-Loop**: Interactive agent workflows with approval gates and user intervention points
 - **📊 [Langfuse Integration](docs/langfuse-usage.md)**: Complete observability and tracing for your agent runs
+
+
+## ⚠️ Important: Upgrade to PostgreSQL 18
+
+**Update (Jan 2026):** We have upgraded the database from PostgreSQL 15 to 18. This is a **breaking change** for existing local environments.
+
+If you are a **new user**, simply run `docker compose up` and ignore this section.
+
+If you have **existing data**, you must migrate your database, otherwise, the container will fail to start.
+
+### 🔄 Migration Guide (Preserve Data)
+
+**1. Backup your data (Before pulling new changes)**
+While your v15 container is still running:
+```bash
+docker compose exec -T postgres pg_dumpall -c -U user > dump.sql
+```
+**2. Remove the old volume The internal file structure has changed in v18. You must delete the old volume to let Docker create a fresh one.**
+```
+# Option A: Delete all volumes (Simplest)
+docker compose down -v
+
+# Option B: Delete only Postgres volume (If you need to keep Redis data)
+docker volume rm aegra_postgres_data
+
+# ⚠️ This deletes the old database volume. Ensure you have the dump from Step 1.
+```
+**3. Update and Start DB Only Pull the changes and start only the database. Do not start the full app yet, or it will create empty tables and conflict with your restore.**
+```
+git pull origin main
+docker compose up -d postgres
+```
+**4. Restore Data Wait a few seconds for the database to initialize, then restore your data:**
+```
+cat dump.sql | docker compose exec -T postgres psql -U user -d postgres
+```
+**5. Start Application Now that the data is restored, stop the temporary session and start the full stack:**
+```
+docker compose down
+docker compose up -d
+```
 
 
 ## 🔥 Why Aegra vs LangGraph Platform?
@@ -292,16 +335,41 @@ cp .env.example .env
 ```
 
 ```bash
+# --- Application Settings ---
+PROJECT_NAME=Aegra
+VERSION="0.1.0"
+DEBUG=true
+
+# [MANDATORY] Path to the main agent configuration file
+AEGRA_CONFIG=
+
 # Database
+POSTGRES_USER=user
+POSTGRES_PASSWORD=password
+POSTGRES_DB=aegra
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+
 DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/aegra
+DATABASE_ECHO=false
+
+# --- Connection Pools ---
+# SQLAlchemy (Metadata & App)
+SQLALCHEMY_POOL_SIZE=2
+SQLALCHEMY_MAX_OVERFLOW=0
+
+# LangGraph (Agent Runtime)
+LANGGRAPH_MIN_POOL_SIZE=1
+LANGGRAPH_MAX_POOL_SIZE=6
 
 # Authentication (extensible)
 AUTH_TYPE=noop  # noop, custom
 
-# Server
+# Server Configuration
 HOST=0.0.0.0
 PORT=8000
 DEBUG=true
+SERVER_URL=http://localhost:8000
 
 # Logging
 LOG_LEVEL=INFO
@@ -313,7 +381,8 @@ OPENAI_API_KEY=sk-...
 # ANTHROPIC_API_KEY=...
 # TOGETHER_API_KEY=...
 
-LANGFUSE_LOGGING=true
+# --- Observability (Langfuse) ---
+LANGFUSE_LOGGING=false
 LANGFUSE_SECRET_KEY=sk-...
 LANGFUSE_PUBLIC_KEY=pk-...
 LANGFUSE_HOST=https://cloud.langfuse.com
@@ -330,6 +399,51 @@ LANGFUSE_HOST=https://cloud.langfuse.com
   }
 }
 ```
+
+### Dependencies (Optional)
+
+Add shared utility modules to the Python path for graph imports:
+
+```json
+{
+  "graphs": { ... },
+  "dependencies": [
+    "./shared",
+    "./libs/common"
+  ]
+}
+```
+
+Paths are resolved relative to the config file. This matches LangGraph CLI behavior.
+
+📚 **[Full Documentation](docs/dependencies.md)** - Path resolution, use cases, and examples.
+
+### Semantic Store (Optional)
+
+Enable semantic similarity search for your agent's memory using pgvector:
+
+```json
+{
+  "graphs": { ... },
+  "store": {
+    "index": {
+      "dims": 1536,
+      "embed": "openai:text-embedding-3-small",
+      "fields": ["$"]
+    }
+  }
+}
+```
+
+**Options:** `dims` (required), `embed` (required), `fields` (optional, default `["$"]`)
+
+**Supported embedding providers:**
+- `openai:text-embedding-3-small` (1536 dims)
+- `openai:text-embedding-3-large` (3072 dims)
+- `bedrock:amazon.titan-embed-text-v2:0` (1024 dims)
+- `cohere:embed-english-v3.0` (1024 dims)
+
+📚 **[Full Documentation](docs/semantic-store.md)** - Configuration, usage examples, and troubleshooting.
 
 ## 🎯 What You Get
 
