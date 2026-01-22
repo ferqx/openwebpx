@@ -22,7 +22,7 @@ class Context:
     )
 
     model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="openai/minimaxai/minimax-m2",
+        default="openai/deepseek-chat",
         metadata={
             "description": "The name of the language model to use for the agent's main interactions. "
             "Should be in the form: provider/model-name."
