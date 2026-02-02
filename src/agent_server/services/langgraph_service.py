@@ -1,8 +1,16 @@
-"""LangGraph integration service with official patterns"""
+"""LangGraph integration service.
+
+Architecture:
+- Base graph definitions are cached (safe, immutable)
+- Each request gets a fresh graph copy with checkpointer/store injected
+- Thread-safe by design without locks
+"""
 
 import importlib.util
 import json
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid5
@@ -11,24 +19,33 @@ import structlog
 from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
 
+from src.agent_server.constants import ASSISTANT_NAMESPACE_UUID
+from src.agent_server.observability.base import (
+    get_tracing_callbacks,
+    get_tracing_metadata,
+)
 from src.agent_server.settings import settings
-
-from ..constants import ASSISTANT_NAMESPACE_UUID
-from ..observability.base import get_tracing_callbacks, get_tracing_metadata
 
 State = TypeVar("State")
 logger = structlog.get_logger(__name__)
 
 
 class LangGraphService:
-    """Service to work with LangGraph CLI configuration and graphs"""
+    """Service to work with LangGraph CLI configuration and graphs.
+
+    Architecture:
+    - Caches base graph definitions (raw StateGraph/Pregel before checkpointer)
+    - Yields fresh copies per-request with checkpointer/store injected
+    - Thread-safe without locks via immutable cached state
+    """
 
     def __init__(self, config_path: str = "aegra.json"):
         # Default path can be overridden via AEGRA_CONFIG or by placing aegra.json
         self.config_path = Path(config_path)
         self.config: dict[str, Any] | None = None
         self._graph_registry: dict[str, Any] = {}
-        self._graph_cache: dict[str, Any] = {}
+        # Cache for base graph definitions (without checkpointer/store)
+        self._base_graph_cache: dict[str, Pregel] = {}
 
     async def initialize(self):
         """Load configuration file and setup graph registry.
@@ -177,53 +194,96 @@ class LangGraphService:
         finally:
             await session.close()
 
-    async def get_graph(self, graph_id: str, force_reload: bool = False) -> Pregel:
-        """Get a compiled graph by ID with caching and LangGraph integration"""
+    async def _get_base_graph(self, graph_id: str) -> Pregel:
+        """Get the base compiled graph without checkpointer/store.
+
+        Caches the compiled graph structure for reuse. This is safe because
+        the base graph is immutable - we create copies with checkpointer/store
+        injected per-request.
+
+        @param graph_id: The graph identifier from aegra.json
+        @returns: Compiled Pregel graph (without checkpointer/store)
+        @raises ValueError: If graph_id not found or loading fails
+        """
         if graph_id not in self._graph_registry:
             raise ValueError(f"Graph not found: {graph_id}")
 
-        # Return cached graph if available and not forcing reload
-        if not force_reload and graph_id in self._graph_cache:
-            return self._graph_cache[graph_id]
+        # Return cached base graph if available
+        if graph_id in self._base_graph_cache:
+            return self._base_graph_cache[graph_id]
 
         graph_info = self._graph_registry[graph_id]
 
         # Load graph from file
-        base_graph = await self._load_graph_from_file(graph_id, graph_info)
+        raw_graph = await self._load_graph_from_file(graph_id, graph_info)
 
-        # Always ensure graphs are compiled with our Postgres checkpointer for persistence
+        # Compile if it's a StateGraph
+        if isinstance(raw_graph, StateGraph):
+            logger.info(f"🔧 Compiling graph '{graph_id}'")
+            compiled_graph = raw_graph.compile()
+        else:
+            compiled_graph = raw_graph
+
+        # Cache the base compiled graph (without checkpointer/store)
+        self._base_graph_cache[graph_id] = compiled_graph
+        return compiled_graph
+
+    @asynccontextmanager
+    async def get_graph(self, graph_id: str) -> AsyncIterator[Pregel]:
+        """Get a graph instance for execution with checkpointer/store injected.
+
+        This is a context manager that yields a fresh graph copy per-request.
+        Thread-safe without locks since each request gets its own instance.
+
+        Usage:
+            async with langgraph_service.get_graph("react_agent") as graph:
+                async for event in graph.astream(input, config):
+                    ...
+
+        @param graph_id: The graph identifier from aegra.json
+        @yields: Compiled Pregel graph with Postgres checkpointer/store attached
+        @raises ValueError: If graph_id not found or loading fails
+        """
+        # Get the cached base graph
+        base_graph = await self._get_base_graph(graph_id)
+
+        # Get checkpointer and store for this request
         from ..core.database import db_manager
 
-        checkpointer_cm = db_manager.get_checkpointer()
-        store_cm = db_manager.get_store()
+        checkpointer = db_manager.get_checkpointer()
+        store = db_manager.get_store()
 
-        if isinstance(base_graph, StateGraph):
-            # The module exported an *uncompiled* StateGraph – compile it now with
-            # a Postgres checkpointer for durable state.
-
-            logger.info(f"🔧 Compiling graph '{graph_id}' with Postgres persistence")
-            compiled_graph = base_graph.compile(
-                checkpointer=checkpointer_cm, store=store_cm
+        # Try to create a copy with checkpointer/store injected.
+        # NOTE: Do this BEFORE yield to avoid dual-yield when exceptions occur
+        # in the context body - @asynccontextmanager would call athrow() and
+        # catch it in except, causing "generator didn't stop after athrow()".
+        try:
+            graph_to_use = base_graph.copy(
+                update={"checkpointer": checkpointer, "store": store}
             )
-        else:
-            # Graph was already compiled by the module.  Create a shallow copy
-            # that injects our Postgres checkpointer *unless* the author already
-            # set one.
-            try:
-                compiled_graph = base_graph.copy(
-                    update={"checkpointer": checkpointer_cm, "store": store_cm}
-                )
-            except Exception:
-                # Fallback: property may be immutably set; run as-is with warning
-                logger.warning(
-                    f"⚠️  Pre-compiled graph '{graph_id}' does not support checkpointer injection; running without persistence"
-                )
-                compiled_graph = base_graph
+        except Exception:
+            # Graph doesn't support copy with these attrs (e.g., immutable property)
+            logger.warning(
+                f"⚠️  Graph '{graph_id}' does not support checkpointer injection; "
+                "running without persistence"
+            )
+            graph_to_use = base_graph
 
-        # Cache the compiled graph
-        self._graph_cache[graph_id] = compiled_graph
+        yield graph_to_use
 
-        return compiled_graph
+    async def get_graph_for_validation(self, graph_id: str) -> Pregel:
+        """Get a graph instance for validation/schema extraction only.
+
+        Use this when you only need to validate that a graph exists and can be
+        loaded, or to extract schemas. Does NOT include checkpointer/store.
+
+        For actual execution, use the `get_graph()` context manager instead.
+
+        @param graph_id: The graph identifier from aegra.json
+        @returns: Compiled Pregel graph (without checkpointer/store)
+        @raises ValueError: If graph_id not found or loading fails
+        """
+        return await self._get_base_graph(graph_id)
 
     async def _load_graph_from_file(self, graph_id: str, graph_info: dict[str, str]):
         """Load graph from filesystem"""
@@ -264,11 +324,14 @@ class LangGraphService:
         }
 
     def invalidate_cache(self, graph_id: str = None):
-        """Invalidate graph cache for hot-reload"""
+        """Invalidate graph cache for hot-reload.
+
+        @param graph_id: Specific graph to invalidate, or None to clear all
+        """
         if graph_id:
-            self._graph_cache.pop(graph_id, None)
+            self._base_graph_cache.pop(graph_id, None)
         else:
-            self._graph_cache.clear()
+            self._base_graph_cache.clear()
 
     def get_config(self) -> dict[str, Any] | None:
         """Get loaded configuration"""
@@ -303,9 +366,23 @@ def get_langgraph_service() -> LangGraphService:
     return _langgraph_service
 
 
-def inject_user_context(user, base_config: dict = None) -> dict:
-    """Inject user context into LangGraph configuration for user isolation"""
-    config = (base_config or {}).copy()
+def inject_user_context(
+    user: Any | None, base_config: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Inject user context into LangGraph configuration for user isolation.
+
+    Passes ALL user fields (including custom auth handler fields like
+    subscription_tier, team_id, etc.) to the graph config under
+    'langgraph_auth_user'.
+
+    Args:
+        user: User object with identity and optional extra fields
+        base_config: Base configuration to extend
+
+    Returns:
+        Configuration dict with user context injected
+    """
+    config: dict[str, Any] = (base_config or {}).copy()
     config["configurable"] = config.get("configurable", {})
 
     # All user-related data injection (only if user exists)
@@ -313,15 +390,16 @@ def inject_user_context(user, base_config: dict = None) -> dict:
         # Basic user identity for multi-tenant scoping
         config["configurable"].setdefault("user_id", user.identity)
         config["configurable"].setdefault(
-            "user_display_name", getattr(user, "display_name", user.identity)
+            "user_display_name", getattr(user, "display_name", None) or user.identity
         )
 
-        # Full auth payload for graph nodes
+        # Full auth payload for graph nodes - includes ALL fields from auth handler
         if "langgraph_auth_user" not in config["configurable"]:
             try:
-                config["configurable"]["langgraph_auth_user"] = user.to_dict()  # type: ignore[attr-defined]
+                # user.to_dict() returns all fields including extras from auth handlers
+                config["configurable"]["langgraph_auth_user"] = user.to_dict()
             except Exception:
-                # Fallback: minimal dict if to_dict unavailable
+                # Fallback: minimal dict if to_dict unavailable or fails
                 config["configurable"]["langgraph_auth_user"] = {
                     "identity": user.identity
                 }
