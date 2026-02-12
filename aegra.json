@@ -2,5 +2,9 @@
   "graphs": {
     "agent": "./graphs/react_agent/graph.py:graph",
     "build_app_agent": "./graphs/build_app_agent/agent.py:agent"
+  },
+  "http": {
+    "app": "./app.py:app",
+    "enable_custom_route_auth": true
   }
 }
