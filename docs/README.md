@@ -18,6 +18,7 @@ Welcome to the Aegra documentation! Here you'll find everything you need to get 
 - **[Configuration](configuration.md)** - Complete configuration reference for aegra.json
 - **[Authentication & Authorization](authentication.md)** - Configure authentication and authorization handlers
 - **[Custom Routes](custom-routes.md)** - Add custom FastAPI endpoints
+- **[Sandbox Runtime Debug Guide](sandbox-runtime-debug-guide.md)** - Docker 沙盒自动运行、Runtime 诊断与 Debug 聚合接口使用指南
 
 ## Observability
 

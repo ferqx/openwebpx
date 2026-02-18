@@ -4,7 +4,7 @@
     "build_app_agent": "./graphs/build_app_agent/agent.py:agent"
   },
   "http": {
-    "app": "./app.py:app",
+    "app": "./app/main.py:app",
     "enable_custom_route_auth": true
   }
 }

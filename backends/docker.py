@@ -1,10 +1,9 @@
-"""DockerBackend: Sandbox backend using docker-py for containerized execution.
+"""DockerBackend: 使用docker-py进行容器化执行的沙箱后端。
 
-This backend assumes a Docker container already exists and is identified by a
-container ID stored in runtime state. It provides file operations and command
-execution within that container.
+该后端假设Docker容器已存在，并通过运行时状态中存储的容器ID进行标识。
+它提供在该容器内的文件操作和命令执行功能。
 
-The container lifecycle (creation, cleanup) is managed by DockerMiddleware.
+容器的生命周期（创建、清理）由DockerMiddleware管理。
 """
 
 from __future__ import annotations
@@ -33,19 +32,18 @@ logger = logging.getLogger(__name__)
 
 
 class DockerBackend(BaseSandbox):
-    """Sandbox backend that runs commands in an existing Docker container.
+    """在现有Docker容器中运行命令的沙箱后端。
 
-    This backend expects a container ID to be present in runtime state under
-    the key "docker_container_id". It will use that container for all operations.
-    If the container ID is missing or invalid, operations will fail.
+    该后端期望运行时状态中存在键为"container_id"的容器ID。
+    它将使用该容器进行所有操作。
+    如果容器ID缺失或无效，操作将失败。
 
-    The backend does NOT create or destroy containers; that responsibility lies
-    with the DockerMiddleware.
+    该后端不创建或销毁容器；该职责由DockerMiddleware负责。
 
     Attributes:
-        runtime: ToolRuntime instance for accessing state.
-        workdir: Working directory inside the container (default: /workspace).
-        client: Docker client instance.
+        runtime: 用于访问状态的ToolRuntime实例。
+        workdir: 容器内的工作目录（默认：/workspace）。
+        client: Docker客户端实例。
     """
 
     def __init__(
@@ -54,12 +52,12 @@ class DockerBackend(BaseSandbox):
         *,
         workdir: str = "/workspace",
     ) -> None:
-        """Initialize DockerBackend.
+        """初始化DockerBackend。
 
         Args:
-            runtime: ToolRuntime instance providing state access.
-            workdir: Working directory inside the container.
-            **kwargs: Ignored (for compatibility).
+            runtime: 提供状态访问的ToolRuntime实例。
+            workdir: 容器内的工作目录。
+            **kwargs: 忽略（用于兼容性）。
         """
         super().__init__()
         self.runtime = runtime
@@ -69,7 +67,7 @@ class DockerBackend(BaseSandbox):
 
     @property
     def client(self) -> docker.DockerClient:
-        """Lazy-loaded Docker client."""
+        """延迟加载的Docker客户端。"""
         if self._client is None:
             try:
                 self._client = docker.from_env()
@@ -82,13 +80,13 @@ class DockerBackend(BaseSandbox):
 
     @property
     def container(self) -> Container:
-        """Get the Docker container from runtime state.
+        """从运行时状态获取Docker容器。
 
         Returns:
-            The Docker container object.
+            Docker容器对象。
 
         Raises:
-            RuntimeError: If container ID is missing or container not found.
+            RuntimeError: 如果容器ID缺失或容器未找到。
         """
         if self._container is not None:
             return self._container
@@ -115,17 +113,17 @@ class DockerBackend(BaseSandbox):
 
     @property
     def id(self) -> str:
-        """Unique identifier for the sandbox backend instance."""
+        """沙箱后端实例的唯一标识符。"""
         return f"docker:{self.container.id}"
 
     def execute(self, command: str) -> ExecuteResponse:
-        """Execute a command in the Docker container.
+        """在Docker容器中执行命令。
 
         Args:
-            command: Shell command to execute.
+            command: 要执行的shell命令。
 
         Returns:
-            ExecuteResponse with combined stdout/stderr output and exit code.
+            包含合并的stdout/stderr输出和退出码的ExecuteResponse。
         """
         container = self.container
         try:
@@ -154,30 +152,37 @@ class DockerBackend(BaseSandbox):
             )
 
     async def aexecute(self, command: str) -> ExecuteResponse:
-        """Async version of execute."""
+        """在Docker容器中异步执行命令。
+
+        Args:
+            command: 要执行的shell命令。
+
+        Returns:
+            ExecuteResponse，包含合并的stdout/stderr输出和退出码。
+        """
         return await asyncio.to_thread(self.execute, command)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        """Upload multiple files to the container.
+        """上传多个文件到容器。
 
-        Uses docker cp to copy files into the container.
+        使用docker cp将文件复制到容器中。
 
         Args:
-            files: List of (path, content) tuples.
+            files: (路径, 内容) 元组列表。
 
         Returns:
-            List of FileUploadResponse objects.
+            FileUploadResponse对象列表。
         """
         container = self.container
         responses: list[FileUploadResponse] = []
         for path, content in files:
             try:
-                # Ensure parent directory exists
+                # 确保父目录存在
                 dir_path = Path(path).parent
                 if dir_path != Path():
                     self.execute(f"mkdir -p {shlex.quote(str(dir_path))}")
 
-                # Create tar archive in memory
+                # 在内存中创建tar归档
                 import io
                 import tarfile
 
@@ -189,7 +194,7 @@ class DockerBackend(BaseSandbox):
                     tar.addfile(tarinfo, io.BytesIO(content))
                 tar_stream.seek(0)
 
-                # Use put_archive to extract into container
+                # 使用put_archive解压到容器中
                 container.put_archive(str(Path(path).parent), tar_stream)
                 responses.append(FileUploadResponse(path=path, error=None))
             except Exception as e:
@@ -202,19 +207,28 @@ class DockerBackend(BaseSandbox):
     async def aupload_files(
         self, files: list[tuple[str, bytes]]
     ) -> list[FileUploadResponse]:
-        """Async version of upload_files."""
+        """异步上传多个文件到容器。
+
+        使用docker cp将文件复制到容器中。
+
+        Args:
+            files: (路径, 内容) 元组列表。
+
+        Returns:
+            FileUploadResponse对象列表。
+        """
         return await asyncio.to_thread(self.upload_files, files)
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        """Download multiple files from the container.
+        """从容器下载多个文件。
 
-        Uses docker cp to copy files from the container.
+        使用docker cp从容器复制文件。
 
         Args:
-            paths: List of file paths to download.
+            paths: 要下载的文件路径列表。
 
         Returns:
-            List of FileDownloadResponse objects.
+            FileDownloadResponse对象列表。
         """
         container = self.container
         responses: list[FileDownloadResponse] = []
@@ -253,5 +267,14 @@ class DockerBackend(BaseSandbox):
         return responses
 
     async def adownload_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        """Async version of download_files."""
+        """异步从容器下载多个文件。
+
+        使用docker cp从容器复制文件。
+
+        Args:
+            paths: 要下载的文件路径列表。
+
+        Returns:
+            FileDownloadResponse对象列表。
+        """
         return await asyncio.to_thread(self.download_files, paths)
