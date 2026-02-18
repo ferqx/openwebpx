@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import docker
 from docker.errors import DockerException, NotFound
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from langchain_core.runnables import RunnableConfig
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -104,6 +105,29 @@ def _extract_event_error_excerpt(event: str, data: dict[str, Any] | None) -> str
         return f"{event}: {str(data_dict)[:600]}"
 
     return None
+
+
+def _pick_preview_url(service_status: dict[str, Any] | None) -> str | None:
+    """从运行态中选择最优预览 URL。
+
+    选择策略：
+    1. 优先返回 HTTP 探测为 2xx/3xx 的 URL
+    2. 否则回退到首个可用 preview URL
+    """
+    if not isinstance(service_status, dict):
+        return None
+
+    preview_urls = service_status.get("preview_urls")
+    probes = service_status.get("preview_probes")
+    if not isinstance(preview_urls, list) or not preview_urls:
+        return None
+
+    if isinstance(probes, dict):
+        for url in preview_urls:
+            code = probes.get(url)
+            if isinstance(code, str) and code.isdigit() and 200 <= int(code) < 400:
+                return url
+    return preview_urls[0]
 
 
 async def _fetch_recent_run_events(
@@ -361,6 +385,65 @@ async def get_sandbox_debug_bundle(
             "has_runtime_diagnostic": bool(runtime.get("last_diagnostic_fingerprint")),
             "timestamp": datetime.utcnow().isoformat() + "Z",
         },
+    }
+
+
+@app.get("/custom/sandbox/threads/{thread_id}/preview")
+async def get_sandbox_preview(
+    thread_id: str,
+    redirect: bool = Query(
+        True,
+        description="Whether to return HTTP redirect to preview URL",
+    ),
+    path: str = Query(
+        "/",
+        description="Sub-path to append to preview URL (e.g. /src/main.jsx)",
+    ),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> Any:
+    # 复用 runtime 查询，确保 preview 路由与运行态数据源一致。
+    runtime = await get_sandbox_runtime(
+        thread_id=thread_id,
+        include_state_values=False,
+        log_lines=40,
+        errors_only=True,
+        include_container_details=False,
+        user=user,
+        session=session,
+    )
+    service_status = runtime.get("service_status")
+    base_url = _pick_preview_url(service_status)
+    if not base_url:
+        raise HTTPException(
+            409,
+            "Preview URL is unavailable. Service may not be running yet.",
+        )
+
+    # 统一 path 规范，避免出现双斜杠拼接。
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    target_url = f"{base_url.rstrip('/')}{normalized_path}"
+
+    if redirect:
+        # 默认重定向：前端可直接打开该 API，自动跳到真实端口。
+        return RedirectResponse(url=target_url, status_code=307)
+
+    # 非重定向模式：返回结构化信息，便于前端自己处理跳转。
+    return {
+        "thread_id": thread_id,
+        "preview_url": target_url,
+        "base_preview_url": base_url,
+        "runtime_status": runtime.get("status"),
+        "service_running": (
+            service_status.get("service_running")
+            if isinstance(service_status, dict)
+            else None
+        ),
+        "preview_probes": (
+            service_status.get("preview_probes")
+            if isinstance(service_status, dict)
+            else {}
+        ),
     }
 
 
