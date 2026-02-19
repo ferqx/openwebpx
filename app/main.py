@@ -4,6 +4,15 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import docker
+from aegra_api.core.auth_deps import get_current_user
+from aegra_api.core.orm import Run as RunORM
+from aegra_api.core.orm import RunEvent as RunEventORM
+from aegra_api.core.orm import Thread as ThreadORM
+from aegra_api.core.orm import get_session
+from aegra_api.services.langgraph_service import (
+    create_thread_config,
+    get_langgraph_service,
+)
 from docker.errors import DockerException, NotFound
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
@@ -11,18 +20,8 @@ from langchain_core.runnables import RunnableConfig
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agent_server.core.auth_deps import get_current_user
-from src.agent_server.core.orm import Run as RunORM
-from src.agent_server.core.orm import RunEvent as RunEventORM
-from src.agent_server.core.orm import Thread as ThreadORM
-from src.agent_server.core.orm import get_session
-from src.agent_server.services.langgraph_service import (
-    create_thread_config,
-    get_langgraph_service,
-)
-
 if TYPE_CHECKING:
-    from src.agent_server.models.auth import User
+    from aegra_api.models.auth import User
 
 app = FastAPI()
 

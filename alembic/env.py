@@ -3,15 +3,14 @@
 import asyncio
 from logging.config import fileConfig
 
+# Import your SQLAlchemy models here
+from aegra_api.core.orm import Base
+from aegra_api.settings import settings
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
-
-# Import your SQLAlchemy models here
-from src.agent_server.core.orm import Base
-from src.agent_server.settings import settings
 
 # This is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

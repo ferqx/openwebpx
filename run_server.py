@@ -14,10 +14,9 @@ from pathlib import Path
 
 import structlog
 import uvicorn
+from aegra_api.settings import settings
+from aegra_api.utils.setup_logging import get_logging_config, setup_logging
 from dotenv import load_dotenv
-
-from src.agent_server.settings import settings
-from src.agent_server.utils.setup_logging import get_logging_config, setup_logging
 
 # Add graphs directory to Python path so imports can be resolved
 current_dir = Path(__file__).parent
@@ -48,7 +47,7 @@ def configure_logging(level: str = "DEBUG"):
 
     # Ensure our package/module loggers are at least at the configured level
     logging.getLogger("agent_server").setLevel(log_level)
-    logging.getLogger("src.agent_server").setLevel(log_level)
+    logging.getLogger("aegra_api").setLevel(log_level)
     logging.getLogger("aegra").setLevel(log_level)
 
 
@@ -67,7 +66,7 @@ def main():
     logger.info("🧪 Test with: python test_sdk_integration.py")
 
     uvicorn.run(
-        "src.agent_server.main:app",
+        "aegra_api.main:app",
         host=settings.app.HOST,
         port=port,
         reload=True,

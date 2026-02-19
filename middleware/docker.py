@@ -23,7 +23,6 @@ import httpx
 from docker.errors import DockerException, NotFound
 from docker.models.containers import Container
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
-from langchain_core.messages import SystemMessage
 
 logger = logging.getLogger(__name__)
 # 沙盒内服务必须监听全接口，才能通过 Docker 端口映射被宿主机预览访问。
@@ -558,7 +557,7 @@ class DockerMiddleware(AgentMiddleware):
         # 用短哈希做幂等键，避免同一错误在每轮都重复注入。
         return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
-    def before_agent(self, state: DockerState, runtime: Any) -> dict[str, Any] | None:  # noqa: ARG002
+    def before_agent(self, state: DockerState, _runtime: Any) -> dict[str, Any] | None:
         # 在 agent 主循环前确保容器存在，并初始化计数类状态。
         container_id = self._ensure_container(state)
         return {
@@ -567,36 +566,36 @@ class DockerMiddleware(AgentMiddleware):
             "service_restart_count": int(state.get("service_restart_count") or 0),
         }
 
-    def before_model(self, state: DockerState, runtime: Any) -> dict[str, Any] | None:  # noqa: ARG002
-        # 每次模型调用前执行运行态扫描，让同一轮推理就能拿到最新故障信息。
-        container_id = self._ensure_container(state)
-        container = self.client.containers.get(container_id)
+    # def before_model(self, state: DockerState, runtime: Any) -> dict[str, Any] | None:  # noqa: ARG002
+    #     # 每次模型调用前执行运行态扫描，让同一轮推理就能拿到最新故障信息。
+    #     container_id = self._ensure_container(state)
+    #     container = self.client.containers.get(container_id)
 
-        status = self._build_runtime_status(state, container)
-        update: dict[str, Any] = {
-            "container_id": container_id,
-            "service_status": status,
-            "service_bootstrapped": bool(status.get("app_detected")),
-        }
+    #     status = self._build_runtime_status(state, container)
+    #     update: dict[str, Any] = {
+    #         "container_id": container_id,
+    #         "service_status": status,
+    #         "service_bootstrapped": bool(status.get("app_detected")),
+    #     }
 
-        if status.get("startup_attempted"):
-            update["service_restart_count"] = (
-                int(state.get("service_restart_count") or 0) + 1
-            )
+    #     if status.get("startup_attempted"):
+    #         update["service_restart_count"] = (
+    #             int(state.get("service_restart_count") or 0) + 1
+    #         )
 
-        diagnostic = self._build_diagnostic_message(status)
-        if diagnostic:
-            fingerprint = self._fingerprint(diagnostic)
-            # 仅在诊断变化时注入消息，避免重复上下文占用。
-            if state.get("last_diagnostic_fingerprint") != fingerprint:
-                update["messages"] = [SystemMessage(content=diagnostic)]
-            update["last_diagnostic_fingerprint"] = fingerprint
-        else:
-            update["last_diagnostic_fingerprint"] = None
+    #     diagnostic = self._build_diagnostic_message(status)
+    #     if diagnostic:
+    #         fingerprint = self._fingerprint(diagnostic)
+    #         # 仅在诊断变化时注入消息，避免重复上下文占用。
+    #         if state.get("last_diagnostic_fingerprint") != fingerprint:
+    #             update["messages"] = [SystemMessage(content=diagnostic)]
+    #         update["last_diagnostic_fingerprint"] = fingerprint
+    #     else:
+    #         update["last_diagnostic_fingerprint"] = None
 
-        return update
+    #     return update
 
-    def after_agent(self, state: DockerState, runtime: Any) -> dict[str, Any] | None:  # noqa: ARG002
+    def after_agent(self, state: DockerState, _runtime: Any) -> dict[str, Any] | None:
         # 结束时再采样一次，确保外部 API 读取到的是最新运行结果。
         container_id = state.get("container_id")
         if not container_id:

@@ -29,9 +29,6 @@ agent = create_deep_agent(
             image="node:20-bookworm",
             ports={
                 "5173/tcp": None,
-                "3000/tcp": None,
-                "4173/tcp": None,
-                "8080/tcp": None,
             },
             environment={"HOST": SANDBOX_BIND_HOST},
             auto_start_service=True,

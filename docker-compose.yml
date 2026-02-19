@@ -42,7 +42,7 @@ services:
         echo 'Running database migrations...' &&
         alembic upgrade head &&
         echo 'Starting Aegra server...' &&
-        uvicorn src.agent_server.main:app --host 0.0.0.0 --port $${PORT:-8000} --reload
+        uvicorn aegra_api.main:app --host 0.0.0.0 --port $${PORT:-8000} --reload
       "
 
   # Redis (optional - for advanced queuing in future phases)

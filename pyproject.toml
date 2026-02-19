@@ -59,6 +59,8 @@ dependencies = [
     "langchain-qdrant>=1.1.0",
     "pydantic-settings>=2.12.0",
     "docker>=7.1.0",
+    "aegra-cli>=0.7.0",
+    "aegra-api>=0.7.0",
 ]
 
 [project.urls]
@@ -107,6 +109,9 @@ ignore = [
 "tests/**/*.py" = [
     "ARG",   # unused arguments in tests are common
     "S101",  # assert statements are expected in tests
+]
+"middleware/docker.py" = [
+    "ERA",   # keep archived commented-out lifecycle logic for reference
 ]
 "alembic/**/*.py" = [
     "ERA",   # commented code in migrations is intentional
