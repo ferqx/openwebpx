@@ -1,7 +1,8 @@
 {
   "graphs": {
     "agent": "./graphs/react_agent/graph.py:graph",
-    "build_app_agent": "./graphs/build_app_agent/agent.py:agent"
+    "build_app_agent": "./graphs/build_app_agent/agent.py:agent",
+    "build_app_agent_v2": "./graphs/build_app_agent_v2/agent.py:agent"
   },
   "http": {
     "app": "./app/main.py:app",
