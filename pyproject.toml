@@ -7,7 +7,7 @@ name = "aegra"
 version = "0.1.0"
 description = "Open source LangGraph Platform alternative - Self-hosted AI agent backend with FastAPI and PostgreSQL. Zero vendor lock-in, full control over your agent infrastructure."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 keywords = ["langgraph", "ai-agents", "self-hosted", "agent-backend", "fastapi", "postgresql", "langchain", "agent-protocol"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -31,8 +31,8 @@ dependencies = [
     "fastapi",
     "greenlet>=3.2.3",
     "langchain-openai",
-    "langgraph",
-    "langchain",
+    "langgraph>=1.0.9",
+    "langchain>=1.2.10",
     "langgraph-checkpoint-postgres",
     "psycopg[binary]>=3.2.9",
     "pydantic>=2.11.7",
@@ -45,7 +45,7 @@ dependencies = [
     "asgi-correlation-id>=4.3.4",
     "langchain-ollama",
     "httpx[socks]>=0.28.1",
-    "deepagents",
+    "deepagents>=0.4.3",
     "tavily-python>=0.7.16",
     "llms-txt>=0.0.4",
     "mcp>=1.24.0",
@@ -59,8 +59,8 @@ dependencies = [
     "langchain-qdrant>=1.1.0",
     "pydantic-settings>=2.12.0",
     "docker>=7.1.0",
-    "aegra-cli>=0.7.0",
-    "aegra-api>=0.7.0",
+    "aegra-cli>=0.7.2",
+    "aegra-api>=0.7.2",
 ]
 
 [project.urls]
@@ -112,6 +112,9 @@ ignore = [
 ]
 "middleware/docker.py" = [
     "ERA",   # keep archived commented-out lifecycle logic for reference
+]
+"middleware/tool_call_tracker.py" = [
+    "ARG",   # middleware hooks require unused parameters for signature compatibility
 ]
 "alembic/**/*.py" = [
     "ERA",   # commented code in migrations is intentional
@@ -168,7 +171,6 @@ directory = "htmlcov"
 [dependency-groups]
 dev = [
     "ruff>=0.8.4",
-    "langgraph-sdk==0.2.4",
     "mypy>=1.17.1",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.1.0",

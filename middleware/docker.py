@@ -22,7 +22,8 @@ import docker
 import httpx
 from docker.errors import DockerException, NotFound
 from docker.models.containers import Container
-from langchain.agents.middleware.types import AgentMiddleware, AgentState
+from langchain.agents.middleware.types import AgentMiddleware, AgentState, hook_config
+from langchain_core.messages import AIMessage
 
 logger = logging.getLogger(__name__)
 # 沙盒内服务必须监听全接口，才能通过 Docker 端口映射被宿主机预览访问。
@@ -37,6 +38,10 @@ class DockerState(AgentState):
     service_bootstrapped: bool | None  # 服务是否已完成引导
     service_restart_count: int | None  # 服务重启次数计数
     last_diagnostic_fingerprint: str | None  # 上次诊断信息的指纹（用于去重）
+
+
+class ContainerDestroyedError(RuntimeError):
+    """线程绑定容器已销毁，当前会话应直接结束。"""
 
 
 class DockerMiddleware(AgentMiddleware):
@@ -107,15 +112,53 @@ class DockerMiddleware(AgentMiddleware):
                 ) from exc
         return self._client
 
+    def _restore_container_if_needed(
+        self, container: Container, *, container_id: str
+    ) -> None:
+        """若容器非 running，则尝试恢复。
+
+        目标是保证线程已绑定容器在新一轮对话开始时可继续复用。
+        """
+        with suppress(DockerException):
+            container.reload()
+
+        status = str(getattr(container, "status", "") or "").lower()
+        if status == "running":
+            return
+
+        try:
+            if status == "paused":
+                container.unpause()
+            else:
+                container.start()
+            container.reload()
+        except NotFound as exc:
+            raise ContainerDestroyedError(
+                "当前线程绑定的容器已销毁，请重新创建线程以启动新的容器服务。"
+            ) from exc
+        except DockerException as exc:
+            raise RuntimeError(
+                f"Failed to start existing container '{container_id}': {exc}"
+            ) from exc
+
+        restored_status = str(getattr(container, "status", "") or "").lower()
+        if restored_status != "running":
+            raise RuntimeError(
+                f"Failed to restore container '{container_id}', current status: {restored_status or 'unknown'}"
+            )
+
     def _ensure_container(self, state: DockerState) -> str:
         # 优先复用已有容器，保证同一 thread 在多轮会话中上下文连续。
         container_id: str | None = state.get("container_id")
         if container_id:
             try:
-                self.client.containers.get(container_id)
+                container = self.client.containers.get(container_id)
+                self._restore_container_if_needed(container, container_id=container_id)
                 return cast("str", container_id)
             except NotFound:
-                logger.warning("Container %s not found, creating new one", container_id)
+                raise ContainerDestroyedError(
+                    "当前线程绑定的容器已销毁，请重新创建线程以启动新的容器服务。"
+                ) from None
 
         # 仅在容器不存在时创建新容器，并保持常驻进程防止容器自动退出。
         try:
@@ -134,6 +177,41 @@ class DockerMiddleware(AgentMiddleware):
             raise RuntimeError("Failed to create Docker container: No ID returned")
         logger.info("Created container %s", container.id)
         return container.id
+
+    def _persist_thread_container_mapping(
+        self,
+        *,
+        runtime: Any,
+        container_id: str,
+    ) -> None:
+        """将 thread_id -> container_id 映射持久化到 runtime.store。"""
+        if runtime is None:
+            return
+
+        config = getattr(runtime, "config", None)
+        store = getattr(runtime, "store", None)
+        if not isinstance(config, dict) or store is None:
+            return
+
+        configurable = config.get("configurable")
+        if not isinstance(configurable, dict):
+            return
+
+        thread_id = configurable.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            return
+
+        try:
+            store.put(
+                ("docker_backend", "thread_container"),
+                thread_id.strip(),
+                {"container_id": container_id},
+            )
+        except Exception:  # pragma: no cover - 非关键路径
+            logger.debug(
+                "Failed to persist thread/container mapping for thread %s",
+                thread_id,
+            )
 
     def _exec(
         self,
@@ -557,45 +635,35 @@ class DockerMiddleware(AgentMiddleware):
         # 用短哈希做幂等键，避免同一错误在每轮都重复注入。
         return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
-    def before_agent(self, state: DockerState, _runtime: Any) -> dict[str, Any] | None:
+    @hook_config(can_jump_to=["end"])
+    def before_agent(
+        self, state: DockerState, runtime: Any = None
+    ) -> dict[str, Any] | None:
         # 在 agent 主循环前确保容器存在，并初始化计数类状态。
-        container_id = self._ensure_container(state)
+        try:
+            container_id = self._ensure_container(state)
+        except ContainerDestroyedError:
+            return {
+                "jump_to": "end",
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "当前线程绑定的容器已销毁，无法继续本次对话。"
+                            "请重新创建线程进行对话。"
+                        )
+                    )
+                ],
+            }
+        self._persist_thread_container_mapping(
+            runtime=runtime, container_id=container_id
+        )
         return {
             "container_id": container_id,
             "service_bootstrapped": bool(state.get("service_bootstrapped")),
             "service_restart_count": int(state.get("service_restart_count") or 0),
         }
 
-    # def before_model(self, state: DockerState, runtime: Any) -> dict[str, Any] | None:  # noqa: ARG002
-    #     # 每次模型调用前执行运行态扫描，让同一轮推理就能拿到最新故障信息。
-    #     container_id = self._ensure_container(state)
-    #     container = self.client.containers.get(container_id)
-
-    #     status = self._build_runtime_status(state, container)
-    #     update: dict[str, Any] = {
-    #         "container_id": container_id,
-    #         "service_status": status,
-    #         "service_bootstrapped": bool(status.get("app_detected")),
-    #     }
-
-    #     if status.get("startup_attempted"):
-    #         update["service_restart_count"] = (
-    #             int(state.get("service_restart_count") or 0) + 1
-    #         )
-
-    #     diagnostic = self._build_diagnostic_message(status)
-    #     if diagnostic:
-    #         fingerprint = self._fingerprint(diagnostic)
-    #         # 仅在诊断变化时注入消息，避免重复上下文占用。
-    #         if state.get("last_diagnostic_fingerprint") != fingerprint:
-    #             update["messages"] = [SystemMessage(content=diagnostic)]
-    #         update["last_diagnostic_fingerprint"] = fingerprint
-    #     else:
-    #         update["last_diagnostic_fingerprint"] = None
-
-    #     return update
-
-    def after_agent(self, state: DockerState, _runtime: Any) -> dict[str, Any] | None:
+    def after_agent(self, state: DockerState) -> dict[str, Any] | None:
         # 结束时再采样一次，确保外部 API 读取到的是最新运行结果。
         container_id = state.get("container_id")
         if not container_id:

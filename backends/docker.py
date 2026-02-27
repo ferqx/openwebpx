@@ -13,7 +13,7 @@ import logging
 import shlex
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import docker
 from deepagents.backends.protocol import (
@@ -78,6 +78,52 @@ class DockerBackend(BaseSandbox):
                 ) from e
         return self._client
 
+    def _get_thread_id(self) -> str | None:
+        """从运行时配置提取 thread_id。"""
+        config: Any = getattr(self.runtime, "config", None)
+        if not isinstance(config, dict):
+            return None
+        configurable = config.get("configurable")
+        if not isinstance(configurable, dict):
+            return None
+        thread_id = configurable.get("thread_id")
+        if isinstance(thread_id, str) and thread_id.strip():
+            return thread_id.strip()
+        return None
+
+    def _store_container_mapping(self, *, thread_id: str, container_id: str) -> None:
+        """将 thread_id -> container_id 映射持久化到 LangGraph store。"""
+        store = getattr(self.runtime, "store", None)
+        if store is None:
+            return
+        try:
+            store.put(
+                ("docker_backend", "thread_container"),
+                thread_id,
+                {"container_id": container_id},
+            )
+        except Exception:  # pragma: no cover - 非关键路径
+            logger.debug("Failed to persist container mapping for thread %s", thread_id)
+
+    def _load_container_mapping(self, *, thread_id: str) -> str | None:
+        """从 LangGraph store 读取 thread_id -> container_id 映射。"""
+        store = getattr(self.runtime, "store", None)
+        if store is None:
+            return None
+        try:
+            item = store.get(("docker_backend", "thread_container"), thread_id)
+        except Exception:  # pragma: no cover - 非关键路径
+            logger.debug("Failed to load container mapping for thread %s", thread_id)
+            return None
+
+        value = getattr(item, "value", None) if item is not None else None
+        if not isinstance(value, dict):
+            return None
+        container_id = value.get("container_id")
+        if isinstance(container_id, str) and container_id.strip():
+            return container_id.strip()
+        return None
+
     @property
     def container(self) -> Container:
         """从运行时状态获取Docker容器。
@@ -91,12 +137,25 @@ class DockerBackend(BaseSandbox):
         if self._container is not None:
             return self._container
 
-        state = self.runtime.state
+        state = self.runtime.state if isinstance(self.runtime.state, dict) else {}
         container_id = state.get("container_id")
+        thread_id = self._get_thread_id()
+
+        if isinstance(container_id, str) and container_id.strip():
+            container_id = container_id.strip()
+            if thread_id:
+                self._store_container_mapping(
+                    thread_id=thread_id,
+                    container_id=container_id,
+                )
+
+        if not container_id and thread_id:
+            container_id = self._load_container_mapping(thread_id=thread_id)
+
         if not container_id:
             raise RuntimeError(
-                "Docker container ID not found in runtime state. "
-                "Ensure DockerMiddleware has created a container."
+                "在运行时状态下未找到 Docker 容器 ID. "
+                "确保 DockerMiddleware 已成功创建容器."
             )
 
         try:
