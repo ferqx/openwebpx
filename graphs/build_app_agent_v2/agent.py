@@ -20,7 +20,7 @@ from langchain.chat_models import init_chat_model
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
 from backends.docker import DockerBackend
-from middleware.docker import DockerMiddleware
+from middleware.docker import build_web_sandbox_docker_middleware
 
 # LangGraph API may load this file as a standalone module (graphs.<graph_id>).
 # Fallback to sibling imports to avoid package-resolution failures.
@@ -34,9 +34,6 @@ except ModuleNotFoundError:
         sys.path.insert(0, _module_dir_str)
     from guard_middleware import ToolCallGuardMiddleware
     from prompts import build_system_prompt
-
-# 沙盒预览通过端口映射访问，容器内服务必须绑定到全接口。
-SANDBOX_BIND_HOST = "0.0.0.0"  # nosec B104
 
 
 def _infer_prompt_profile(model_provider: str, model_name: str) -> str:
@@ -156,16 +153,7 @@ _middleware.extend(
             small_edit_char_threshold=SMALL_EDIT_CHAR_THRESHOLD,
             max_small_edits_per_file_total=MAX_SMALL_EDITS_PER_FILE_TOTAL,
         ),
-        DockerMiddleware(
-            image="node:20-bookworm",
-            ports={
-                "3000/tcp": None,
-            },
-            environment={"HOST": SANDBOX_BIND_HOST},
-            auto_start_service=True,
-            default_container_port=3000,
-            healthcheck_path="/",
-        ),
+        build_web_sandbox_docker_middleware(),
     ]
 )
 

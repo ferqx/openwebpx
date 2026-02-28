@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from aegra_api.core.auth_deps import require_auth
+from aegra_api.models.auth import User
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+from app.auth.core import authenticate_user, create_access_token, register_user
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=6, max_length=128)
+    role: Literal["admin", "premium", "developer", "reviewer", "free"] | None = None
+    team_id: str | None = Field(default=None, max_length=64)
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    user: dict[str, Any]
+
+
+@router.post("/register", response_model=LoginResponse)
+async def register(payload: RegisterRequest) -> LoginResponse:
+    try:
+        user = register_user(
+            username=payload.username,
+            password=payload.password,
+            role=payload.role,
+            team_id=payload.team_id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if "已存在" in detail:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=detail,
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=detail
+        ) from exc
+
+    token = create_access_token(user)
+    return LoginResponse(access_token=token, user=user)
+
+
+@router.post("/login", response_model=LoginResponse)
+async def login(payload: LoginRequest) -> LoginResponse:
+    try:
+        user = authenticate_user(username=payload.username, password=payload.password)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
+
+    token = create_access_token(user)
+    return LoginResponse(access_token=token, user=user)
+
+
+@router.get("/me")
+async def me(user: User = Depends(require_auth)) -> dict[str, Any]:
+    return {
+        "identity": user.identity,
+        "display_name": user.display_name,
+        "is_authenticated": user.is_authenticated,
+        "permissions": user.permissions,
+        "role": getattr(user, "role", None),
+        "subscription_tier": getattr(user, "subscription_tier", None),
+        "team_id": getattr(user, "team_id", None),
+        "email": getattr(user, "email", None),
+    }
+
+
+@router.post("/logout")
+async def logout(_user: User = Depends(require_auth)) -> dict[str, bool]:
+    return {"ok": True}

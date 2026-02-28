@@ -4,8 +4,11 @@
     "build_app_agent": "./graphs/build_app_agent/agent.py:agent",
     "build_app_agent_v2": "./graphs/build_app_agent_v2/agent.py:agent"
   },
+  "auth": {
+    "path": "./app/auth/aegra_auth.py:auth"
+  },
   "http": {
     "app": "./app/main.py:app",
-    "enable_custom_route_auth": true
+    "enable_custom_route_auth": false
   }
 }

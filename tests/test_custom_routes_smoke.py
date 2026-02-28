@@ -1,21 +1,41 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from aegra_api.core.auth_deps import get_current_user
+from aegra_api.core.auth_deps import get_current_user, require_auth
 from aegra_api.core.orm import get_session
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from app.auth.core import reset_auth_state_for_tests
 from app.main import app
 from app.routers import sandbox as sandbox_router
 from app.routers import scm as scm_router
 
 
+async def _override_require_auth() -> Any:
+    return SimpleNamespace(
+        identity="local-dev",
+        display_name="Local Dev",
+        is_authenticated=True,
+        permissions=["developer", "developer:read", "developer:write"],
+        role="developer",
+        team_id="team_default",
+        email="local-dev@example.com",
+    )
+
+
 @pytest.fixture
-def client() -> TestClient:
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    monkeypatch.setenv("AUTH_USERS_FILE", str(tmp_path / "auth_users_test.json"))
+    reset_auth_state_for_tests()
+    scm_router.SCM_TOKENS.clear()
+    app.dependency_overrides[require_auth] = _override_require_auth
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
@@ -26,6 +46,52 @@ def test_hello_route_smoke(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"message": "Hello from custom route!"}
+
+
+def test_auth_register_and_login_smoke(client: TestClient) -> None:
+    register_response = client.post(
+        "/auth/register",
+        json={
+            "username": "new-user",
+            "password": "secret123",
+        },
+    )
+
+    assert register_response.status_code == 200
+    register_payload = register_response.json()
+    assert isinstance(register_payload["access_token"], str)
+    assert register_payload["access_token"].count(".") == 2
+
+    login_response = client.post(
+        "/auth/login",
+        json={
+            "username": "new-user",
+            "password": "secret123",
+        },
+    )
+
+    assert login_response.status_code == 200
+    assert login_response.json()["user"]["identity"] == "new_user"
+
+
+def test_auth_register_conflict_smoke(client: TestClient) -> None:
+    first = client.post(
+        "/auth/register",
+        json={
+            "username": "repeat-user",
+            "password": "secret123",
+        },
+    )
+    second = client.post(
+        "/auth/register",
+        json={
+            "username": "repeat-user",
+            "password": "secret123",
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
 
 
 def test_sandbox_runtime_route_smoke(
@@ -307,3 +373,147 @@ def test_scm_branches_route_smoke(
 
     assert response.status_code == 200
     assert response.json() == {"branches": [{"name": "main"}, {"name": "dev"}]}
+
+
+def test_scm_token_persistence_smoke(client: TestClient) -> None:
+    storage: dict[str, str] = {}
+
+    class FakeResult:
+        def __init__(
+            self,
+            *,
+            rowcount: int = 0,
+            row: dict[str, Any] | None = None,
+        ) -> None:
+            self.rowcount = rowcount
+            self._row = row
+
+        def mappings(self) -> FakeResult:
+            return self
+
+        def first(self) -> dict[str, Any] | None:
+            return self._row
+
+    class FakeSession:
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: Any,
+            exc: Any,
+            tb: Any,  # noqa: ARG002
+        ) -> None:
+            return None
+
+        async def execute(self, stmt: Any, params: dict[str, Any]) -> FakeResult:
+            sql = str(stmt).strip().lower()
+            cache_key = str(params.get("cache_key", ""))
+            if sql.startswith("update"):
+                if cache_key not in storage:
+                    return FakeResult(rowcount=0)
+                storage[cache_key] = str(params["token_encrypted"])
+                return FakeResult(rowcount=1)
+            if sql.startswith("insert"):
+                storage[cache_key] = str(params["token_encrypted"])
+                return FakeResult(rowcount=1)
+            if sql.startswith("select"):
+                token_encrypted = storage.get(cache_key)
+                if token_encrypted is None:
+                    return FakeResult(row=None)
+                return FakeResult(row={"token_encrypted": token_encrypted})
+            if sql.startswith("delete"):
+                storage.pop(cache_key, None)
+                return FakeResult(rowcount=1)
+            return FakeResult(rowcount=0)
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    class FakeSessionMaker:
+        def __call__(self) -> FakeSession:
+            return FakeSession()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            scm_router,
+            "_get_session_maker",
+            lambda: FakeSessionMaker(),
+        )
+
+        scm_router.SCM_TOKENS.clear()
+        cache_key = scm_router._scm_token_cache_key(  # noqa: SLF001
+            user_id="local-dev",
+            provider="github",
+        )
+        asyncio.run(
+            scm_router._set_scm_token_payload(  # noqa: SLF001
+                cache_key,
+                {
+                    "provider": "github",
+                    "access_token": "persisted-token",
+                    "github_token_source": "user_token",
+                },
+            )
+        )
+        scm_router.SCM_TOKENS.clear()
+
+        payload = asyncio.run(
+            scm_router._resolve_scm_token_payload(  # noqa: SLF001
+                user_id="local-dev",
+                provider="github",
+                gitlab_base_url=None,
+                github_auth_mode=None,
+            )
+        )
+
+        assert payload["access_token"] == "persisted-token"
+
+
+def test_scm_repositories_revoked_token_clears_cache(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scm_router.SCM_TOKENS.clear()
+    cache_key = scm_router._scm_token_cache_key(  # noqa: SLF001
+        user_id="local-dev",
+        provider="github",
+    )
+    scm_router.SCM_TOKENS[cache_key] = {
+        "provider": "github",
+        "access_token": "revoked-token",
+        "github_token_source": "user_token",
+    }
+
+    async def fake_fetch_github_user_repositories(
+        *,
+        http_client: Any,  # noqa: ARG001
+        access_token: str,  # noqa: ARG001
+    ) -> list[dict[str, Any]]:
+        raise HTTPException(401, "GitHub 仓库查询失败: Bad credentials")
+
+    monkeypatch.setattr(
+        scm_router,
+        "_fetch_github_user_repositories",
+        fake_fetch_github_user_repositories,
+    )
+
+    async def fake_delete_scm_token_payload(cache_key: str) -> None:
+        scm_router.SCM_TOKENS.pop(cache_key, None)
+
+    monkeypatch.setattr(
+        scm_router,
+        "_delete_scm_token_payload",
+        fake_delete_scm_token_payload,
+    )
+
+    response = client.get(
+        "/integrations/scm/repositories",
+        params={"provider": "github"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "SCM 授权已失效或已被撤销，请重新授权"
+    assert cache_key not in scm_router.SCM_TOKENS

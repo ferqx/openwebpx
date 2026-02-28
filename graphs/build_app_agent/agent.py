@@ -2,10 +2,7 @@ from deepagents import create_deep_agent
 from langchain.chat_models import init_chat_model
 
 from backends.docker import DockerBackend
-from middleware.docker import DockerMiddleware
-
-# 沙盒预览通过端口映射访问，容器内服务必须绑定到全接口。
-SANDBOX_BIND_HOST = "0.0.0.0"  # nosec B104
+from middleware.docker import build_web_sandbox_docker_middleware
 
 WEB_BUILDER_PROMPT = """
 你是一个资深、务实的编程代理（Coding Agent）。
@@ -329,16 +326,7 @@ agent = create_deep_agent(
     system_prompt=WEB_PX_SYSTEM_PROMPT_V3,
     backend=DockerBackend,
     middleware=[
-        DockerMiddleware(
-            image="node:20-bookworm",
-            ports={
-                "3000/tcp": None,
-            },
-            environment={"HOST": SANDBOX_BIND_HOST},
-            auto_start_service=True,
-            default_container_port=3000,
-            healthcheck_path="/",
-        ),
+        build_web_sandbox_docker_middleware(),
     ],
     model=init_chat_model(model_provider="openai", model="deepseek-chat"),
 )

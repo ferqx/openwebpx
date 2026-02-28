@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "aegra": {
+      "source": "aegra/dev",
+      "sourceType": "well-known",
+      "computedHash": "a45d55f6627905f915c51e2e2bd626dc55125f7d0c677e55997dd2dba39305c8"
+    }
+  }
+}
