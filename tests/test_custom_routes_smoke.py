@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -517,3 +518,244 @@ def test_scm_repositories_revoked_token_clears_cache(
     assert response.status_code == 401
     assert response.json()["detail"] == "SCM 授权已失效或已被撤销，请重新授权"
     assert cache_key not in scm_router.SCM_TOKENS
+
+
+def test_scm_connections_route_lists_multiple_sources(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    github_payload = scm_router._encrypt_scm_token_payload(  # noqa: SLF001
+        {
+            "provider": "github",
+            "access_token": "gh-token",
+            "refresh_token": "gh-refresh",
+            "expires_at": time.time() + 3600,
+        }
+    )
+    gitlab_payload = scm_router._encrypt_scm_token_payload(  # noqa: SLF001
+        {
+            "provider": "gitlab",
+            "access_token": "gl-token",
+            "gitlab_base_url": "https://gitlab.com",
+            "expires_at": time.time() + 1800,
+        }
+    )
+
+    async def fake_list_rows(user_id: str) -> list[dict[str, Any]]:
+        assert user_id == "local-dev"
+        return [
+            {
+                "cache_key": "local-dev:github:github_app",
+                "provider": "github",
+                "github_auth_mode": "github_app",
+                "gitlab_base_url": None,
+                "token_encrypted": github_payload,
+                "updated_at": time.time(),
+            },
+            {
+                "cache_key": "local-dev:gitlab:https://gitlab.com",
+                "provider": "gitlab",
+                "github_auth_mode": None,
+                "gitlab_base_url": "https://gitlab.com",
+                "token_encrypted": gitlab_payload,
+                "updated_at": time.time(),
+            },
+        ]
+
+    monkeypatch.setattr(scm_router, "_list_scm_token_rows_for_user", fake_list_rows)
+
+    response = client.get("/integrations/scm/connections")
+
+    assert response.status_code == 200
+    payload = response.json()
+    keys = {item["connection_key"] for item in payload["connections"]}
+    assert "github" in keys
+    assert "gitlab" in keys
+
+
+def test_scm_connections_route_tolerates_legacy_github_auth_mode(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    github_payload = scm_router._encrypt_scm_token_payload(  # noqa: SLF001
+        {
+            "provider": "github",
+            "access_token": "legacy-gh-token",
+            "expires_at": time.time() + 3600,
+        }
+    )
+
+    async def fake_list_rows(user_id: str) -> list[dict[str, Any]]:
+        assert user_id == "local-dev"
+        return [
+            {
+                "cache_key": "local-dev:github:oauth",
+                "provider": "github",
+                "github_auth_mode": "oauth",
+                "gitlab_base_url": None,
+                "token_encrypted": github_payload,
+                "updated_at": time.time(),
+            }
+        ]
+
+    monkeypatch.setattr(scm_router, "_list_scm_token_rows_for_user", fake_list_rows)
+
+    response = client.get("/integrations/scm/connections")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["connections"]) == 1
+    assert payload["connections"][0]["provider"] == "github"
+    assert payload["connections"][0]["github_auth_mode"] == "github_app"
+
+
+def test_scm_revoke_connection_route_smoke(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deleted_cache_keys: list[str] = []
+
+    async def fake_delete(cache_key: str) -> None:
+        deleted_cache_keys.append(cache_key)
+
+    monkeypatch.setattr(scm_router, "_delete_scm_token_payload", fake_delete)
+
+    response = client.delete(
+        "/integrations/scm/connections",
+        params={
+            "provider": "gitlab",
+            "gitlab_base_url": "https://gitlab.company.com",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["connection_key"] == "gitlab_enterprise:https://gitlab.company.com"
+    assert deleted_cache_keys == ["local-dev:gitlab:https://gitlab.company.com"]
+
+
+def test_scm_validate_connection_revoked_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scm_router.SCM_TOKENS.clear()
+    cache_key = scm_router._scm_token_cache_key(  # noqa: SLF001
+        user_id="local-dev",
+        provider="github",
+    )
+    scm_router.SCM_TOKENS[cache_key] = {
+        "provider": "github",
+        "access_token": "expired-token",
+        "github_token_source": "github_app",
+    }
+
+    class FakeResponse:
+        status_code = 401
+        text = "Bad credentials"
+
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
+            return None
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:  # noqa: ARG002
+            return None
+
+        async def get(self, url: str, *, headers: dict[str, str]) -> FakeResponse:
+            assert url == "https://api.github.com/user"
+            assert headers["Authorization"] == "Bearer expired-token"
+            return FakeResponse()
+
+    monkeypatch.setattr(scm_router.httpx, "AsyncClient", FakeAsyncClient)
+
+    async def fake_delete(cache_key: str) -> None:
+        scm_router.SCM_TOKENS.pop(cache_key, None)
+
+    monkeypatch.setattr(scm_router, "_delete_scm_token_payload", fake_delete)
+
+    response = client.get(
+        "/integrations/scm/connections/validate",
+        params={"provider": "github"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["valid"] is False
+    assert payload["revoked"] is True
+    assert cache_key not in scm_router.SCM_TOKENS
+
+
+def test_scm_access_token_refresh_when_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    scm_router.SCM_TOKENS.clear()
+    cache_key = scm_router._scm_token_cache_key(  # noqa: SLF001
+        user_id="local-dev",
+        provider="github",
+    )
+    scm_router.SCM_TOKENS[cache_key] = {
+        "provider": "github",
+        "access_token": "old-token",
+        "refresh_token": "refresh-token",
+        "expires_at": time.time() - 5,
+        "github_auth_mode": "github_app",
+    }
+
+    async def fake_refresh(
+        *,
+        refresh_token: str,
+        github_auth_mode: str | None = None,
+    ) -> dict[str, Any]:
+        assert refresh_token == "refresh-token"
+        assert github_auth_mode == "github_app"
+        return {
+            "access_token": "new-token",
+            "refresh_token": "refresh-token-next",
+            "expires_in": 3600,
+            "github_auth_mode": "github_app",
+            "github_token_source": "github_app",
+        }
+
+    async def fake_set(cache_key: str, payload: dict[str, Any]) -> None:
+        scm_router.SCM_TOKENS[cache_key] = payload
+
+    monkeypatch.setattr(scm_router, "_refresh_github_oauth_token", fake_refresh)
+    monkeypatch.setattr(scm_router, "_set_scm_token_payload", fake_set)
+
+    token = asyncio.run(
+        scm_router._resolve_scm_access_token(  # noqa: SLF001
+            user_id="local-dev",
+            provider="github",
+            gitlab_base_url=None,
+            github_auth_mode="github_app",
+        )
+    )
+
+    assert token == "new-token"
+    assert scm_router.SCM_TOKENS[cache_key]["access_token"] == "new-token"
+    assert scm_router.SCM_TOKENS[cache_key]["refresh_token"] == "refresh-token-next"
+
+
+def test_scm_oauth_callback_rejects_mismatched_redirect_uri(client: TestClient) -> None:
+    state = scm_router._encode_scm_oauth_state_token(  # noqa: SLF001
+        {
+            "provider": "github",
+            "user_id": "local-dev",
+            "created_at": time.time(),
+            "redirect_uri": "http://localhost:5173/oauth/scm/callback",
+            "origin": "http://localhost:5173",
+            "github_auth_mode": "github_app",
+            "nonce": "nonce-1",
+        }
+    )
+
+    response = client.post(
+        "/integrations/scm/oauth/callback",
+        json={
+            "params": {"state": state, "code": "code-1"},
+            "redirect_uri": "http://localhost:5173/another/callback",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": False,
+        "error": "OAuth redirect_uri 与授权请求不匹配",
+    }
