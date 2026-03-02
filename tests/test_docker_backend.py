@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from docker.errors import NotFound
 
 from backends.docker import DockerBackend
 
@@ -26,6 +27,11 @@ class FakeContainerManager:
 class FakeClient:
     def __init__(self, manager: FakeContainerManager) -> None:
         self.containers = manager
+
+
+class FakeDownloadContainer:
+    def get_archive(self, _path: str) -> tuple[bytes, dict[str, Any]]:
+        raise NotFound("file not found in container")
 
 
 class FakeRuntime:
@@ -112,3 +118,18 @@ def test_container_raises_when_state_and_store_both_missing() -> None:
 
     with pytest.raises(RuntimeError, match="未找到 Docker 容器 ID"):
         _ = backend.container
+
+
+def test_download_files_maps_docker_not_found_to_file_not_found() -> None:
+    runtime = FakeRuntime(state={}, config={})
+    backend = DockerBackend(runtime)
+    backend._container = FakeDownloadContainer()  # type: ignore[assignment]
+
+    responses = backend.download_files(
+        ["/workspace/packages/components/examples/table-optimization.md"]
+    )
+
+    assert len(responses) == 1
+    assert responses[0].path.endswith("table-optimization.md")
+    assert responses[0].content is None
+    assert responses[0].error == "file_not_found"

@@ -321,6 +321,79 @@ def test_sandbox_debug_route_smoke(
     assert payload["summary"]["has_runtime_diagnostic"] is True
 
 
+def test_sandbox_thread_cancel_route_smoke(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_thread = SimpleNamespace(
+        metadata_json={"graph_id": "agent"},
+        thread_id="th-1",
+        status="busy",
+        user_id="user-1",
+    )
+    fake_runs = [
+        SimpleNamespace(
+            run_id="run-1",
+            status="running",
+            error_message=None,
+            created_at=datetime.now(UTC),
+        )
+    ]
+
+    class FakeScalarRows:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        async def scalar(self, stmt: Any) -> Any:  # noqa: ARG002
+            return fake_thread
+
+        async def scalars(self, stmt: Any) -> FakeScalarRows:  # noqa: ARG002
+            return FakeScalarRows(fake_runs)
+
+        async def commit(self) -> None:
+            return None
+
+    class FakeBootstrapTask:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    async def override_current_user() -> Any:
+        return SimpleNamespace(identity="user-1")
+
+    async def override_session() -> Any:
+        return FakeSession()
+
+    app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_session] = override_session
+
+    task = FakeBootstrapTask()
+    monkeypatch.setitem(sandbox_router.BOOTSTRAP_TASKS, "th-1", task)
+
+    response = client.post(
+        "/sandbox/threads/th-1/cancel", params={"action": "interrupt"}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["thread_id"] == "th-1"
+    assert payload["action"] == "interrupt"
+    assert payload["cancelled_run_ids"] == ["run-1"]
+    assert payload["cancelled_run_count"] == 1
+    assert payload["bootstrap_task_cancelled"] is True
+    assert payload["thread_status"] == "idle"
+    assert fake_runs[0].status == "interrupted"
+    assert task.cancelled is True
+
+
 def test_scm_branches_route_smoke(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

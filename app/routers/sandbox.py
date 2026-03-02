@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import AsyncGenerator
 from contextlib import suppress
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 import docker
@@ -404,9 +405,11 @@ def _normalize_bootstrap_state(raw_state: Any) -> dict[str, Any]:
             event_payload: dict[str, Any] = {
                 "seq": seq,
                 "type": "log",
-                "timestamp": item.get("timestamp")
-                if isinstance(item.get("timestamp"), str)
-                else None,
+                "timestamp": (
+                    item.get("timestamp")
+                    if isinstance(item.get("timestamp"), str)
+                    else None
+                ),
                 "level": level if isinstance(level, str) else "info",
                 "message": message.strip(),
             }
@@ -440,9 +443,9 @@ def _build_bootstrap_response(
         "status": state.get("status", "idle"),
         "steps": state.get("steps") or _default_bootstrap_steps(),
         "logs": state.get("logs") or [],
-        "event_seq": state.get("event_seq")
-        if isinstance(state.get("event_seq"), int)
-        else 0,
+        "event_seq": (
+            state.get("event_seq") if isinstance(state.get("event_seq"), int) else 0
+        ),
         "error": state.get("error"),
         "request_id": state.get("request_id"),
         "run_id": state.get("run_id"),
@@ -706,8 +709,18 @@ async def _run_bootstrap_task(
             run_request = RunCreate(
                 assistant_id=graph_id,
                 input={"messages": [{"type": "human", "content": message}]},
+                config={},
+                context={},
+                checkpoint=None,
+                stream=False,
                 stream_mode=stream_mode,
                 on_disconnect="continue",
+                on_completion=None,
+                multitask_strategy=None,
+                command=None,
+                interrupt_before=None,
+                interrupt_after=None,
+                stream_subgraphs=False,
                 metadata={
                     "source": "sandbox_bootstrap",
                     "request_id": request_id,
@@ -1118,6 +1131,89 @@ async def get_sandbox_thread_bootstrap_status(
     )
 
 
+@router.post("/sandbox/threads/{thread_id}/cancel")
+async def cancel_sandbox_thread(
+    thread_id: str,
+    action: Literal["cancel", "interrupt"] = Query(
+        "cancel",
+        description="Cancel strategy for active runs. Accepts: cancel, interrupt",
+    ),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """按线程维度取消活跃任务，用于 run_id 丢失时的兜底恢复。"""
+
+    thread, graph_id, _, bootstrap_state = await _read_thread_and_bootstrap_state(
+        session,
+        thread_id=thread_id,
+        user_id=user.identity,
+    )
+    if not thread:
+        raise HTTPException(404, f"Thread '{thread_id}' not found")
+
+    active_runs_stmt = (
+        select(RunORM)
+        .where(
+            RunORM.thread_id == thread_id,
+            RunORM.user_id == user.identity,
+            RunORM.status.in_(["pending", "running"]),
+        )
+        .order_by(RunORM.created_at.desc())
+    )
+    active_runs = (await session.scalars(active_runs_stmt)).all()
+
+    cancelled_run_ids: list[str] = []
+    for run in active_runs:
+        run.status = "interrupted"
+        if hasattr(run, "error_message"):
+            run.error_message = (
+                "Interrupted by thread-level cancel endpoint "
+                f"(action={action}, at={_utc_now_iso_z()})."
+            )
+        cancelled_run_ids.append(run.run_id)
+
+    cancel_signal_failures: list[str] = []
+
+    bootstrap_task_cancelled = False
+    active_task = BOOTSTRAP_TASKS.pop(thread_id, None)
+    if active_task is not None and not active_task.done():
+        active_task.cancel()
+        bootstrap_task_cancelled = True
+
+    if bootstrap_state.get("status") == "running":
+        now = _utc_now_iso_z()
+        bootstrap_state["status"] = "idle"
+        bootstrap_state["error"] = "已通过线程级取消接口中断当前初始化任务。"
+        bootstrap_state["finished_at"] = now
+        _append_bootstrap_log(
+            bootstrap_state,
+            level="warning",
+            message=f"收到线程取消请求，action={action}，已中断初始化任务。",
+        )
+        await _persist_bootstrap_state(
+            session,
+            thread=thread,
+            graph_id=graph_id,
+            state=bootstrap_state,
+        )
+    else:
+        await session.commit()
+
+    thread.status = "idle"
+    await session.commit()
+
+    return {
+        "thread_id": thread_id,
+        "action": action,
+        "cancelled_run_ids": cancelled_run_ids,
+        "cancelled_run_count": len(cancelled_run_ids),
+        "cancel_signal_failures": cancel_signal_failures,
+        "bootstrap_task_cancelled": bootstrap_task_cancelled,
+        "thread_status": thread.status,
+        "timestamp": _utc_now_iso_z(),
+    }
+
+
 @router.post("/sandbox/threads/{thread_id}/bootstrap/reset")
 async def reset_sandbox_thread_bootstrap(
     thread_id: str,
@@ -1252,7 +1348,7 @@ async def stream_sandbox_thread_bootstrap_status(
     session_maker = _get_session_maker()
     initial_seq = max(0, from_seq)
 
-    async def _event_stream() -> Any:
+    async def _event_stream() -> AsyncGenerator[str, None]:
         current_seq = initial_seq
         last_snapshot_signature: str | None = None
 

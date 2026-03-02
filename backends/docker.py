@@ -22,7 +22,7 @@ from deepagents.backends.protocol import (
     FileUploadResponse,
 )
 from deepagents.backends.sandbox import BaseSandbox
-from docker.errors import DockerException, NotFound
+from docker.errors import APIError, DockerException, NotFound
 from docker.models.containers import Container
 
 if TYPE_CHECKING:
@@ -309,6 +309,26 @@ class DockerBackend(BaseSandbox):
                     content = file_obj.read()
                 responses.append(
                     FileDownloadResponse(path=path, content=content, error=None)
+                )
+            except NotFound:
+                responses.append(
+                    FileDownloadResponse(
+                        path=path, content=None, error="file_not_found"
+                    )
+                )
+            except APIError as e:
+                if getattr(e, "status_code", None) == 404:
+                    responses.append(
+                        FileDownloadResponse(
+                            path=path, content=None, error="file_not_found"
+                        )
+                    )
+                    continue
+                logger.error("Failed to download file %s: %s", path, e)
+                responses.append(
+                    FileDownloadResponse(
+                        path=path, content=None, error="permission_denied"
+                    )
                 )
             except FileNotFoundError:
                 responses.append(
