@@ -4,12 +4,13 @@ from typing import Any, Literal
 
 from aegra_api.core.auth_deps import require_auth
 from aegra_api.models.auth import User
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from app.auth.core import authenticate_user, create_access_token, register_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+ACCESS_TOKEN_COOKIE_NAME = "aegra_access_token"  # nosec B105
 
 
 class LoginRequest(BaseModel):
@@ -31,7 +32,7 @@ class LoginResponse(BaseModel):
 
 
 @router.post("/register", response_model=LoginResponse)
-async def register(payload: RegisterRequest) -> LoginResponse:
+async def register(payload: RegisterRequest, response: Response) -> LoginResponse:
     try:
         user = register_user(
             username=payload.username,
@@ -51,11 +52,19 @@ async def register(payload: RegisterRequest) -> LoginResponse:
         ) from exc
 
     token = create_access_token(user)
+    response.set_cookie(
+        key=ACCESS_TOKEN_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        path="/",
+    )
     return LoginResponse(access_token=token, user=user)
 
 
 @router.post("/login", response_model=LoginResponse)
-async def login(payload: LoginRequest) -> LoginResponse:
+async def login(payload: LoginRequest, response: Response) -> LoginResponse:
     try:
         user = authenticate_user(username=payload.username, password=payload.password)
     except ValueError as exc:
@@ -65,6 +74,14 @@ async def login(payload: LoginRequest) -> LoginResponse:
         ) from exc
 
     token = create_access_token(user)
+    response.set_cookie(
+        key=ACCESS_TOKEN_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        path="/",
+    )
     return LoginResponse(access_token=token, user=user)
 
 
@@ -83,5 +100,8 @@ async def me(user: User = Depends(require_auth)) -> dict[str, Any]:
 
 
 @router.post("/logout")
-async def logout(_user: User = Depends(require_auth)) -> dict[str, bool]:
+async def logout(
+    response: Response, _user: User = Depends(require_auth)
+) -> dict[str, bool]:
+    response.delete_cookie(ACCESS_TOKEN_COOKIE_NAME, path="/")
     return {"ok": True}

@@ -13,8 +13,10 @@ from aegra_api.core.orm import get_session
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from app.auth import aegra_auth
 from app.auth.core import reset_auth_state_for_tests
 from app.main import app
+from app.routers import code_review as code_review_router
 from app.routers import sandbox as sandbox_router
 from app.routers import scm as scm_router
 
@@ -62,6 +64,7 @@ def test_auth_register_and_login_smoke(client: TestClient) -> None:
     register_payload = register_response.json()
     assert isinstance(register_payload["access_token"], str)
     assert register_payload["access_token"].count(".") == 2
+    assert "aegra_access_token=" in register_response.headers.get("set-cookie", "")
 
     login_response = client.post(
         "/auth/login",
@@ -73,6 +76,21 @@ def test_auth_register_and_login_smoke(client: TestClient) -> None:
 
     assert login_response.status_code == 200
     assert login_response.json()["user"]["identity"] == "new_user"
+    assert "aegra_access_token=" in login_response.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_aegra_auth_supports_cookie_token(client: TestClient) -> None:
+    login_response = client.post(
+        "/auth/register",
+        json={
+            "username": "cookie-user",
+            "password": "secret123",
+        },
+    )
+    token = login_response.json()["access_token"]
+    payload = await aegra_auth.authenticate({"Cookie": f"aegra_access_token={token}"})
+    assert payload["identity"] == "cookie_user"
 
 
 def test_auth_register_conflict_smoke(client: TestClient) -> None:
@@ -832,3 +850,255 @@ def test_scm_oauth_callback_rejects_mismatched_redirect_uri(client: TestClient) 
         "ok": False,
         "error": "OAuth redirect_uri 与授权请求不匹配",
     }
+
+
+def test_code_review_settings_routes_smoke(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_store: dict[str, Any] = {
+        "user_id": "local-dev",
+        "auto_review_enabled": False,
+        "default_trigger": "pr_open",
+        "updated_at": None,
+        "updated_by": None,
+    }
+    repo_store: list[dict[str, Any]] = []
+
+    async def fake_select_profile(user_id: str) -> dict[str, Any]:
+        assert user_id == "local-dev"
+        return dict(profile_store)
+
+    async def fake_upsert_profile(
+        *,
+        user_id: str,
+        auto_review_enabled: bool,
+        default_trigger: str,
+        updated_by: str,
+    ) -> None:
+        profile_store.update(
+            {
+                "user_id": user_id,
+                "auto_review_enabled": auto_review_enabled,
+                "default_trigger": default_trigger,
+                "updated_at": time.time(),
+                "updated_by": updated_by,
+            }
+        )
+
+    async def fake_list_repo_settings(user_id: str) -> list[dict[str, Any]]:
+        assert user_id == "local-dev"
+        return list(repo_store)
+
+    async def fake_upsert_repo_setting(
+        *,
+        user_id: str,
+        provider: str,
+        repository: str,
+        gitlab_base_url: str | None,
+        auto_review: str,
+        trigger: str,
+        updated_by: str,
+    ) -> None:
+        repo_store.clear()
+        repo_store.append(
+            {
+                "provider": provider,
+                "repository": repository,
+                "gitlab_base_url": gitlab_base_url,
+                "auto_review": auto_review,
+                "trigger": trigger,
+                "updated_by": updated_by,
+                "updated_at": time.time(),
+            }
+        )
+        assert user_id == "local-dev"
+
+    async def fake_delete_repo_setting(
+        *,
+        user_id: str,
+        provider: str,
+        repository: str,
+        gitlab_base_url: str | None,
+    ) -> bool:
+        _ = (user_id, provider, repository, gitlab_base_url)
+        if not repo_store:
+            return False
+        repo_store.clear()
+        return True
+
+    async def fake_sync_repo_webhook_if_needed(
+        *,
+        user_id: str,
+        provider: str,
+        repository: str,
+        gitlab_base_url: str | None,
+        auto_review: str,
+        request: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        assert user_id == "local-dev"
+        return {
+            "enabled": auto_review == "enabled",
+            "ok": True,
+            "mode": "auto",
+            "message": "ok",
+            "provider": provider,
+            "repository": repository,
+            "webhook_url": "https://example.com/integrations/code-review/webhook",
+            "manual_setup": None,
+            "gitlab_base_url": gitlab_base_url,
+        }
+
+    monkeypatch.setattr(code_review_router, "_select_profile", fake_select_profile)
+    monkeypatch.setattr(code_review_router, "_upsert_profile", fake_upsert_profile)
+    monkeypatch.setattr(
+        code_review_router, "_list_repo_settings", fake_list_repo_settings
+    )
+    monkeypatch.setattr(
+        code_review_router, "_upsert_repo_setting", fake_upsert_repo_setting
+    )
+    monkeypatch.setattr(
+        code_review_router, "_delete_repo_setting", fake_delete_repo_setting
+    )
+    monkeypatch.setattr(
+        code_review_router,
+        "_sync_repo_webhook_if_needed",
+        fake_sync_repo_webhook_if_needed,
+    )
+
+    get_response = client.get("/integrations/code-review/settings")
+    assert get_response.status_code == 200
+    assert get_response.json()["global"]["auto_review_enabled"] is False
+
+    update_global = client.put(
+        "/integrations/code-review/settings/global",
+        json={"auto_review_enabled": True, "default_trigger": "push"},
+    )
+    assert update_global.status_code == 200
+    assert update_global.json()["global"]["default_trigger"] == "push"
+
+    update_repo = client.put(
+        "/integrations/code-review/settings/repositories",
+        json={
+            "provider": "github",
+            "repository": "owner/repo-a",
+            "auto_review": "enabled",
+            "trigger": "pr_open",
+        },
+    )
+    assert update_repo.status_code == 200
+    assert len(update_repo.json()["repositories"]) == 1
+    assert update_repo.json()["repositories"][0]["repository"] == "owner/repo-a"
+    assert update_repo.json()["webhook_sync"]["ok"] is True
+
+    delete_repo = client.delete(
+        "/integrations/code-review/settings/repositories",
+        params={"provider": "github", "repository": "owner/repo-a"},
+    )
+    assert delete_repo.status_code == 200
+    assert delete_repo.json()["deleted"] is True
+
+
+def test_code_review_webhook_dispatches_enabled_targets(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    targets = [
+        {"user_id": "local-dev", "provider": "github", "repository": "owner/repo-a"}
+    ]
+    dispatched: list[dict[str, Any]] = []
+
+    async def fake_resolve_targets(
+        event: code_review_router.WebhookEventContext,
+    ) -> list[dict[str, Any]]:
+        assert event.provider == "github"
+        assert event.trigger == "push"
+        assert event.repository == "owner/repo-a"
+        return targets
+
+    async def fake_dispatch(
+        *,
+        target: dict[str, Any],
+        event: code_review_router.WebhookEventContext,
+    ) -> dict[str, Any]:
+        dispatched.append({"target": target, "repository": event.repository})
+        return {"ok": True, "run_id": "run-1", "thread_id": "th-1"}
+
+    monkeypatch.setattr(
+        code_review_router, "_resolve_webhook_targets", fake_resolve_targets
+    )
+    monkeypatch.setattr(code_review_router, "_dispatch_code_review_run", fake_dispatch)
+
+    response = client.post(
+        "/integrations/code-review/webhook",
+        headers={"x-github-event": "push"},
+        json={
+            "repository": {"full_name": "owner/repo-a"},
+            "ref": "refs/heads/main",
+            "head_commit": {"message": "fix: sample"},
+            "before": "a" * 40,
+            "after": "b" * 40,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["target_count"] == 1
+    assert payload["success_count"] == 1
+    assert len(dispatched) == 1
+
+
+def test_code_review_repo_setting_returns_manual_webhook_fallback(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_upsert_repo_setting(**kwargs: Any) -> None:  # noqa: ANN401
+        _ = kwargs
+        return None
+
+    async def fake_list_repo_settings(user_id: str) -> list[dict[str, Any]]:
+        assert user_id == "local-dev"
+        return []
+
+    async def fake_sync_repo_webhook_if_needed(**kwargs: Any) -> dict[str, Any]:  # noqa: ANN401
+        _ = kwargs
+        return {
+            "enabled": True,
+            "ok": False,
+            "mode": "manual",
+            "message": "权限不足，无法自动创建 webhook",
+            "provider": "gitlab",
+            "repository": "group/project",
+            "webhook_url": "https://server.example/integrations/code-review/webhook",
+            "manual_setup": {
+                "provider": "gitlab",
+                "events": ["Push Hook", "Merge Request Hook"],
+            },
+        }
+
+    monkeypatch.setattr(
+        code_review_router, "_upsert_repo_setting", fake_upsert_repo_setting
+    )
+    monkeypatch.setattr(
+        code_review_router, "_list_repo_settings", fake_list_repo_settings
+    )
+    monkeypatch.setattr(
+        code_review_router,
+        "_sync_repo_webhook_if_needed",
+        fake_sync_repo_webhook_if_needed,
+    )
+
+    response = client.put(
+        "/integrations/code-review/settings/repositories",
+        json={
+            "provider": "gitlab",
+            "repository": "group/project",
+            "gitlab_base_url": "https://gitlab.example.com",
+            "auto_review": "enabled",
+            "trigger": "pr_open",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["webhook_sync"]["ok"] is False
+    assert payload["webhook_sync"]["mode"] == "manual"
+    assert payload["webhook_sync"]["manual_setup"]["provider"] == "gitlab"

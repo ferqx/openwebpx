@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from http.cookies import SimpleCookie
 from typing import Any
 
 from langgraph_sdk import Auth
@@ -15,18 +16,36 @@ def _get_user_attr(user: Any, key: str) -> Any:
     return getattr(user, key, None)
 
 
+def _extract_bearer_token(headers: dict[str, str]) -> str | None:
+    auth_header = headers.get("authorization", "") or headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        return token or None
+
+    cookie_header = headers.get("cookie", "") or headers.get("Cookie", "")
+    if not cookie_header:
+        return None
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header)
+    except Exception:  # pragma: no cover - malformed cookie fallback
+        return None
+
+    morsel = cookie.get("aegra_access_token")
+    if morsel is None:
+        return None
+    value = morsel.value.strip()
+    return value or None
+
+
 @auth.authenticate
 async def authenticate(headers: dict) -> dict:
-    auth_header = headers.get("authorization", "") or headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+    token = _extract_bearer_token(headers)
+    if not token:
         raise Auth.exceptions.HTTPException(
             status_code=401,
-            detail="Missing or invalid Authorization header",
+            detail="Missing or invalid Authorization header/cookie",
         )
-
-    token = auth_header[7:].strip()
-    if not token:
-        raise Auth.exceptions.HTTPException(status_code=401, detail="Missing token")
 
     try:
         return decode_access_token(token)
