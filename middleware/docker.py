@@ -729,18 +729,80 @@ class DockerMiddleware(AgentMiddleware):
             return f"{base} -- --host {BIND_ALL_HOST} --port {port}"
         return base
 
-    def _install_dependencies(
+    def _resolve_package_manager_spec(
+        self,
+        *,
+        package_manager: str,
+        package_json: dict[str, Any] | None,
+    ) -> str:
+        """解析包管理器版本规格，优先读取 package.json#packageManager。"""
+        if not isinstance(package_json, dict):
+            return f"{package_manager}@latest"
+        raw = package_json.get("packageManager")
+        if isinstance(raw, str):
+            normalized = raw.strip()
+            if normalized.lower().startswith(f"{package_manager}@"):
+                return normalized
+        return f"{package_manager}@latest"
+
+    def _ensure_package_manager_available(
         self,
         container: Container,
         package_manager: str,
         *,
+        package_json: dict[str, Any] | None = None,
         reporter: Callable[[str, str, str], None] | None = None,
     ) -> tuple[bool, str | None]:
+        """确保包管理器可用；缺失时尝试通过 corepack 自动激活。"""
         has_pm, _ = self._exec(
             container, f"command -v {package_manager} >/dev/null 2>&1"
         )
-        if has_pm != 0:
-            message = f"Package manager '{package_manager}' is required but not available in container."
+        if has_pm == 0:
+            return True, None
+
+        if package_manager not in {"pnpm", "yarn"}:
+            return (
+                False,
+                f"Package manager '{package_manager}' is required but not available in container.",
+            )
+
+        pm_spec = self._resolve_package_manager_spec(
+            package_manager=package_manager,
+            package_json=package_json,
+        )
+        self._report_progress(
+            reporter,
+            stage="bootstrap",
+            level="info",
+            message=f"检测到缺少 {package_manager}，尝试通过 corepack 激活：{pm_spec}",
+        )
+        setup_cmd = (
+            "if command -v corepack >/dev/null 2>&1; then "
+            "corepack enable >/dev/null 2>&1 || true; "
+            f"corepack prepare {shlex.quote(pm_spec)} --activate; "
+            "else exit 127; fi"
+        )
+        code, output = self._exec_stream(
+            container,
+            setup_cmd,
+            on_output_line=(
+                lambda line: self._report_progress(
+                    reporter,
+                    stage="bootstrap",
+                    level="info",
+                    message=f"[corepack] {line}",
+                )
+            )
+            if reporter is not None
+            else None,
+        )
+        if code != 0:
+            message = (
+                f"Package manager '{package_manager}' is required but not available in container "
+                f"(auto-provision via corepack failed)."
+            )
+            if output.strip():
+                message = f"{message}\n{output[-2000:]}"
             self._report_progress(
                 reporter,
                 stage="bootstrap",
@@ -748,6 +810,79 @@ class DockerMiddleware(AgentMiddleware):
                 message=message,
             )
             return False, message
+
+        has_pm_after, _ = self._exec(
+            container, f"command -v {package_manager} >/dev/null 2>&1"
+        )
+        if has_pm_after != 0:
+            message = (
+                f"Package manager '{package_manager}' is required but not available in container "
+                "(corepack activation did not expose command)."
+            )
+            self._report_progress(
+                reporter,
+                stage="bootstrap",
+                level="error",
+                message=message,
+            )
+            return False, message
+
+        self._report_progress(
+            reporter,
+            stage="bootstrap",
+            level="info",
+            message=f"{package_manager} 已就绪。",
+        )
+        return True, None
+
+    def _resolve_runtime_package_manager(
+        self,
+        container: Container,
+        *,
+        detected_manager: str,
+        package_json: dict[str, Any] | None = None,
+        reporter: Callable[[str, str, str], None] | None = None,
+    ) -> tuple[str | None, str | None]:
+        """解析运行时可用包管理器；必要时从 pnpm/yarn 受控降级到 npm。"""
+        pm_ready, pm_error = self._ensure_package_manager_available(
+            container,
+            detected_manager,
+            package_json=package_json,
+            reporter=reporter,
+        )
+        if pm_ready:
+            return detected_manager, None
+
+        if detected_manager in {"pnpm", "yarn"}:
+            npm_ready, _ = self._exec(container, "command -v npm >/dev/null 2>&1")
+            if npm_ready == 0:
+                warn_message = f"Package manager '{detected_manager}' unavailable; fallback to npm for bootstrap."
+                self._report_progress(
+                    reporter,
+                    stage="bootstrap",
+                    level="warning",
+                    message=warn_message,
+                )
+                return "npm", None
+
+        return None, pm_error
+
+    def _install_dependencies(
+        self,
+        container: Container,
+        package_manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,
+        reporter: Callable[[str, str, str], None] | None = None,
+    ) -> tuple[bool, str | None]:
+        pm_ready, pm_error = self._ensure_package_manager_available(
+            container,
+            package_manager,
+            package_json=package_json,
+            reporter=reporter,
+        )
+        if not pm_ready:
+            return False, pm_error
 
         # 若 node_modules 已存在则跳过安装，加速增量修复场景。
         has_node_modules, _ = self._exec(container, "[ -d node_modules ]")
@@ -1005,11 +1140,17 @@ class DockerMiddleware(AgentMiddleware):
 
         status["app_detected"] = True
         framework = self._detect_framework(package_json)
-        package_manager = self._detect_package_manager(container)
+        detected_package_manager = self._detect_package_manager(container)
+        package_manager, manager_error = self._resolve_runtime_package_manager(
+            container,
+            detected_manager=detected_package_manager,
+            package_json=package_json,
+            reporter=reporter,
+        )
         start_script = self._resolve_start_script(package_json)
         start_command = (
             self._build_start_command(
-                package_manager=package_manager,
+                package_manager=package_manager or detected_package_manager,
                 start_script=start_script,
                 framework=framework,
                 port=self.default_container_port,
@@ -1018,15 +1159,19 @@ class DockerMiddleware(AgentMiddleware):
             else None
         )
         status["framework"] = framework
-        status["package_manager"] = package_manager
+        status["package_manager"] = package_manager or detected_package_manager
         status["start_script"] = start_script
         status["start_command"] = start_command
 
-        installed, install_error = self._install_dependencies(
-            container,
-            package_manager,
-            reporter=reporter,
-        )
+        if package_manager is None:
+            installed, install_error = False, manager_error
+        else:
+            installed, install_error = self._install_dependencies(
+                container,
+                package_manager,
+                package_json=package_json,
+                reporter=reporter,
+            )
         status["dependencies_installed"] = installed
         if not installed:
             status["startup_error"] = install_error

@@ -126,3 +126,164 @@ def test_before_agent_persists_thread_container_mapping_to_store() -> None:
             {"container_id": "cid-1"},
         )
     ]
+
+
+def test_install_dependencies_auto_provisions_pnpm_via_corepack() -> None:
+    middleware = DockerMiddleware()
+    state = {"pnpm_ready": False}
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command.startswith("command -v pnpm"):
+            return (0, "") if state["pnpm_ready"] else (1, "")
+        if command == "[ -d node_modules ]":
+            return 1, ""
+        return 0, ""
+
+    def fake_exec_stream(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+        on_output_line: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[int, str]:
+        if "corepack prepare" in command:
+            state["pnpm_ready"] = True
+            return 0, "prepared"
+        if command == "pnpm install":
+            return 0, "installed"
+        return 1, "unexpected command"
+
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+    middleware._exec_stream = fake_exec_stream  # type: ignore[method-assign]
+
+    ok, err = middleware._install_dependencies(
+        object(),
+        "pnpm",
+        package_json={"packageManager": "pnpm@9.0.0"},
+    )
+
+    assert ok is True
+    assert err is None
+
+
+def test_install_dependencies_reports_error_when_corepack_provision_fails() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command.startswith("command -v pnpm"):
+            return 1, ""
+        return 0, ""
+
+    def fake_exec_stream(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+        on_output_line: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[int, str]:
+        if "corepack prepare" in command:
+            return 127, "corepack: command not found"
+        return 1, "unexpected command"
+
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+    middleware._exec_stream = fake_exec_stream  # type: ignore[method-assign]
+
+    ok, err = middleware._install_dependencies(
+        object(),
+        "pnpm",
+        package_json={"packageManager": "pnpm@9.0.0"},
+    )
+
+    assert ok is False
+    assert isinstance(err, str)
+    assert "auto-provision via corepack failed" in err
+
+
+def test_resolve_runtime_package_manager_falls_back_to_npm() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_ensure(
+        _container: Any,
+        _manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,  # noqa: ARG001
+        reporter: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[bool, str | None]:
+        return False, "pnpm unavailable"
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command == "command -v npm >/dev/null 2>&1":
+            return 0, ""
+        return 1, ""
+
+    middleware._ensure_package_manager_available = fake_ensure  # type: ignore[method-assign]
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+
+    manager, err = middleware._resolve_runtime_package_manager(
+        object(),
+        detected_manager="pnpm",
+    )
+
+    assert manager == "npm"
+    assert err is None
+
+
+def test_resolve_runtime_package_manager_returns_error_without_fallback() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_ensure(
+        _container: Any,
+        _manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,  # noqa: ARG001
+        reporter: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[bool, str | None]:
+        return False, "pm unavailable"
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command == "command -v npm >/dev/null 2>&1":
+            return 1, ""
+        return 1, ""
+
+    middleware._ensure_package_manager_available = fake_ensure  # type: ignore[method-assign]
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+
+    manager, err = middleware._resolve_runtime_package_manager(
+        object(),
+        detected_manager="pnpm",
+    )
+
+    assert manager is None
+    assert err == "pm unavailable"

@@ -329,9 +329,11 @@ async def _set_scm_token_payload(
         github_auth_mode = (
             payload.get("github_auth_mode")
             if isinstance(payload.get("github_auth_mode"), str)
-            else provider_scope.split(":", 1)[1]
-            if ":" in provider_scope
-            else "github_app"
+            else (
+                provider_scope.split(":", 1)[1]
+                if ":" in provider_scope
+                else "github_app"
+            )
         )
         github_auth_mode = _normalize_github_auth_mode(github_auth_mode)
     else:
