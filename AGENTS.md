@@ -68,6 +68,12 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-03（用户认证增强：数据库持久化 + LDAP 登录）：
+  - 用户认证从文件存储升级为“数据库优先”，新增 `auth_users` 表（迁移：`alembic/versions/20260303110000_add_auth_users_table.py`），支持本地账号信息持久化。
+  - `/auth/register` 与 `/auth/login` 认证链路已异步化并接入数据库；数据库不可用时默认回退文件存储（可通过 `AUTH_FILE_FALLBACK_ENABLED=false` 关闭回退）。
+  - 增加 LDAP 登录分支（`AUTH_LDAP_ENABLED=true` 时启用）：本地认证失败后尝试 LDAP bind，成功后自动 upsert 用户到 `auth_users`（`auth_source=ldap`）。
+  - LDAP 关键配置：`AUTH_LDAP_SERVER_URI`、`AUTH_LDAP_BIND_DN_TEMPLATE`（需包含 `{username}` 占位符），可选 `AUTH_LDAP_DEFAULT_ROLE`、`AUTH_LDAP_DEFAULT_TEAM_ID`。
+  - 新增回归测试：`tests/test_auth_core.py`，覆盖“注册写库路径”和“LDAP 登录成功后回写数据库”。
 - 2026-03-02（代码质量审查 webhook 自动同步）：
   - 仓库级代码审查配置保存时，后端会自动尝试创建/更新对应 GitHub/GitLab webhook（幂等：优先查询已有 hook）。
   - 自动同步失败不阻断配置保存，接口返回 `webhook_sync` 与 `manual_setup` 指引，前端可引导用户手工配置。

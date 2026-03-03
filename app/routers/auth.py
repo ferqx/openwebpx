@@ -34,7 +34,7 @@ class LoginResponse(BaseModel):
 @router.post("/register", response_model=LoginResponse)
 async def register(payload: RegisterRequest, response: Response) -> LoginResponse:
     try:
-        user = register_user(
+        user = await register_user(
             username=payload.username,
             password=payload.password,
             role=payload.role,
@@ -66,7 +66,10 @@ async def register(payload: RegisterRequest, response: Response) -> LoginRespons
 @router.post("/login", response_model=LoginResponse)
 async def login(payload: LoginRequest, response: Response) -> LoginResponse:
     try:
-        user = authenticate_user(username=payload.username, password=payload.password)
+        user = await authenticate_user(
+            username=payload.username,
+            password=payload.password,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
