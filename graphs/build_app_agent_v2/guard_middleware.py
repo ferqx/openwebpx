@@ -17,8 +17,12 @@ from langchain.agents.middleware.types import (
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
-_WRITE_TOOLS = {"edit_file", "write_file"}
+_WRITE_TOOLS = {"edit_file", "write_file", "apply_patch"}
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_PATCH_FILE_HEADER_RE = re.compile(
+    r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$",
+    re.MULTILINE,
+)
 
 
 class ToolGuardState(AgentState):
@@ -123,6 +127,19 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
 
     def _increment_counter(self, state: dict[str, Any], key: str) -> None:
         state[key] = int(state.get(key, 0)) + 1
+
+    def _extract_apply_patch_paths(self, patch_content: Any) -> list[str]:
+        if not isinstance(patch_content, str):
+            return []
+        paths: list[str] = []
+        seen: set[str] = set()
+        for match in _PATCH_FILE_HEADER_RE.finditer(patch_content):
+            path = match.group(1).strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+        return paths
 
     def _read_file_content(
         self, request: ToolCallRequest, file_path: str
@@ -291,6 +308,85 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
         if tool_name not in _WRITE_TOOLS or not isinstance(args, dict):
             return handler(request)
 
+        write_counts = dict(state.get("write_counts_in_round") or {})
+        write_hashes = dict(state.get("write_content_hashes_in_round") or {})
+        write_totals = dict(state.get("writes_per_file_total") or {})
+        edit_totals = dict(state.get("edit_calls_per_file_total") or {})
+        small_edit_totals = dict(state.get("small_edit_calls_per_file_total") or {})
+
+        if tool_name == "apply_patch":
+            if bool(args.get("dry_run")):
+                return handler(request)
+
+            patch_paths = self._extract_apply_patch_paths(args.get("patch_content"))
+            if not patch_paths:
+                self._increment_counter(state, "blocked_writes_total")
+                return ToolMessage(
+                    content=(
+                        "Blocked apply_patch: no `*** Add/Update/Delete File:` "
+                        "path found in patch_content."
+                    ),
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+
+            for path in patch_paths:
+                current_round_writes = int(write_counts.get(path, 0))
+                if current_round_writes >= self.max_writes_per_file_per_round:
+                    self._increment_counter(state, "blocked_writes_total")
+                    return ToolMessage(
+                        content=(
+                            f"Blocked apply_patch for '{path}'. "
+                            "This file has already been written in the current round. "
+                            "Please merge edits into one patch and retry in the next round."
+                        ),
+                        tool_call_id=tool_call_id,
+                        status="error",
+                    )
+
+                current_total_writes = int(write_totals.get(path, 0))
+                if (
+                    self.max_writes_per_file_total > 0
+                    and current_total_writes >= self.max_writes_per_file_total
+                ):
+                    self._increment_counter(state, "blocked_writes_total")
+                    return ToolMessage(
+                        content=(
+                            f"Blocked apply_patch for '{path}'. "
+                            "This file already reached the total write limit for this run. "
+                            "Please consolidate remaining edits into one planned patch."
+                        ),
+                        tool_call_id=tool_call_id,
+                        status="error",
+                    )
+
+            before_map = {
+                path: self._read_file_content(request, path) for path in patch_paths
+            }
+            result = handler(request)
+            after_map = {
+                path: self._read_file_content(request, path) for path in patch_paths
+            }
+
+            for path in patch_paths:
+                metadata = self._build_file_diff_metadata(
+                    tool_name=tool_name,
+                    file_path=path,
+                    before=before_map.get(path),
+                    after=after_map.get(path),
+                )
+                if metadata is not None:
+                    result = self._attach_diff_metadata(result, metadata)
+                    write_counts[path] = int(write_counts.get(path, 0)) + 1
+                    write_totals[path] = int(write_totals.get(path, 0)) + 1
+
+            state["write_counts_in_round"] = write_counts
+            state["write_content_hashes_in_round"] = write_hashes
+            state["writes_per_file_total"] = write_totals
+            state["edit_calls_per_file_total"] = edit_totals
+            state["small_edit_calls_per_file_total"] = small_edit_totals
+            return result
+
         file_path = args.get("file_path")
         if not isinstance(file_path, str) or not file_path.strip():
             return handler(request)
@@ -309,12 +405,6 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
                 tool_call_id=tool_call_id,
                 status="error",
             )
-
-        write_counts = dict(state.get("write_counts_in_round") or {})
-        write_hashes = dict(state.get("write_content_hashes_in_round") or {})
-        write_totals = dict(state.get("writes_per_file_total") or {})
-        edit_totals = dict(state.get("edit_calls_per_file_total") or {})
-        small_edit_totals = dict(state.get("small_edit_calls_per_file_total") or {})
 
         current_round_writes = int(write_counts.get(path, 0))
         if current_round_writes >= self.max_writes_per_file_per_round:
@@ -443,6 +533,87 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
         if tool_name not in _WRITE_TOOLS or not isinstance(args, dict):
             return await handler(request)
 
+        write_counts = dict(state.get("write_counts_in_round") or {})
+        write_hashes = dict(state.get("write_content_hashes_in_round") or {})
+        write_totals = dict(state.get("writes_per_file_total") or {})
+        edit_totals = dict(state.get("edit_calls_per_file_total") or {})
+        small_edit_totals = dict(state.get("small_edit_calls_per_file_total") or {})
+
+        if tool_name == "apply_patch":
+            if bool(args.get("dry_run")):
+                return await handler(request)
+
+            patch_paths = self._extract_apply_patch_paths(args.get("patch_content"))
+            if not patch_paths:
+                self._increment_counter(state, "blocked_writes_total")
+                return ToolMessage(
+                    content=(
+                        "Blocked apply_patch: no `*** Add/Update/Delete File:` "
+                        "path found in patch_content."
+                    ),
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+
+            for path in patch_paths:
+                current_round_writes = int(write_counts.get(path, 0))
+                if current_round_writes >= self.max_writes_per_file_per_round:
+                    self._increment_counter(state, "blocked_writes_total")
+                    return ToolMessage(
+                        content=(
+                            f"Blocked apply_patch for '{path}'. "
+                            "This file has already been written in the current round. "
+                            "Please merge edits into one patch and retry in the next round."
+                        ),
+                        tool_call_id=tool_call_id,
+                        status="error",
+                    )
+
+                current_total_writes = int(write_totals.get(path, 0))
+                if (
+                    self.max_writes_per_file_total > 0
+                    and current_total_writes >= self.max_writes_per_file_total
+                ):
+                    self._increment_counter(state, "blocked_writes_total")
+                    return ToolMessage(
+                        content=(
+                            f"Blocked apply_patch for '{path}'. "
+                            "This file already reached the total write limit for this run. "
+                            "Please consolidate remaining edits into one planned patch."
+                        ),
+                        tool_call_id=tool_call_id,
+                        status="error",
+                    )
+
+            before_map = {
+                path: await self._aread_file_content(request, path)
+                for path in patch_paths
+            }
+            result = await handler(request)
+            after_map = {
+                path: await self._aread_file_content(request, path)
+                for path in patch_paths
+            }
+
+            for path in patch_paths:
+                metadata = self._build_file_diff_metadata(
+                    tool_name=tool_name,
+                    file_path=path,
+                    before=before_map.get(path),
+                    after=after_map.get(path),
+                )
+                if metadata is not None:
+                    result = self._attach_diff_metadata(result, metadata)
+                    write_counts[path] = int(write_counts.get(path, 0)) + 1
+                    write_totals[path] = int(write_totals.get(path, 0)) + 1
+
+            state["write_counts_in_round"] = write_counts
+            state["write_content_hashes_in_round"] = write_hashes
+            state["writes_per_file_total"] = write_totals
+            state["edit_calls_per_file_total"] = edit_totals
+            state["small_edit_calls_per_file_total"] = small_edit_totals
+            return result
+
         file_path = args.get("file_path")
         if not isinstance(file_path, str) or not file_path.strip():
             return await handler(request)
@@ -461,12 +632,6 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
                 tool_call_id=tool_call_id,
                 status="error",
             )
-
-        write_counts = dict(state.get("write_counts_in_round") or {})
-        write_hashes = dict(state.get("write_content_hashes_in_round") or {})
-        write_totals = dict(state.get("writes_per_file_total") or {})
-        edit_totals = dict(state.get("edit_calls_per_file_total") or {})
-        small_edit_totals = dict(state.get("small_edit_calls_per_file_total") or {})
 
         current_round_writes = int(write_counts.get(path, 0))
         if current_round_writes >= self.max_writes_per_file_per_round:

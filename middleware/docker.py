@@ -412,15 +412,17 @@ class DockerMiddleware(AgentMiddleware):
             container,
             sync_cmd,
             on_output_line=(
-                lambda line: self._report_progress(
-                    reporter,
-                    stage="repo",
-                    level="info",
-                    message=self._sanitize_repo_sync_error(line, token),
+                (
+                    lambda line: self._report_progress(
+                        reporter,
+                        stage="repo",
+                        level="info",
+                        message=self._sanitize_repo_sync_error(line, token),
+                    )
                 )
-            )
-            if reporter is not None
-            else None,
+                if reporter is not None
+                else None
+            ),
         )
         if code == 0:
             self._report_progress(
@@ -594,7 +596,10 @@ class DockerMiddleware(AgentMiddleware):
         on_output_line: Callable[[str], None] | None = None,
     ) -> tuple[int, str]:
         """以流式方式执行容器命令，并按行回调输出。"""
-        api = container.client.api
+        container_client = container.client
+        if container_client is None:
+            raise RuntimeError("Docker container client is unavailable")
+        api = container_client.api
         exec_create_resp = api.exec_create(
             container.id,
             cmd=["sh", "-lc", command],
@@ -786,15 +791,17 @@ class DockerMiddleware(AgentMiddleware):
             container,
             setup_cmd,
             on_output_line=(
-                lambda line: self._report_progress(
-                    reporter,
-                    stage="bootstrap",
-                    level="info",
-                    message=f"[corepack] {line}",
+                (
+                    lambda line: self._report_progress(
+                        reporter,
+                        stage="bootstrap",
+                        level="info",
+                        message=f"[corepack] {line}",
+                    )
                 )
-            )
-            if reporter is not None
-            else None,
+                if reporter is not None
+                else None
+            ),
         )
         if code != 0:
             message = (
@@ -911,15 +918,17 @@ class DockerMiddleware(AgentMiddleware):
             container,
             install_cmd,
             on_output_line=(
-                lambda line: self._report_progress(
-                    reporter,
-                    stage="bootstrap",
-                    level="info",
-                    message=f"[deps] {line}",
+                (
+                    lambda line: self._report_progress(
+                        reporter,
+                        stage="bootstrap",
+                        level="info",
+                        message=f"[deps] {line}",
+                    )
                 )
-            )
-            if reporter is not None
-            else None,
+                if reporter is not None
+                else None
+            ),
         )
         if code != 0:
             return (
@@ -1147,10 +1156,11 @@ class DockerMiddleware(AgentMiddleware):
             package_json=package_json,
             reporter=reporter,
         )
+        runtime_package_manager: str = package_manager or detected_package_manager
         start_script = self._resolve_start_script(package_json)
         start_command = (
             self._build_start_command(
-                package_manager=package_manager or detected_package_manager,
+                package_manager=runtime_package_manager,
                 start_script=start_script,
                 framework=framework,
                 port=self.default_container_port,
@@ -1159,7 +1169,7 @@ class DockerMiddleware(AgentMiddleware):
             else None
         )
         status["framework"] = framework
-        status["package_manager"] = package_manager or detected_package_manager
+        status["package_manager"] = runtime_package_manager
         status["start_script"] = start_script
         status["start_command"] = start_command
 
@@ -1201,7 +1211,7 @@ class DockerMiddleware(AgentMiddleware):
                 status["startup_attempted"] = True
                 started, start_error = self._start_service(
                     container,
-                    package_manager=package_manager,
+                    package_manager=runtime_package_manager,
                     start_script=start_script,
                     framework=framework,
                     port=self.default_container_port,

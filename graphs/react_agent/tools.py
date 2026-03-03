@@ -7,6 +7,7 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.runtime import get_runtime
 from qdrant_client import QdrantClient, models
+
 from react_agent.context import Context
 from react_agent.utils import load_embedding_model
 
@@ -45,11 +46,11 @@ def search_latest_tech_docs(url: str, query: str):
 
     if not doc_exists:
         print(f"--- 未发现缓存，正在下载文档: {url} ---")
-        res = requests.get(url)
+        res = requests.get(url, timeout=15)
         if res.status_code != 200:
             return "无法获取文档，请确认 URL 是否正确。"
 
-        print(f"--- 文档下载成功，开始处理与入库 ---")
+        print("--- 文档下载成功，开始处理与入库 ---")
 
         # 切分与入库
         text_splitter = RecursiveCharacterTextSplitter(
@@ -67,11 +68,11 @@ def search_latest_tech_docs(url: str, query: str):
             embedding=load_embedding_model(runtime.context.embedding_model),
             collection_name=collection_name,
         )
-        print(f"--- 文档已入库 ---")
+        print("--- 文档已入库 ---")
     else:
-        print(f"--- 发现缓存文档，直接使用 ---")
+        print("--- 发现缓存文档，直接使用 ---")
 
-    print(f"--- 开始搜索 ---")
+    print("--- 开始搜索 ---")
 
     # 初始化向量库对象用于搜索
     vector_store = QdrantVectorStore(

@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.summarization import (
     SummarizationMiddleware,
@@ -27,6 +26,9 @@ from middleware.docker import build_web_sandbox_docker_middleware
 try:
     from graphs.build_app_agent_v2.guard_middleware import ToolCallGuardMiddleware
     from graphs.build_app_agent_v2.prompts import build_system_prompt
+    from graphs.build_app_agent_v2.v4a_filesystem_middleware import (
+        V4AFilesystemMiddleware,
+    )
 except ModuleNotFoundError:
     _module_dir = Path(__file__).resolve().parent
     _module_dir_str = str(_module_dir)
@@ -34,6 +36,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, _module_dir_str)
     from guard_middleware import ToolCallGuardMiddleware
     from prompts import build_system_prompt
+    from v4a_filesystem_middleware import V4AFilesystemMiddleware
 
 
 def _infer_prompt_profile(model_provider: str, model_name: str) -> str:
@@ -116,6 +119,15 @@ Usage constraints:
 - Do not narrate intermediate micro-steps between partial edits; execute then summarize.
 """.strip()
 
+APPLY_PATCH_DESCRIPTION = """
+Apply a single merged patch with minimal hunks.
+
+Recommended flow:
+1. First call `apply_patch` with `dry_run=true` to validate matching and preconditions.
+2. If dry-run passes, call the same patch with `dry_run=false` to commit.
+3. If dry-run fails, re-read target file and regenerate the patch with exact context.
+""".strip()
+
 _middleware: list[AgentMiddleware[Any, Any, Any]] = []
 
 if ENABLE_TODO_MIDDLEWARE:
@@ -123,9 +135,12 @@ if ENABLE_TODO_MIDDLEWARE:
 
 _middleware.extend(
     [
-        FilesystemMiddleware(
+        V4AFilesystemMiddleware(
             backend=DockerBackend,
-            custom_tool_descriptions={"edit_file": EDIT_FILE_DESCRIPTION},
+            custom_tool_descriptions={
+                "edit_file": EDIT_FILE_DESCRIPTION,
+                "apply_patch": APPLY_PATCH_DESCRIPTION,
+            },
         ),
         SummarizationMiddleware(
             model=MODEL,
