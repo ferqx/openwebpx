@@ -1,27 +1,59 @@
-FROM alpine:latest
+FROM alpine:3.20
 
-# 设置环境变量
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
-# 安装系统依赖
+# Preinstall common tooling for coding-agent terminal workflows.
 RUN apk add --no-cache \
-    python3 \
-    py3-pip \
+    bash \
+    ca-certificates \
+    coreutils \
+    curl \
+    diffutils \
+    fd \
+    file \
+    findutils \
+    gawk \
+    git \
+    git-lfs \
+    grep \
+    jq \
+    less \
+    make \
+    nano \
     nodejs \
     npm \
-    git \
-    curl \
-    && npm install -g pm2
+    openssh-client \
+    patch \
+    procps \
+    py3-pip \
+    python3 \
+    ripgrep \
+    rsync \
+    sed \
+    tar \
+    tree \
+    tzdata \
+    unzip \
+    util-linux \
+    vim \
+    wget \
+    xz \
+    zip \
+    && npm install -g pm2 \
+    && npm install -g pnpm yarn \
+    && update-ca-certificates
 
-# 创建应用目录
-WORKDIR /app
+WORKDIR /workspace
 
-# 验证安装
 RUN echo "Python: $(python3 --version)" && \
     echo "Node: $(node --version)" && \
     echo "NPM: $(npm --version)" && \
+    echo "PNPM: $(pnpm --version)" && \
+    echo "Yarn: $(yarn --version)" && \
     echo "PM2: $(pm2 --version)" && \
-    echo "Git: $(git --version)"
+    echo "Git: $(git --version)" && \
+    echo "rg: $(rg --version | head -1)"
 
-# 设置默认命令
-CMD ["/bin/sh"]
+CMD ["/bin/bash"]

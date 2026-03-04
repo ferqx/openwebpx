@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import posixpath
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -140,6 +141,15 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
             seen.add(path)
             paths.append(path)
         return paths
+
+    def _normalize_workspace_path(self, file_path: str) -> str:
+        """Normalize file paths so sandbox reads are anchored under /workspace."""
+        path = file_path.strip()
+        if not path:
+            return path
+        if path.startswith("/"):
+            return posixpath.normpath(path)
+        return posixpath.normpath(posixpath.join("/workspace", path))
 
     def _read_file_content(
         self, request: ToolCallRequest, file_path: str
@@ -361,11 +371,19 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
                     )
 
             before_map = {
-                path: self._read_file_content(request, path) for path in patch_paths
+                path: self._read_file_content(
+                    request,
+                    self._normalize_workspace_path(path),
+                )
+                for path in patch_paths
             }
             result = handler(request)
             after_map = {
-                path: self._read_file_content(request, path) for path in patch_paths
+                path: self._read_file_content(
+                    request,
+                    self._normalize_workspace_path(path),
+                )
+                for path in patch_paths
             }
 
             for path in patch_paths:
@@ -586,12 +604,18 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
                     )
 
             before_map = {
-                path: await self._aread_file_content(request, path)
+                path: await self._aread_file_content(
+                    request,
+                    self._normalize_workspace_path(path),
+                )
                 for path in patch_paths
             }
             result = await handler(request)
             after_map = {
-                path: await self._aread_file_content(request, path)
+                path: await self._aread_file_content(
+                    request,
+                    self._normalize_workspace_path(path),
+                )
                 for path in patch_paths
             }
 

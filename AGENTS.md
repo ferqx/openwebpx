@@ -24,6 +24,7 @@ AI 代理在本仓库工作时请遵循以下协议。
 - 保持导入、命名、类型标注、错误处理风格与现有代码一致。
 - 非必要不引入新依赖、不做大规模重构。
 - 涉及数据库变更时，使用 `scripts/migrate.py` 和 Alembic 流程。
+- 新增或修改的“非直观逻辑”必须添加简短注释，说明意图与约束（避免解释显而易见的语句）。
 
 ## 5. 测试与质量门禁
 - 常用命令（详见 `CLAUDE.md`）：
@@ -68,6 +69,12 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-04（build_app_agent_v2 工具链与沙箱增强）：
+  - `build_app_agent_v2` 新增 `update_plan` 工具（在 `PatchFilesystemMiddleware` 注册），支持计划步骤校验与状态回写，避免提示词要求与可用工具不一致导致 `update_plan is not a valid tool`。
+  - 修复 `ToolCallGuardMiddleware` 在 `apply_patch` 场景下的 diff 元数据采集：相对路径统一归一到 `/workspace/...` 后再读取，确保 `additional_kwargs.file_diff`/`tool_file_diffs` 可用于前端渲染。
+  - 前端 `openwebpx-ui` 增加 `apply_patch` diff 回退解析：当后端未返回 `file_diff` 时，可从 `ai.tool_calls[].args.patch_content` 解析文件路径、增删行与 old/new 文本并渲染差异视图。
+  - Web 沙箱默认镜像由 `node:20-bookworm` 切换为 `sandbox-agent:latest`（`middleware/docker.py`），并重建镜像。
+  - `deployments/docker/Dockerfile.agent` 增强：预装常用终端工具（含 `ripgrep`、`fd`、`jq`、`git`、`python3`、`node`、`pnpm`、`yarn`、`patch` 等），避免运行期 `rg: not found`。
 - 2026-03-03（用户认证增强：数据库持久化 + LDAP 登录）：
   - 用户认证从文件存储升级为“数据库优先”，新增 `auth_users` 表（迁移：`alembic/versions/20260303110000_add_auth_users_table.py`），支持本地账号信息持久化。
   - `/auth/register` 与 `/auth/login` 认证链路已异步化并接入数据库；数据库不可用时默认回退文件存储（可通过 `AUTH_FILE_FALLBACK_ENABLED=false` 关闭回退）。

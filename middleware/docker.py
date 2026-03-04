@@ -32,7 +32,7 @@ from sqlalchemy import select
 logger = logging.getLogger(__name__)
 # 沙盒内服务必须监听全接口，才能通过 Docker 端口映射被宿主机预览访问。
 BIND_ALL_HOST = "0.0.0.0"  # nosec B104
-DEFAULT_WEB_SANDBOX_IMAGE = "node:20-bookworm"
+DEFAULT_WEB_SANDBOX_IMAGE = "sandbox-agent:latest"
 DEFAULT_WEB_SANDBOX_CONTAINER_PORT = 3000
 
 
@@ -663,7 +663,21 @@ class DockerMiddleware(AgentMiddleware):
             return None
         return payload if isinstance(payload, dict) else None
 
-    def _detect_package_manager(self, container: Container) -> str:
+    def _detect_package_manager(
+        self,
+        container: Container,
+        *,
+        package_json: dict[str, Any] | None = None,
+    ) -> str:
+        # package.json#packageManager 优先级最高，显式声明即视为强约束。
+        if isinstance(package_json, dict):
+            pm_raw = package_json.get("packageManager")
+            if isinstance(pm_raw, str):
+                normalized = pm_raw.strip().lower()
+                for manager in ("pnpm", "yarn", "npm"):
+                    if normalized.startswith(f"{manager}@"):
+                        return manager
+
         # 锁文件强约束：存在锁文件时必须使用对应包管理器，避免误用导致依赖树漂移。
         lockfile_checks: list[tuple[str, str]] = [
             (
@@ -687,6 +701,24 @@ class DockerMiddleware(AgentMiddleware):
             if code == 0:
                 return manager
         return "npm"
+
+    def _has_workspace_protocol(self, package_json: dict[str, Any] | None) -> bool:
+        if not isinstance(package_json, dict):
+            return False
+        dependency_sections = (
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        )
+        for section_name in dependency_sections:
+            section = package_json.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            for value in section.values():
+                if isinstance(value, str) and value.strip().startswith("workspace:"):
+                    return True
+        return False
 
     def _resolve_start_script(self, package_json: dict[str, Any]) -> str | None:
         # 优先 dev，其次 start/preview，兼容大多数前端项目脚本约定。
@@ -861,6 +893,32 @@ class DockerMiddleware(AgentMiddleware):
             return detected_manager, None
 
         if detected_manager in {"pnpm", "yarn"}:
+            strict_manager_declared = False
+            if isinstance(package_json, dict):
+                pm_raw = package_json.get("packageManager")
+                if isinstance(pm_raw, str):
+                    normalized = pm_raw.strip().lower()
+                    strict_manager_declared = normalized.startswith(
+                        f"{detected_manager}@"
+                    )
+            if strict_manager_declared or self._has_workspace_protocol(package_json):
+                strict_reason = (
+                    "package.json#packageManager"
+                    if strict_manager_declared
+                    else "workspace protocol dependencies"
+                )
+                message = (
+                    f"Package manager '{detected_manager}' is required by {strict_reason}; "
+                    "refusing fallback to npm."
+                )
+                self._report_progress(
+                    reporter,
+                    stage="bootstrap",
+                    level="error",
+                    message=message,
+                )
+                return None, message
+
             npm_ready, _ = self._exec(container, "command -v npm >/dev/null 2>&1")
             if npm_ready == 0:
                 warn_message = f"Package manager '{detected_manager}' unavailable; fallback to npm for bootstrap."
@@ -1149,7 +1207,10 @@ class DockerMiddleware(AgentMiddleware):
 
         status["app_detected"] = True
         framework = self._detect_framework(package_json)
-        detected_package_manager = self._detect_package_manager(container)
+        detected_package_manager = self._detect_package_manager(
+            container,
+            package_json=package_json,
+        )
         package_manager, manager_error = self._resolve_runtime_package_manager(
             container,
             detected_manager=detected_package_manager,

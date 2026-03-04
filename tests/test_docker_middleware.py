@@ -287,3 +287,55 @@ def test_resolve_runtime_package_manager_returns_error_without_fallback() -> Non
 
     assert manager is None
     assert err == "pm unavailable"
+
+
+def test_resolve_runtime_package_manager_does_not_fallback_when_workspace_protocol_present() -> (
+    None
+):
+    middleware = DockerMiddleware()
+
+    def fake_ensure(
+        _container: Any,
+        _manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,  # noqa: ARG001
+        reporter: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[bool, str | None]:
+        return False, "pnpm unavailable"
+
+    middleware._ensure_package_manager_available = fake_ensure  # type: ignore[method-assign]
+
+    manager, err = middleware._resolve_runtime_package_manager(
+        object(),
+        detected_manager="pnpm",
+        package_json={"dependencies": {"ui": "workspace:*"}},
+    )
+
+    assert manager is None
+    assert isinstance(err, str)
+    assert "refusing fallback to npm" in err
+
+
+def test_detect_package_manager_prefers_package_manager_field() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command == "command -v pnpm >/dev/null 2>&1":
+            return 0, ""
+        return 1, ""
+
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+
+    detected = middleware._detect_package_manager(
+        object(),
+        package_json={"packageManager": "pnpm@9.1.0"},
+    )
+
+    assert detected == "pnpm"

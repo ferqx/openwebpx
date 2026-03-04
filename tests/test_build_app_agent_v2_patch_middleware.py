@@ -6,14 +6,16 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import ToolMessage
 
 from graphs.build_app_agent_v2.guard_middleware import ToolCallGuardMiddleware
-from graphs.build_app_agent_v2.prompts import build_system_prompt
-from graphs.build_app_agent_v2.v4a_filesystem_middleware import (
-    V4AFilesystemMiddleware,
-    apply_v4a_update_patch,
-    parse_v4a_patch_content,
+from graphs.build_app_agent_v2.patch_filesystem_middleware import (
+    PatchFilesystemMiddleware,
+    _resolve_patch_path,
+    apply_update_patch,
+    parse_patch_content,
 )
+from graphs.build_app_agent_v2.prompts import build_system_prompt
 
 
 class _FakeBackend:
@@ -97,19 +99,28 @@ class _FakeBackend:
         return self.read(file_path=file_path, offset=offset, limit=limit)
 
 
-def test_parse_and_apply_v4a_patch_with_multiple_hunks() -> None:
+class _RawReadBackend(_FakeBackend):
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
+        content = self.files.get(file_path)
+        if content is None:
+            return f"Error: File '{file_path}' not found"
+        lines = content.splitlines()
+        return "\n".join(lines[offset : offset + limit])
+
+
+def test_parse_and_apply_patch_with_multiple_hunks() -> None:
     patch_content = """
-*** Update File: /workspace/style.css
+*** Update File: style.css
 @@ .dark-theme body
-.dark-theme body {
+ .dark-theme body {
 -  color: #ffffff;
 +  color: #e0e0e0;
-}
+ }
 @@ .dark-theme input
-.dark-theme input {
+ .dark-theme input {
 -  background: #fff;
 +  background: #222;
-}
+ }
 """.strip()
     original = """
 .dark-theme body {
@@ -121,14 +132,14 @@ def test_parse_and_apply_v4a_patch_with_multiple_hunks() -> None:
 }
 """.strip()
 
-    file_patches = parse_v4a_patch_content(patch_content)
+    file_patches = parse_patch_content(patch_content)
 
     assert len(file_patches) == 1
     assert file_patches[0].action == "Update"
-    assert file_patches[0].path == "/workspace/style.css"
+    assert file_patches[0].path == "style.css"
     assert len(file_patches[0].hunks) == 2
 
-    updated, applied = apply_v4a_update_patch(
+    updated, applied = apply_update_patch(
         original,
         file_path=file_patches[0].path,
         hunks=file_patches[0].hunks,
@@ -141,30 +152,30 @@ def test_parse_and_apply_v4a_patch_with_multiple_hunks() -> None:
     assert "background: #fff;" not in updated
 
 
-def test_parse_v4a_patch_rejects_duplicate_file_sections() -> None:
+def test_parse_patch_rejects_duplicate_file_sections() -> None:
     patch_content = """
-*** Update File: /workspace/style.css
+*** Update File: style.css
 @@ section-1
 -old-1
 +new-1
-*** Update File: /workspace/style.css
+*** Update File: style.css
 @@ section-2
 -old-2
 +new-2
 """.strip()
 
     with pytest.raises(ValueError, match="appears multiple times"):
-        parse_v4a_patch_content(patch_content)
+        parse_patch_content(patch_content)
 
 
-def test_parse_and_apply_v4a_update_insert_only_hunk() -> None:
+def test_parse_and_apply_patch_insert_only_hunk() -> None:
     patch_content = """
-*** Update File: /workspace/style.css
+*** Update File: style.css
 @@ insert-muted-color
-.dark-theme body {
+ .dark-theme body {
 +  --muted-text: #a0a0a0;
-  color: #ffffff;
-}
+   color: #ffffff;
+ }
 """.strip()
     original = """
 .dark-theme body {
@@ -172,8 +183,8 @@ def test_parse_and_apply_v4a_update_insert_only_hunk() -> None:
 }
 """.strip()
 
-    file_patches = parse_v4a_patch_content(patch_content)
-    updated, applied = apply_v4a_update_patch(
+    file_patches = parse_patch_content(patch_content)
+    updated, applied = apply_update_patch(
         original,
         file_path=file_patches[0].path,
         hunks=file_patches[0].hunks,
@@ -184,12 +195,12 @@ def test_parse_and_apply_v4a_update_insert_only_hunk() -> None:
     assert "  color: #ffffff;" in updated
 
 
-def test_parse_and_apply_v4a_update_insert_only_with_context_after() -> None:
+def test_parse_and_apply_patch_insert_only_with_context_after() -> None:
     patch_content = """
-*** Update File: /workspace/style.css
+*** Update File: style.css
 @@ insert-before-closing-brace
 +  --surface-contrast: #1a1a1a;
-}
+ }
 """.strip()
     original = """
 .dark-theme body {
@@ -197,8 +208,8 @@ def test_parse_and_apply_v4a_update_insert_only_with_context_after() -> None:
 }
 """.strip()
 
-    file_patches = parse_v4a_patch_content(patch_content)
-    updated, applied = apply_v4a_update_patch(
+    file_patches = parse_patch_content(patch_content)
+    updated, applied = apply_update_patch(
         original,
         file_path=file_patches[0].path,
         hunks=file_patches[0].hunks,
@@ -210,40 +221,101 @@ def test_parse_and_apply_v4a_update_insert_only_with_context_after() -> None:
     assert updated.endswith("\n}")
 
 
-def test_parse_v4a_update_insert_only_hunk_requires_context() -> None:
+def test_parse_patch_insert_only_hunk_requires_context() -> None:
     patch_content = """
-*** Update File: /workspace/style.css
+*** Update File: style.css
 @@ insert-without-context
 +  --muted-text: #a0a0a0;
 """.strip()
 
     with pytest.raises(ValueError, match="insert-only hunk must include context"):
-        parse_v4a_patch_content(patch_content)
+        parse_patch_content(patch_content)
 
 
-def test_v4a_filesystem_middleware_replaces_edit_file_tool() -> None:
-    middleware = V4AFilesystemMiddleware()
+def test_resolve_patch_path_supports_relative_path_under_workspace() -> None:
+    resolved = _resolve_patch_path("src/app.py")
+    assert resolved == "/workspace/src/app.py"
+
+
+def test_resolve_patch_path_rejects_relative_escape() -> None:
+    with pytest.raises(ValueError, match="escapes '/workspace'"):
+        _resolve_patch_path("../../etc/passwd")
+
+
+def test_resolve_patch_path_rejects_absolute_path() -> None:
+    with pytest.raises(ValueError, match="Absolute patch path"):
+        _resolve_patch_path("/workspace/src/app.py")
+
+
+def test_parse_add_file_requires_plus_prefix() -> None:
+    patch_content = """
+*** Add File: docs/readme.txt
+plain-line
+""".strip()
+
+    with pytest.raises(ValueError, match="must start with '\\+'"):
+        parse_patch_content(patch_content)
+
+
+def test_parse_update_hunk_requires_prefix_marker() -> None:
+    patch_content = """
+*** Update File: style.css
+@@ bad-hunk
+no-prefix-context
+-old
++new
+""".strip()
+
+    with pytest.raises(ValueError, match="invalid hunk line prefix"):
+        parse_patch_content(patch_content)
+
+
+def test_apply_patch_sync_supports_move_to() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _FakeBackend({"/workspace/a.py": "x = 1\n"})
+    patch_content = """
+*** Update File: a.py
+*** Move to: b.py
+@@ rename-and-edit
+-x = 1
++x = 2
+""".strip()
+
+    result_raw = middleware._apply_patch_sync(backend, patch_content)
+    result = json.loads(result_raw)
+
+    assert result["ok"] is True
+    assert "/workspace/a.py" not in backend.files
+    assert backend.files["/workspace/b.py"] == "x = 2\n"
+
+
+def test_patch_filesystem_middleware_replaces_edit_file_tool() -> None:
+    middleware = PatchFilesystemMiddleware()
     tool_names = {tool.name for tool in middleware.tools}
 
-    assert "submit_edit_plan" in tool_names
+    assert "execute" in tool_names
+    assert "update_plan" in tool_names
     assert "apply_patch" in tool_names
-    assert "list_resources" in tool_names
-    assert "get_implementation" in tool_names
-    assert "find_callers" in tool_names
-    assert "read_resource" in tool_names
-    assert "read_files" in tool_names
-    assert "list_components" in tool_names
+    assert "get_implementation" not in tool_names
+    assert "find_callers" not in tool_names
+    assert "read_files" not in tool_names
+    assert "list_components" not in tool_names
+    assert "read_file" not in tool_names
+    assert "write_file" not in tool_names
+    assert "ls" not in tool_names
+    assert "glob" not in tool_names
+    assert "grep" not in tool_names
     assert "edit_file" not in tool_names
 
 
 def test_guard_extracts_paths_from_apply_patch_payload() -> None:
     guard = ToolCallGuardMiddleware()
     patch_content = """
-*** Update File: /workspace/style.css
+*** Update File: style.css
 @@ section-1
 -old
 +new
-*** Update File: /workspace/index.html
+*** Update File: index.html
 @@ section-2
 -old
 +new
@@ -254,7 +326,50 @@ def test_guard_extracts_paths_from_apply_patch_payload() -> None:
         {"patch_content": patch_content},
     )
 
-    assert paths == ["/workspace/style.css", "/workspace/index.html"]
+    assert paths == ["style.css", "index.html"]
+
+
+def test_guard_apply_patch_reads_relative_paths_under_workspace_and_attaches_diff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = ToolCallGuardMiddleware()
+    observed_paths: list[str] = []
+    contents = iter(["old line\n", "new line\n"])
+
+    def fake_read_file_content(request: object, file_path: str) -> str | None:
+        _ = request
+        observed_paths.append(file_path)
+        return next(contents, None)
+
+    monkeypatch.setattr(guard, "_read_file_content", fake_read_file_content)
+
+    request = SimpleNamespace(
+        tool_call={
+            "name": "apply_patch",
+            "id": "call-1",
+            "args": {
+                "patch_content": (
+                    "*** Begin Patch\n"
+                    "*** Update File: app/main.py\n"
+                    "@@ update-main\n"
+                    "-old line\n"
+                    "+new line\n"
+                    "*** End Patch"
+                )
+            },
+        },
+        state={},
+        runtime=SimpleNamespace(),
+    )
+
+    def handler(_request: object) -> ToolMessage:
+        return ToolMessage(content="ok", tool_call_id="call-1")
+
+    result = guard.wrap_tool_call(request, handler)
+
+    assert observed_paths == ["/workspace/app/main.py", "/workspace/app/main.py"]
+    assert isinstance(result, ToolMessage)
+    assert result.additional_kwargs["file_diff"]["file_path"] == "app/main.py"
 
 
 def test_guard_ls_budget_blocks_repeated_same_path() -> None:
@@ -468,24 +583,11 @@ def test_guard_list_resources_budget_blocks_broad_pattern() -> None:
     assert "Blocked broad list_resources pattern" in str(blocked.content)
 
 
-def test_build_system_prompt_includes_compact_output_rules_by_default() -> None:
-    prompt = build_system_prompt("deepseek")
+def test_build_system_prompt_uses_single_template() -> None:
+    prompt = build_system_prompt()
 
-    assert "工具调用阶段默认静默" in prompt
-    assert "最终回复使用最短可审计结构" in prompt
-    assert "必须优先调用 `list_components`" in prompt
-    assert "必须优先使用 `read_files` 批量读取" in prompt
-    assert "必须先调用 `submit_edit_plan`" in prompt
-    assert "资源发现优先使用 `list_resources`" in prompt
-    assert "优先使用 `read_resource`" in prompt
-    assert "优先 `get_implementation`" in prompt
-    assert "优先 `find_callers`" in prompt
-
-
-def test_build_system_prompt_can_disable_compact_output_rules() -> None:
-    prompt = build_system_prompt("deepseek", concise_output=False)
-
-    assert "工具调用阶段默认静默" not in prompt
+    assert "你是一个编码代理" in prompt
+    assert "## `apply_patch`" in prompt
 
 
 def test_guard_blocks_write_before_submit_plan() -> None:
@@ -553,10 +655,10 @@ def test_guard_blocks_write_for_file_outside_submitted_plan() -> None:
 
 
 def test_apply_patch_sync_supports_dry_run_without_writing_files() -> None:
-    middleware = V4AFilesystemMiddleware()
+    middleware = PatchFilesystemMiddleware()
     backend = _FakeBackend({"/workspace/a.py": "x = 1\n"})
     patch_content = """
-*** Update File: /workspace/a.py
+*** Update File: a.py
 @@ update-a
 -x = 1
 +x = 2
@@ -575,7 +677,7 @@ def test_apply_patch_sync_supports_dry_run_without_writing_files() -> None:
 
 
 def test_apply_patch_sync_rolls_back_on_mid_commit_failure() -> None:
-    middleware = V4AFilesystemMiddleware()
+    middleware = PatchFilesystemMiddleware()
     backend = _FakeBackend(
         {
             "/workspace/a.py": "x = 1\n",
@@ -584,11 +686,11 @@ def test_apply_patch_sync_rolls_back_on_mid_commit_failure() -> None:
         fail_upload_for={"/workspace/b.py"},
     )
     patch_content = """
-*** Update File: /workspace/a.py
+*** Update File: a.py
 @@ update-a
 -x = 1
 +x = 2
-*** Update File: /workspace/b.py
+*** Update File: b.py
 @@ update-b
 -y = 1
 +y = 2
@@ -605,7 +707,7 @@ def test_apply_patch_sync_rolls_back_on_mid_commit_failure() -> None:
 
 
 def test_list_resources_returns_file_uris() -> None:
-    middleware = V4AFilesystemMiddleware()
+    middleware = PatchFilesystemMiddleware()
     backend = _FakeBackend(
         {
             "/workspace/app/main.py": "print('main')\n",
@@ -631,7 +733,7 @@ def test_list_resources_returns_file_uris() -> None:
 
 
 def test_read_resource_supports_file_uri() -> None:
-    middleware = V4AFilesystemMiddleware()
+    middleware = PatchFilesystemMiddleware()
     backend = _FakeBackend({"/workspace/app/main.py": "print('main')\n"})
 
     result_raw = middleware._read_resource_sync(
@@ -647,58 +749,43 @@ def test_read_resource_supports_file_uri() -> None:
     assert "print('main')" in result["details"]["content"]
 
 
-def test_get_implementation_returns_symbol_resource_uris() -> None:
-    middleware = V4AFilesystemMiddleware()
-    backend = _FakeBackend(
-        {
-            "/workspace/app/service.py": "class OrderService:\n    pass\n",
-            "/workspace/app/other.py": "def create_order():\n    return OrderService()\n",
-        }
-    )
+def test_read_resource_supports_percent_encoded_file_uri_path() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _FakeBackend({"/workspace/app/main file.py": "print('main')\n"})
 
-    result_raw = middleware._get_implementation_sync(
+    result_raw = middleware._read_resource_sync(
         backend=backend,
-        symbol="OrderService",
-        scope="/workspace/app",
-        limit=5,
+        uri="file:///workspace/app/main%20file.py",
+        offset=0,
+        limit=20,
     )
     result = json.loads(result_raw)
 
     assert result["ok"] is True
-    assert result["details"]["symbol"] == "OrderService"
-    items = result["details"]["items"]
-    assert len(items) == 1
-    assert items[0]["uri"].startswith("symbol://OrderService?")
-    assert items[0]["path"] == "/workspace/app/service.py"
+    assert result["details"]["path"] == "/workspace/app/main file.py"
+    assert "print('main')" in result["details"]["content"]
 
 
-def test_find_callers_returns_caller_resource_uris() -> None:
-    middleware = V4AFilesystemMiddleware()
-    backend = _FakeBackend(
-        {
-            "/workspace/app/service.py": "class OrderService:\n    pass\n",
-            "/workspace/app/usage.py": "from app.service import OrderService\n\norder = OrderService()\n",
-        }
+def test_read_resource_does_not_treat_plain_error_prefixed_content_as_failure() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _RawReadBackend(
+        {"/workspace/app/messages.txt": "Error: expected input format\nsecond line\n"}
     )
 
-    result_raw = middleware._find_callers_sync(
+    result_raw = middleware._read_resource_sync(
         backend=backend,
-        symbol="OrderService",
-        scope="/workspace/app",
-        limit=10,
-        include_definitions=False,
+        uri="file:///workspace/app/messages.txt",
+        offset=0,
+        limit=20,
     )
     result = json.loads(result_raw)
 
     assert result["ok"] is True
-    items = result["details"]["items"]
-    assert len(items) >= 1
-    assert all(item["uri"].startswith("callers://OrderService?") for item in items)
-    assert any(item["path"] == "/workspace/app/usage.py" for item in items)
+    assert "Error: expected input format" in result["details"]["content"]
 
 
 def test_read_resource_supports_symbol_uri() -> None:
-    middleware = V4AFilesystemMiddleware()
+    middleware = PatchFilesystemMiddleware()
     backend = _FakeBackend(
         {
             "/workspace/app/service.py": (
@@ -722,7 +809,7 @@ def test_read_resource_supports_symbol_uri() -> None:
 
 
 def test_read_resource_rejects_unsupported_scheme() -> None:
-    middleware = V4AFilesystemMiddleware()
+    middleware = PatchFilesystemMiddleware()
     backend = _FakeBackend({"/workspace/app/main.py": "print('main')\n"})
 
     result_raw = middleware._read_resource_sync(

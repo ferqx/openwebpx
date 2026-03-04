@@ -61,6 +61,7 @@ dependencies = [
     "docker>=7.1.0",
     "aegra-cli>=0.7.2",
     "aegra-api>=0.7.2",
+    "pytest>=9.0.2",
 ]
 
 [project.urls]
