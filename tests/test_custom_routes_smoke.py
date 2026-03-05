@@ -93,6 +93,83 @@ async def test_aegra_auth_supports_cookie_token(client: TestClient) -> None:
     assert payload["identity"] == "cookie_user"
 
 
+@pytest.mark.asyncio
+async def test_threads_delete_hook_destroys_bound_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    async def fake_resolve_thread_container_id_for_delete(
+        *,
+        thread_id: str,
+        user: Any,  # noqa: ARG001
+    ) -> str | None:
+        calls["thread_id"] = thread_id
+        return "container-123"
+
+    def fake_destroy_container_for_thread_delete(
+        container_id: str,
+    ) -> tuple[bool, str | None]:
+        calls["container_id"] = container_id
+        return True, None
+
+    monkeypatch.setattr(
+        aegra_auth,
+        "_resolve_thread_container_id_for_delete",
+        fake_resolve_thread_container_id_for_delete,
+    )
+    monkeypatch.setattr(
+        aegra_auth,
+        "_destroy_container_for_thread_delete",
+        fake_destroy_container_for_thread_delete,
+    )
+
+    ctx = SimpleNamespace(user=SimpleNamespace(identity="user-1"))
+    allowed = await aegra_auth.cleanup_thread_container_on_delete(
+        ctx,
+        {"thread_id": "thread-1"},
+    )
+
+    assert allowed is True
+    assert calls == {"thread_id": "thread-1", "container_id": "container-123"}
+
+
+@pytest.mark.asyncio
+async def test_threads_delete_hook_allows_delete_when_container_destroy_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_resolve_thread_container_id_for_delete(
+        *,
+        thread_id: str,  # noqa: ARG001
+        user: Any,  # noqa: ARG001
+    ) -> str | None:
+        return "container-123"
+
+    def fake_destroy_container_for_thread_delete(
+        container_id: str,  # noqa: ARG001
+    ) -> tuple[bool, str | None]:
+        return False, "docker unavailable"
+
+    monkeypatch.setattr(
+        aegra_auth,
+        "_resolve_thread_container_id_for_delete",
+        fake_resolve_thread_container_id_for_delete,
+    )
+    monkeypatch.setattr(
+        aegra_auth,
+        "_destroy_container_for_thread_delete",
+        fake_destroy_container_for_thread_delete,
+    )
+
+    ctx = SimpleNamespace(user=SimpleNamespace(identity="user-1"))
+    allowed = await aegra_auth.cleanup_thread_container_on_delete(
+        ctx,
+        {"thread_id": "thread-1"},
+    )
+
+    assert allowed is True
+
+
 def test_auth_register_conflict_smoke(client: TestClient) -> None:
     first = client.post(
         "/auth/register",

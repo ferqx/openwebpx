@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -32,6 +33,24 @@ class FakeClient:
 class FakeDownloadContainer:
     def get_archive(self, _path: str) -> tuple[bytes, dict[str, Any]]:
         raise NotFound("file not found in container")
+
+
+class FakeExecContainer:
+    def __init__(self, output: str = "ok", exit_code: int = 0) -> None:
+        self._output = output
+        self._exit_code = exit_code
+        self.last_environment: dict[str, str] | None = None
+        self.last_cmd: list[str] | None = None
+
+    def exec_run(
+        self, cmd: list[str], workdir: str, environment: dict[str, str]
+    ) -> Any:
+        self.last_cmd = cmd
+        self.last_environment = environment
+        return SimpleNamespace(
+            output=self._output.encode("utf-8"),
+            exit_code=self._exit_code,
+        )
 
 
 class FakeRuntime:
@@ -133,3 +152,49 @@ def test_download_files_maps_docker_not_found_to_file_not_found() -> None:
     assert responses[0].path.endswith("table-optimization.md")
     assert responses[0].content is None
     assert responses[0].error == "file_not_found"
+
+
+def test_build_execution_environment_injects_git_identity_and_token() -> None:
+    runtime = FakeRuntime(
+        state={
+            "repo_auth_context": {
+                "user_id": "u-1",
+                "provider": "github",
+                "repo": "owner/repo",
+            },
+            "repo_git_identity": {
+                "name": "Alice",
+                "email": "alice@example.com",
+            },
+        },
+        config={},
+    )
+    backend = DockerBackend(runtime)
+    backend._resolve_repo_access_token_from_context = lambda _ctx: "token-abc"  # type: ignore[method-assign]
+
+    env, token = backend._build_execution_environment()
+
+    assert token == "token-abc"
+    assert env["GIT_AUTHOR_NAME"] == "Alice"
+    assert env["GIT_AUTHOR_EMAIL"] == "alice@example.com"
+    assert env["GH_TOKEN"] == "token-abc"
+    assert env["GITHUB_TOKEN"] == "token-abc"
+
+
+def test_execute_uses_injected_environment_and_sanitizes_token_output() -> None:
+    runtime = FakeRuntime(state={}, config={})
+    backend = DockerBackend(runtime)
+    fake_container = FakeExecContainer(output="push failed with token-abc")
+    backend._container = fake_container  # type: ignore[assignment]
+    backend._build_execution_environment = lambda: (  # type: ignore[method-assign]
+        {"PATH": "/bin", "GH_TOKEN": "token-abc"},
+        "token-abc",
+    )
+
+    response = backend.execute("git push origin feature/test")
+
+    assert response.exit_code == 0
+    assert "token-abc" not in response.output
+    assert "***" in response.output
+    assert fake_container.last_environment is not None
+    assert fake_container.last_environment["GH_TOKEN"] == "token-abc"

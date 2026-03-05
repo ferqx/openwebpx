@@ -47,6 +47,10 @@ class DockerState(AgentState):
     repo_sync_signature: str | None  # 最近一次仓库同步签名（容器+仓库+分支）
     repo_sync_success: bool | None  # 最近一次仓库同步是否成功
     repo_sync_error: str | None  # 最近一次仓库同步错误
+    repo_auth_context: (
+        dict[str, str] | None
+    )  # 命令执行阶段解析 SCM token 所需的最小上下文
+    repo_git_identity: dict[str, str] | None  # 由授权 SCM 账户推导的 git 身份
 
 
 class ContainerDestroyedError(RuntimeError):
@@ -198,6 +202,23 @@ class DockerMiddleware(AgentMiddleware):
         except DockerException as exc:
             return False, str(exc)
 
+    def _stop_container(self, container_id: str) -> tuple[bool, str | None]:
+        """停止线程绑定容器，但保留容器供后续会话复用。"""
+        try:
+            container = self.client.containers.get(container_id)
+            with suppress(DockerException):
+                container.reload()
+            status = str(getattr(container, "status", "") or "").lower()
+            if status in {"created", "exited", "dead"}:
+                return True, None
+            container.stop(timeout=5)
+            return True, None
+        except NotFound:
+            # 容器已不存在时视为已停止，避免收尾流程报错。
+            return True, None
+        except DockerException as exc:
+            return False, str(exc)
+
     def _persist_thread_container_mapping(
         self,
         *,
@@ -287,6 +308,38 @@ class DockerMiddleware(AgentMiddleware):
         branch = str(metadata.get("branch") or "main").strip() or "main"
         gitlab_base_url = str(metadata.get("gitlab_base_url") or "").strip()
         github_auth_mode = str(metadata.get("github_auth_mode") or "").strip().lower()
+        scm_user_login = ""
+        scm_user_name = ""
+        scm_user_email = ""
+        try:
+            from app.routers.scm import _resolve_scm_token_payload
+
+            payload = await _resolve_scm_token_payload(
+                user_id=str(thread.user_id),
+                provider=provider,
+                gitlab_base_url=gitlab_base_url or None,
+                github_auth_mode=github_auth_mode or None,
+            )
+            if isinstance(payload, dict):
+                scm_user_login = str(payload.get("scm_user_login") or "").strip()
+                scm_user_name = str(payload.get("scm_user_name") or "").strip()
+                scm_user_email = (
+                    str(payload.get("scm_user_email") or "").strip().lower()
+                )
+        except Exception:  # pragma: no cover - 非关键链路
+            logger.debug(
+                "Failed to resolve SCM token payload for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+
+        git_name = scm_user_name or scm_user_login
+        git_email = scm_user_email
+        if not git_email and scm_user_login:
+            if provider == "github":
+                git_email = f"{scm_user_login}@users.noreply.github.com"
+            elif provider == "gitlab":
+                git_email = f"{scm_user_login}@users.noreply.gitlab.com"
 
         return {
             "thread_id": thread_id,
@@ -296,6 +349,8 @@ class DockerMiddleware(AgentMiddleware):
             "branch": branch,
             "gitlab_base_url": gitlab_base_url,
             "github_auth_mode": github_auth_mode,
+            "git_name": git_name,
+            "git_email": git_email,
         }
 
     def _build_repo_remote_urls(
@@ -469,7 +524,19 @@ class DockerMiddleware(AgentMiddleware):
             state.get("repo_sync_signature") == signature
             and state.get("repo_sync_success") is True
         ):
-            return None
+            return {
+                "repo_auth_context": {
+                    "user_id": binding["user_id"],
+                    "provider": binding["provider"],
+                    "repo": binding["repo"],
+                    "gitlab_base_url": binding.get("gitlab_base_url", ""),
+                    "github_auth_mode": binding.get("github_auth_mode", ""),
+                },
+                "repo_git_identity": {
+                    "name": str(binding.get("git_name") or "").strip(),
+                    "email": str(binding.get("git_email") or "").strip().lower(),
+                },
+            }
 
         provider = binding["provider"]
         user_id = binding["user_id"]
@@ -548,6 +615,17 @@ class DockerMiddleware(AgentMiddleware):
                 "repo_sync_signature": signature,
                 "repo_sync_success": True,
                 "repo_sync_error": None,
+                "repo_auth_context": {
+                    "user_id": user_id,
+                    "provider": provider,
+                    "repo": binding["repo"],
+                    "gitlab_base_url": gitlab_base_url or "",
+                    "github_auth_mode": github_auth_mode or "",
+                },
+                "repo_git_identity": {
+                    "name": str(binding.get("git_name") or "").strip(),
+                    "email": str(binding.get("git_email") or "").strip().lower(),
+                },
             }
 
         return {
@@ -557,6 +635,8 @@ class DockerMiddleware(AgentMiddleware):
                 f"自动同步仓库失败（{binding['repo']}#{binding['branch']}）："
                 f"{sync_error or 'unknown error'}"
             ),
+            "repo_auth_context": None,
+            "repo_git_identity": None,
             "messages": [
                 AIMessage(
                     content=(
@@ -1694,6 +1774,8 @@ class DockerMiddleware(AgentMiddleware):
             "repo_sync_signature": None,
             "repo_sync_success": None,
             "repo_sync_error": None,
+            "repo_auth_context": None,
+            "repo_git_identity": None,
         }
 
         return {
@@ -1790,6 +1872,14 @@ class DockerMiddleware(AgentMiddleware):
             return None
 
         status = self._build_runtime_status(state, container)
+        # 对话结束后主动停止容器，下一轮由 before_agent 自动恢复。
+        stopped, stop_error = self._stop_container(container_id)
+        if stopped:
+            status["container_status"] = "stopped"
+            status["service_running"] = False
+            status["service_pid"] = None
+        elif stop_error:
+            logger.warning("Failed to stop container %s: %s", container_id, stop_error)
         return {
             "container_id": container_id,
             "service_status": status,

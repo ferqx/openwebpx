@@ -16,6 +16,7 @@ from graphs.build_app_agent_v2.patch_filesystem_middleware import (
     parse_patch_content,
 )
 from graphs.build_app_agent_v2.prompts import build_system_prompt
+from graphs.build_app_agent_v2.sandbox_policy_guard import SandboxPolicyGuard
 
 
 class _FakeBackend:
@@ -247,6 +248,11 @@ def test_resolve_patch_path_rejects_absolute_path() -> None:
         _resolve_patch_path("/workspace/src/app.py")
 
 
+def test_resolve_patch_path_rejects_git_directory() -> None:
+    with pytest.raises(ValueError, match="forbidden '.git' directory"):
+        _resolve_patch_path(".git/config")
+
+
 def test_parse_add_file_requires_plus_prefix() -> None:
     patch_content = """
 *** Add File: docs/readme.txt
@@ -306,6 +312,136 @@ def test_patch_filesystem_middleware_replaces_edit_file_tool() -> None:
     assert "glob" not in tool_names
     assert "grep" not in tool_names
     assert "edit_file" not in tool_names
+
+
+def test_execute_guard_allows_git_commit_for_pr_flow() -> None:
+    middleware = PatchFilesystemMiddleware()
+
+    violation = middleware._validate_execute_command("git commit -m 'feat: test'")
+
+    assert violation is None
+
+
+def test_execute_guard_blocks_dangerous_force_push() -> None:
+    middleware = PatchFilesystemMiddleware()
+
+    violation = middleware._validate_execute_command("git push --force origin main")
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "dangerous git mutation command" in violation
+    assert "Safe alternative:" in violation
+
+
+def test_execute_guard_blocks_writing_under_git_directory() -> None:
+    middleware = PatchFilesystemMiddleware()
+
+    violation = middleware._validate_execute_command("echo test > .git/config")
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "writing under `.git/` is blocked" in violation
+    assert "Safe alternative:" in violation
+
+
+def test_sandbox_policy_guard_allows_git_commit_for_pr_flow() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("git commit -m 'feat: test'")
+
+    assert violation is None
+
+
+def test_sandbox_policy_guard_allows_regular_git_push_commands() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("git push origin main")
+
+    assert violation is None
+
+
+def test_sandbox_policy_guard_allows_rm_within_workspace() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("rm /workspace/tmp.txt")
+
+    assert violation is None
+
+
+def test_sandbox_policy_guard_blocks_rm_outside_workspace() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("rm /tmp/secret.txt")
+
+    assert violation is not None
+    assert "outside '/workspace'" in violation
+
+
+def test_sandbox_policy_guard_blocks_dangerous_rm_pattern() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("rm -rf /")
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "dangerous `rm` pattern is blocked" in violation
+    assert "Safe alternative:" in violation
+
+
+def test_sandbox_policy_guard_blocks_bulk_rm() -> None:
+    guard = SandboxPolicyGuard(max_bulk_file_ops=2)
+
+    violation = guard.validate_execute_command("rm a.txt b.txt c.txt")
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "bulk `rm` is blocked" in violation
+    assert "Safe alternative:" in violation
+    assert "`apply_patch` `Delete File`" in violation
+
+
+def test_sandbox_policy_guard_blocks_bulk_mv() -> None:
+    guard = SandboxPolicyGuard(max_bulk_file_ops=2)
+
+    violation = guard.validate_execute_command("mv a.txt b.txt c.txt target_dir/")
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "bulk `mv` is blocked" in violation
+    assert "Safe alternative:" in violation
+    assert "`apply_patch` `Move to`" in violation
+
+
+def test_sandbox_policy_guard_blocks_apply_patch_shell_invocation() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command(
+        'apply_patch "*** Begin Patch\n*** Add File: output.txt\n+7\n*** End Patch"'
+    )
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "`apply_patch` is not an executable shell binary" in violation
+    assert "invoke the registered `apply_patch` tool directly" in violation
+
+
+def test_sandbox_policy_guard_blocks_interactive_scm_auth_login() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("glab auth login")
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "interactive SCM CLI login is blocked" in violation
+    assert "token is injected automatically" in violation
+
+
+def test_sandbox_policy_guard_allows_explicit_feature_branch_push() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("git push -u origin feature/add-file")
+
+    assert violation is None
 
 
 def test_guard_extracts_paths_from_apply_patch_payload() -> None:

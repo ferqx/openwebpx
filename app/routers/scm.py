@@ -808,6 +808,34 @@ async def _refresh_github_oauth_token(
     return result
 
 
+async def _fetch_github_authenticated_user_profile(
+    *,
+    access_token: str,
+) -> dict[str, str]:
+    async with httpx.AsyncClient(timeout=20) as http_client:
+        response = await http_client.get(
+            "https://api.github.com/user",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {access_token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+    if response.status_code >= 400:
+        return {}
+    payload = response.json() if response.content else {}
+    if not isinstance(payload, dict):
+        return {}
+    login = payload.get("login")
+    name = payload.get("name")
+    email = payload.get("email")
+    return {
+        "scm_user_login": login.strip() if isinstance(login, str) else "",
+        "scm_user_name": name.strip() if isinstance(name, str) else "",
+        "scm_user_email": email.strip().lower() if isinstance(email, str) else "",
+    }
+
+
 async def _fetch_github_installation_repositories(
     *,
     http_client: httpx.AsyncClient,
@@ -1021,6 +1049,31 @@ async def _refresh_gitlab_oauth_token(
     if expires_at is not None:
         result["expires_at"] = expires_at
     return result
+
+
+async def _fetch_gitlab_authenticated_user_profile(
+    *,
+    access_token: str,
+    gitlab_base_url: str,
+) -> dict[str, str]:
+    async with httpx.AsyncClient(timeout=20) as http_client:
+        response = await http_client.get(
+            f"{gitlab_base_url}/api/v4/user",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if response.status_code >= 400:
+        return {}
+    payload = response.json() if response.content else {}
+    if not isinstance(payload, dict):
+        return {}
+    username = payload.get("username")
+    name = payload.get("name")
+    email = payload.get("email")
+    return {
+        "scm_user_login": username.strip() if isinstance(username, str) else "",
+        "scm_user_name": name.strip() if isinstance(name, str) else "",
+        "scm_user_email": email.strip().lower() if isinstance(email, str) else "",
+    }
 
 
 async def _refresh_scm_token_payload_if_needed(
@@ -1241,6 +1294,11 @@ async def scm_oauth_callback(
                     ),
                     "scope": github_token_payload.get("scope"),
                     "token_type": github_token_payload.get("token_type"),
+                    **(
+                        await _fetch_github_authenticated_user_profile(
+                            access_token=access_token
+                        )
+                    ),
                 },
             )
         elif provider == "gitlab":
@@ -1275,6 +1333,12 @@ async def scm_oauth_callback(
                     "scope": gitlab_token_payload.get("scope"),
                     "token_type": gitlab_token_payload.get("token_type"),
                     "updated_at": time.time(),
+                    **(
+                        await _fetch_gitlab_authenticated_user_profile(
+                            access_token=access_token,
+                            gitlab_base_url=resolved_base_url,
+                        )
+                    ),
                 },
             )
         else:

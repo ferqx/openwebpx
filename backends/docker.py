@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -184,16 +185,17 @@ class DockerBackend(BaseSandbox):
         Returns:
             包含合并的stdout/stderr输出和退出码的ExecuteResponse。
         """
+        environment, token_for_sanitize = self._build_execution_environment()
         container = self.container
         try:
             exec_result = container.exec_run(
                 cmd=["sh", "-c", command],
                 workdir=self.workdir,
-                environment={
-                    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                },
+                environment=environment,
             )
             output = exec_result.output.decode("utf-8", errors="replace")
+            if token_for_sanitize:
+                output = output.replace(token_for_sanitize, "***")
             exit_code = exec_result.exit_code
             truncated = False
             if len(output) > 100_000:
@@ -209,6 +211,112 @@ class DockerBackend(BaseSandbox):
                 exit_code=1,
                 truncated=False,
             )
+
+    def _build_execution_environment(self) -> tuple[dict[str, str], str | None]:
+        env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+        token: str | None = None
+        context = self._repo_auth_context_from_state()
+        identity = self._repo_git_identity_from_state()
+
+        if identity is not None:
+            name = identity.get("name", "").strip()
+            email = identity.get("email", "").strip().lower()
+            if name:
+                env["GIT_AUTHOR_NAME"] = name
+                env["GIT_COMMITTER_NAME"] = name
+            if email:
+                env["GIT_AUTHOR_EMAIL"] = email
+                env["GIT_COMMITTER_EMAIL"] = email
+
+        if context is not None:
+            token = self._resolve_repo_access_token_from_context(context)
+            provider = context.get("provider", "").strip().lower()
+            if token:
+                if provider == "gitlab":
+                    env["SCM_TOKEN"] = token
+                    env["GITLAB_TOKEN"] = token
+                    env["GLAB_TOKEN"] = token
+                    env["GITLAB_ACCESS_TOKEN"] = token
+                elif provider == "github":
+                    env["SCM_TOKEN"] = token
+                    env["GH_TOKEN"] = token
+                    env["GITHUB_TOKEN"] = token
+
+        return env, token
+
+    def _repo_auth_context_from_state(self) -> dict[str, str] | None:
+        state = self.runtime.state if isinstance(self.runtime.state, dict) else {}
+        raw = state.get("repo_auth_context")
+        if not isinstance(raw, dict):
+            return None
+        user_id = str(raw.get("user_id") or "").strip()
+        provider = str(raw.get("provider") or "").strip().lower()
+        repo = str(raw.get("repo") or "").strip()
+        if not user_id or provider not in {"github", "gitlab"} or not repo:
+            return None
+        return {
+            "user_id": user_id,
+            "provider": provider,
+            "repo": repo,
+            "gitlab_base_url": str(raw.get("gitlab_base_url") or "").strip(),
+            "github_auth_mode": str(raw.get("github_auth_mode") or "").strip(),
+        }
+
+    def _repo_git_identity_from_state(self) -> dict[str, str] | None:
+        state = self.runtime.state if isinstance(self.runtime.state, dict) else {}
+        raw = state.get("repo_git_identity")
+        if not isinstance(raw, dict):
+            return None
+        name = str(raw.get("name") or "").strip()
+        email = str(raw.get("email") or "").strip().lower()
+        if not name and not email:
+            return None
+        return {"name": name, "email": email}
+
+    def _resolve_repo_access_token_from_context(
+        self, context: dict[str, str]
+    ) -> str | None:
+        try:
+            from app.routers.scm import _resolve_scm_access_token
+        except Exception:
+            return None
+
+        try:
+            token = self._run_async_blocking(
+                _resolve_scm_access_token(
+                    user_id=context["user_id"],
+                    provider=context["provider"],
+                    gitlab_base_url=context.get("gitlab_base_url") or None,
+                    github_auth_mode=context.get("github_auth_mode") or None,
+                )
+            )
+        except Exception:
+            return None
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+        return None
+
+    def _run_async_blocking(self, coro: Any) -> Any:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        holder: dict[str, Any] = {}
+        error_holder: dict[str, BaseException] = {}
+
+        def _runner() -> None:
+            try:
+                holder["result"] = asyncio.run(coro)
+            except BaseException as exc:  # pragma: no cover - fallback path
+                error_holder["error"] = exc
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+        if "error" in error_holder:
+            raise error_holder["error"]
+        return holder.get("result")
 
     async def aexecute(self, command: str) -> ExecuteResponse:
         """在Docker容器中异步执行命令。

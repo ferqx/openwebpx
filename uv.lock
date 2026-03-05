@@ -58,8 +58,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aegra-api", specifier = ">=0.7.2" },
-    { name = "aegra-cli", specifier = ">=0.7.2" },
+    { name = "aegra-api", specifier = ">=0.7.4" },
+    { name = "aegra-cli", specifier = ">=0.7.4" },
     { name = "alembic", specifier = ">=1.16.4" },
     { name = "asgi-correlation-id", specifier = ">=4.3.4" },
     { name = "asyncpg", specifier = ">=0.30.0" },
@@ -109,7 +109,7 @@ dev = [
 
 [[package]]
 name = "aegra-api"
-version = "0.7.2"
+version = "0.7.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "alembic" },
@@ -119,6 +119,7 @@ dependencies = [
     { name = "greenlet" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-postgres" },
+    { name = "langgraph-sdk" },
     { name = "openinference-instrumentation-langchain" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp" },
@@ -130,14 +131,14 @@ dependencies = [
     { name = "structlog" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/cb/e8/a0033b27927901680edacb1b8ecb0aa0bcd6b7c8dcfa52f426a06c9955a8/aegra_api-0.7.2.tar.gz", hash = "sha256:f26d3e59ec433fa321bc8ba884fb7113c1d958afbc2e7ddeb3546847b57e988a", size = 217660, upload-time = "2026-02-22T14:06:59.13Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/ad/0155c6d38ad6c475eaaf5ce16cf9864af367860cc477b072c4d72887e3f7/aegra_api-0.7.4.tar.gz", hash = "sha256:6d01bcb5cd3f6ba7112240ebe26239eebc3e0039d80ce9aa781b5f4ab4183a59", size = 240249, upload-time = "2026-03-04T00:59:53.299Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/af/7d008dce3d9012ef0b715e4a5d974016516b60e76b0892d5c988cd0965a9/aegra_api-0.7.2-py3-none-any.whl", hash = "sha256:eab99a376632ed49289d2e5070e7df3b2ae8b9e5ad236ed0e0f0c82f09f7f77a", size = 112678, upload-time = "2026-02-22T14:06:57.897Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/7c/523eb16048a9b60cd139af6bd6999c9ecb198dfb1829c72b92453d0b535b/aegra_api-0.7.4-py3-none-any.whl", hash = "sha256:8a40efa92c19aa0de724428abbfd5541bc25fa8abf129b21a53e4caa29530fc8", size = 124470, upload-time = "2026-03-04T00:59:52.053Z" },
 ]
 
 [[package]]
 name = "aegra-cli"
-version = "0.7.2"
+version = "0.7.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aegra-api" },
@@ -146,9 +147,9 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "rich" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/33/86/878a8c5acce50eeddf89ad2fb18e0ca110ee1e75c6163c7f9dceafd366de/aegra_cli-0.7.2.tar.gz", hash = "sha256:72e273ff8daa9fbcc5a3a4c9974edd81da88b27b5b8d7b4e355e6dec9efd0b67", size = 31493, upload-time = "2026-02-22T14:07:53.583Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/ac/0147f236d4ee226471e39933ff65a1bf386e878a1d6b56477a61c25f6157/aegra_cli-0.7.4.tar.gz", hash = "sha256:773022196f4c052e31d10c7bcf576d76db188ecf1af460577c4a06156dfd4bcd", size = 31496, upload-time = "2026-03-04T01:01:21.283Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/37/f2/9a5919ace9be94070ea11d8dfdb5ebdd38ee2b5ab0da253bf83545a6867a/aegra_cli-0.7.2-py3-none-any.whl", hash = "sha256:b09e8e1a6e4e1a0fe48347178ac03599de25564984e758714894976d8e30ec5e", size = 30143, upload-time = "2026-02-22T14:07:52.576Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/f1/2067141245e3e9563984dde2897ce8cbf15541b5ce8b2f106d13f16d6ab9/aegra_cli-0.7.4-py3-none-any.whl", hash = "sha256:fdec06b3b620b6bfdfb8b81c6a4628e2ec156e78c9d6157c3888d7f064138eda", size = 30147, upload-time = "2026-03-04T01:01:20.1Z" },
 ]
 
 [[package]]

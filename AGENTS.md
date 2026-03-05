@@ -69,6 +69,14 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-05（沙箱执行策略与 SCM 凭据执行链路增强）：
+  - `build_app_agent_v2` 新增 `sandbox_policy_guard.py` 并在 `PatchFilesystemMiddleware` 接入：统一拦截危险 git 变更命令、`.git` 写入、越界/批量 `rm|mv` 与 `apply_patch` 误用为 shell 命令等场景。
+  - 新增 `workspace_tree_middleware.py`，在模型调用前注入工作区目录树快照到系统提示，减少“盲改”与重复探测。
+  - `DockerBackend` 执行命令时会从 state 注入 `repo_auth_context` 与 `repo_git_identity`，自动下发 `GH_TOKEN/GLAB_TOKEN` 与 git author/committer 身份，并对输出中的 token 做脱敏。
+  - `DockerMiddleware` 增强仓库绑定信息：保存 SCM 用户画像推导出的 git 身份；会话结束时主动 stop 容器（保留容器以便后续恢复），并在 repo 同步状态中回写认证上下文与身份信息。
+  - 线程删除钩子新增容器清理流程：`app/auth/aegra_auth.py` 在 `threads.delete` 时 best-effort 解析并销毁绑定容器，失败只记录告警不阻断删除。
+  - 协议提示更新：明确“用户要求提交代码/创建 PR/MR 时可走 git 提交流程”，并补充 `gh/glab` token 自动注入与禁用交互式 `auth login` 的约束。
+  - 依赖与镜像更新：`aegra-cli/aegra-api` 升级至 `0.7.4`，`Dockerfile.agent` 预装 `github-cli` 与 `glab`；删除调试产物 `graphs/build_app_agent_v2/test-2.json`。
 - 2026-03-04（build_app_agent_v2 工具链与沙箱增强）：
   - `build_app_agent_v2` 新增 `update_plan` 工具（在 `PatchFilesystemMiddleware` 注册），支持计划步骤校验与状态回写，避免提示词要求与可用工具不一致导致 `update_plan is not a valid tool`。
   - 修复 `ToolCallGuardMiddleware` 在 `apply_patch` 场景下的 diff 元数据采集：相对路径统一归一到 `/workspace/...` 后再读取，确保 `additional_kwargs.file_diff`/`tool_file_diffs` 可用于前端渲染。

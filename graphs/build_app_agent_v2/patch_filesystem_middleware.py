@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import json
-import posixpath
 import re
 import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, cast
 
 from deepagents.backends.protocol import (
@@ -17,7 +15,6 @@ from deepagents.backends.protocol import (
     SandboxBackendProtocol,
     execute_accepts_timeout,
 )
-from deepagents.backends.utils import validate_path
 from deepagents.middleware._utils import append_to_system_message
 from deepagents.middleware.filesystem import FilesystemState
 from langchain.agents.middleware.types import (
@@ -32,8 +29,13 @@ from langgraph.prebuilt.tool_node import ToolRuntime
 
 try:
     from graphs.build_app_agent_v2.prompts import build_system_prompt
+    from graphs.build_app_agent_v2.sandbox_policy_guard import (
+        SandboxPolicyGuard,
+        resolve_sandbox_patch_path,
+    )
 except ModuleNotFoundError:
     from prompts import build_system_prompt
+    from sandbox_policy_guard import SandboxPolicyGuard, resolve_sandbox_patch_path
 
 _FILE_HEADER_RE = re.compile(r"^\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*$")
 _HUNK_HEADER_RE = re.compile(r"^@@(?:\s+.*)?$")
@@ -180,20 +182,7 @@ def parse_patch_content(patch_content: str) -> tuple[FilePatch, ...]:
 
 def _resolve_patch_path(raw_path: str) -> str:
     """Resolve patch path into an absolute sandbox path."""
-    candidate = raw_path.strip()
-    if not candidate:
-        raise ValueError("Patch path is empty.")
-    if candidate.startswith("/"):
-        raise ValueError(
-            f"Absolute patch path '{raw_path}' is not allowed. "
-            "Use a relative path under '/workspace'."
-        )
-
-    joined = str(PurePosixPath("/workspace").joinpath(candidate))
-    normalized = posixpath.normpath(joined)
-    if normalized != "/workspace" and not normalized.startswith("/workspace/"):
-        raise ValueError(f"Relative patch path '{raw_path}' escapes '/workspace'.")
-    return validate_path(normalized)
+    return resolve_sandbox_patch_path(raw_path)
 
 
 def apply_update_patch(
@@ -243,6 +232,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             build_system_prompt() if system_prompt is None else system_prompt
         )
         self._max_execute_timeout = max_execute_timeout
+        self._sandbox_policy_guard = SandboxPolicyGuard()
         self.tools = [self._create_execute_tool()]
         self.tools.append(self._create_update_plan_tool())
         self.tools.append(self._create_apply_patch_tool())
@@ -297,6 +287,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             runtime: ToolRuntime[None, FilesystemState],
             timeout: Annotated[int | None, "Optional timeout seconds."] = None,
         ) -> str:
+            violation = self._validate_execute_command(command)
+            if violation is not None:
+                return f"Error: {violation}"
             backend = self._get_backend(runtime)
             if not isinstance(backend, SandboxBackendProtocol):
                 return "Error: execute is not supported by this backend."
@@ -325,6 +318,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             runtime: ToolRuntime[None, FilesystemState],
             timeout: Annotated[int | None, "Optional timeout seconds."] = None,
         ) -> str:
+            violation = self._validate_execute_command(command)
+            if violation is not None:
+                return f"Error: {violation}"
             backend = self._get_backend(runtime)
             if not isinstance(backend, SandboxBackendProtocol):
                 return "Error: execute is not supported by this backend."
@@ -354,6 +350,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             func=sync_execute,
             coroutine=async_execute,
         )
+
+    def _validate_execute_command(self, command: str) -> str | None:
+        return self._sandbox_policy_guard.validate_execute_command(command)
 
     def _create_apply_patch_tool(self) -> BaseTool:
         description = self._custom_tool_descriptions.get("apply_patch")

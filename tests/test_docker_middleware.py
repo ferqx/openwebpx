@@ -13,6 +13,7 @@ class FakeContainer:
         self.status = status
         self.started = False
         self.unpaused = False
+        self.stopped = False
 
     def reload(self) -> None:
         return None
@@ -24,6 +25,10 @@ class FakeContainer:
     def unpause(self) -> None:
         self.unpaused = True
         self.status = "running"
+
+    def stop(self, timeout: int = 5) -> None:  # noqa: ARG002
+        self.stopped = True
+        self.status = "exited"
 
 
 class FakeContainerManager:
@@ -339,3 +344,23 @@ def test_detect_package_manager_prefers_package_manager_field() -> None:
     )
 
     assert detected == "pnpm"
+
+
+def test_after_agent_stops_container_when_dialog_finishes() -> None:
+    running = FakeContainer("cid-1", status="running")
+    manager = FakeContainerManager(existing={"cid-1": running})
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+    middleware._build_runtime_status = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "service_running": True,
+        "service_pid": "123",
+    }
+
+    result = middleware.after_agent({"container_id": "cid-1"})
+
+    assert result is not None
+    assert running.stopped is True
+    assert result["container_id"] == "cid-1"
+    assert result["service_status"]["container_status"] == "stopped"
+    assert result["service_status"]["service_running"] is False
+    assert result["service_status"]["service_pid"] is None
