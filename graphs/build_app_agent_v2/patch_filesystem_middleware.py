@@ -123,7 +123,7 @@ def parse_patch_content(patch_content: str) -> tuple[FilePatch, ...]:
     if not stripped:
         raise ValueError("Patch content is empty.")
 
-    lines = stripped.splitlines()
+    lines = _repair_missing_update_hunk_headers(stripped.splitlines())
     patches: list[FilePatch] = []
     seen_paths: set[str] = set()
 
@@ -178,6 +178,82 @@ def parse_patch_content(patch_content: str) -> tuple[FilePatch, ...]:
         raise ValueError("No valid file patch sections were found.")
 
     return tuple(patches)
+
+
+def _repair_missing_update_hunk_headers(lines: list[str]) -> list[str]:
+    """Auto-repair simple Update File sections that omitted the first @@ header."""
+
+    repaired: list[str] = []
+    current_header: str | None = None
+    current_action: Literal["Add", "Update", "Delete"] | None = None
+    current_body: list[str] = []
+
+    def flush_section() -> None:
+        nonlocal current_header, current_action, current_body
+        if current_header is None or current_action is None:
+            return
+        repaired.append(current_header)
+        if current_action == "Update":
+            repaired.extend(_repair_update_section_body(current_body))
+        else:
+            repaired.extend(current_body)
+        current_header = None
+        current_action = None
+        current_body = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line in {"*** Begin Patch", "*** End Patch"}:
+            flush_section()
+            repaired.append(raw_line)
+            continue
+
+        header_match = _FILE_HEADER_RE.match(line)
+        if header_match:
+            flush_section()
+            current_header = raw_line
+            current_action = cast(
+                'Literal["Add", "Update", "Delete"]',
+                header_match.group(1),
+            )
+            current_body = []
+            continue
+
+        if current_header is None:
+            repaired.append(raw_line)
+            continue
+
+        current_body.append(raw_line)
+
+    flush_section()
+    return repaired
+
+
+def _repair_update_section_body(body_lines: list[str]) -> list[str]:
+    """Insert a default @@ header when a simple Update block omitted one."""
+
+    if any(_HUNK_HEADER_RE.match(line.strip()) for line in body_lines):
+        return body_lines
+
+    body_start = 0
+    while body_start < len(body_lines):
+        stripped = body_lines[body_start].strip()
+        if not stripped:
+            body_start += 1
+            continue
+        if stripped.startswith("*** Move to:"):
+            body_start += 1
+            continue
+        break
+
+    if body_start >= len(body_lines):
+        return body_lines
+
+    first_body_line = body_lines[body_start]
+    if not first_body_line.startswith((" ", "-", "+")):
+        return body_lines
+
+    return [*body_lines[:body_start], "@@", *body_lines[body_start:]]
 
 
 def _resolve_patch_path(raw_path: str) -> str:

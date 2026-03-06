@@ -34,6 +34,7 @@ _SCM_AUTH_LOGIN_PATTERNS = (
     re.compile(r"\bglab\s+auth\s+login\b", re.IGNORECASE),
     re.compile(r"\bgh\s+auth\s+login\b", re.IGNORECASE),
 )
+_GLAB_MR_CREATE_PATTERN = re.compile(r"\bglab\s+mr\s+create\b", re.IGNORECASE)
 
 
 def resolve_sandbox_patch_path(
@@ -83,10 +84,22 @@ class SandboxPolicyGuard:
                 return self._policy_violation(
                     reason="interactive SCM CLI login is blocked in sandbox.",
                     safer_alternative=(
-                        "use `glab mr create ...` or `gh pr create ...` directly; "
+                        "use `gh pr create ...` for GitHub, or create GitLab merge "
+                        "requests via REST API with `Authorization: Bearer $GITLAB_TOKEN`; "
                         "OAuth token is injected automatically from SCM authorization."
                     ),
                 )
+
+        if _GLAB_MR_CREATE_PATTERN.search(normalized):
+            return self._policy_violation(
+                reason="`glab mr create` is unreliable for GitLab OAuth tokens in sandbox.",
+                safer_alternative=(
+                    "create GitLab merge requests via REST API with "
+                    "`Authorization: Bearer $GITLAB_TOKEN`, for example "
+                    "`curl -X POST https://gitlab.com/api/v4/projects/<url-encoded-path>/merge_requests "
+                    '-H "Authorization: Bearer $GITLAB_TOKEN" --data "source_branch=...&target_branch=...&title=..."`.'
+                ),
+            )
 
         for pattern in _DANGEROUS_GIT_COMMAND_PATTERNS:
             if pattern.search(normalized):

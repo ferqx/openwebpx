@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shlex
 import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import docker
 from deepagents.backends.protocol import (
@@ -30,6 +32,18 @@ if TYPE_CHECKING:
     from langchain.tools import ToolRuntime
 
 logger = logging.getLogger(__name__)
+_GLAB_RE = re.compile(r"\bglab\b", re.IGNORECASE)
+_GH_RE = re.compile(r"\bgh\b", re.IGNORECASE)
+_GLAB_MR_CREATE_RE = re.compile(r"\bglab\s+mr\s+create\b", re.IGNORECASE)
+_EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SCM_BASH_ENV = "/etc/profile.d/openwebpx-scm.sh"
+_GITLAB_MR_REST_HINT = (
+    "create GitLab merge requests via REST API with "
+    "`Authorization: Bearer $GITLAB_TOKEN`, for example "
+    "`curl -X POST https://gitlab.example.com/api/v4/projects/<numeric-id>/merge_requests "
+    "--data-urlencode source_branch=... --data-urlencode target_branch=... "
+    '--data-urlencode title=... -H "Authorization: Bearer $GITLAB_TOKEN"`.'
+)
 
 
 class DockerBackend(BaseSandbox):
@@ -186,10 +200,17 @@ class DockerBackend(BaseSandbox):
             包含合并的stdout/stderr输出和退出码的ExecuteResponse。
         """
         environment, token_for_sanitize = self._build_execution_environment()
+        cli_auth_error = self._validate_scm_cli_auth(command, environment)
+        if cli_auth_error is not None:
+            return ExecuteResponse(
+                output=f"Error: {cli_auth_error}",
+                exit_code=1,
+                truncated=False,
+            )
         container = self.container
         try:
             exec_result = container.exec_run(
-                cmd=["sh", "-c", command],
+                cmd=["bash", "-lc", command],
                 workdir=self.workdir,
                 environment=environment,
             )
@@ -212,8 +233,42 @@ class DockerBackend(BaseSandbox):
                 truncated=False,
             )
 
+    def _validate_scm_cli_auth(
+        self,
+        command: str,
+        environment: dict[str, str],
+    ) -> str | None:
+        if _GLAB_MR_CREATE_RE.search(command):
+            return (
+                "`glab mr create` is disabled in sandbox because GitLab OAuth "
+                f"tokens are handled more reliably via REST API; {_GITLAB_MR_REST_HINT}"
+            )
+        if _GLAB_RE.search(command) and not (
+            environment.get("GLAB_TOKEN")
+            or environment.get("GITLAB_TOKEN")
+            or environment.get("GITLAB_ACCESS_TOKEN")
+        ):
+            return (
+                "SCM authorization unavailable for GitLab CLI command. "
+                "Please re-authorize GitLab integration in OpenWebPX; "
+                "do not run `glab auth login` in sandbox."
+            )
+        if _GH_RE.search(command) and not (
+            environment.get("GH_TOKEN") or environment.get("GITHUB_TOKEN")
+        ):
+            return (
+                "SCM authorization unavailable for GitHub CLI command. "
+                "Please re-authorize GitHub integration in OpenWebPX; "
+                "do not run `gh auth login` in sandbox."
+            )
+        return None
+
     def _build_execution_environment(self) -> tuple[dict[str, str], str | None]:
-        env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+        env = {
+            "PATH": _EXEC_PATH,
+            "SHELL": "/bin/bash",
+            "BASH_ENV": _SCM_BASH_ENV,
+        }
         token: str | None = None
         context = self._repo_auth_context_from_state()
         identity = self._repo_git_identity_from_state()
@@ -233,6 +288,11 @@ class DockerBackend(BaseSandbox):
             provider = context.get("provider", "").strip().lower()
             if token:
                 if provider == "gitlab":
+                    gitlab_base = str(context.get("gitlab_base_url") or "").strip()
+                    gitlab_host = urlparse(gitlab_base).netloc if gitlab_base else ""
+                    if gitlab_host:
+                        env["GLAB_HOST"] = gitlab_host
+                        env["GITLAB_HOST"] = gitlab_host
                     env["SCM_TOKEN"] = token
                     env["GITLAB_TOKEN"] = token
                     env["GLAB_TOKEN"] = token

@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 BIND_ALL_HOST = "0.0.0.0"  # nosec B104
 DEFAULT_WEB_SANDBOX_IMAGE = "sandbox-agent:latest"
 DEFAULT_WEB_SANDBOX_CONTAINER_PORT = 3000
+_EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SCM_BASH_ENV = "/etc/profile.d/openwebpx-scm.sh"
 
 
 class DockerState(AgentState):
@@ -167,6 +169,7 @@ class DockerMiddleware(AgentMiddleware):
             try:
                 container = self.client.containers.get(container_id)
                 self._restore_container_if_needed(container, container_id=container_id)
+                self._bootstrap_global_scm_env_in_container(container)
                 return cast("str", container_id)
             except NotFound:
                 raise ContainerDestroyedError(
@@ -174,14 +177,25 @@ class DockerMiddleware(AgentMiddleware):
                 ) from None
 
         # 仅在容器不存在时创建新容器，并保持常驻进程防止容器自动退出。
+        container_kwargs = dict(self.container_kwargs)
+        merged_environment = {
+            "SHELL": "/bin/bash",
+            "BASH_ENV": _SCM_BASH_ENV,
+        }
+        extra_environment = container_kwargs.pop("environment", None)
+        if isinstance(extra_environment, dict):
+            merged_environment.update(
+                {str(key): str(value) for key, value in extra_environment.items()}
+            )
         try:
             container = self.client.containers.run(
                 self.image,
                 command=["tail", "-f", "/dev/null"],
                 detach=True,
                 working_dir=self.workdir,
+                environment=merged_environment,
                 ports=self.ports,
-                **self.container_kwargs,
+                **container_kwargs,
             )
         except DockerException as exc:
             raise RuntimeError(f"Failed to create Docker container: {exc}") from exc
@@ -189,7 +203,49 @@ class DockerMiddleware(AgentMiddleware):
         if not container.id:
             raise RuntimeError("Failed to create Docker container: No ID returned")
         logger.info("Created container %s", container.id)
+        self._bootstrap_global_scm_env_in_container(container)
         return container.id
+
+    def _bootstrap_global_scm_env_in_container(self, container: Container) -> None:
+        """在容器初始化阶段创建全局持久 SCM 环境脚本。"""
+        cmd = (
+            "set -e; "
+            f'ENV_FILE="{_SCM_BASH_ENV}"; '
+            f"WORKDIR={shlex.quote(self.workdir)}; "
+            'WORKSPACE_ENV_FILE="$WORKDIR/.agent-runtime/openwebpx-scm.sh"; '
+            'BASHRC_FILE="/root/.bashrc"; '
+            'BASH_PROFILE_FILE="/root/.bash_profile"; '
+            'mkdir -p /etc/profile.d "$WORKDIR/.agent-runtime"; '
+            "cat > \"$ENV_FILE\" <<'EOF'\n"
+            "# OpenWebPX SCM runtime env\n"
+            'export SCM_TOKEN="${SCM_TOKEN-}"\n'
+            'export GITLAB_TOKEN="${GITLAB_TOKEN-}"\n'
+            'export GLAB_TOKEN="${GLAB_TOKEN-}"\n'
+            'export GITLAB_ACCESS_TOKEN="${GITLAB_ACCESS_TOKEN-}"\n'
+            'export GLAB_HOST="${GLAB_HOST-}"\n'
+            'export GITLAB_HOST="${GITLAB_HOST-}"\n'
+            'export GH_TOKEN="${GH_TOKEN-}"\n'
+            'export GITHUB_TOKEN="${GITHUB_TOKEN-}"\n'
+            "EOF\n"
+            'chmod 600 "$ENV_FILE"; '
+            'cp "$ENV_FILE" "$WORKSPACE_ENV_FILE"; '
+            'chmod 600 "$WORKSPACE_ENV_FILE"; '
+            'grep -q "openwebpx-scm.sh" "$BASHRC_FILE" 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> "$BASHRC_FILE"; '
+            'chmod 600 "$BASHRC_FILE"; '
+            'grep -q ".bashrc" "$BASH_PROFILE_FILE" 2>/dev/null || echo "[ -f /root/.bashrc ] && . /root/.bashrc" >> "$BASH_PROFILE_FILE"; '
+            'chmod 600 "$BASH_PROFILE_FILE"; '
+            'grep -q "openwebpx-scm.sh" /root/.profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /root/.profile; '
+            'grep -q "openwebpx-scm.sh" /etc/profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /etc/profile'
+        )
+        code, output = self._exec(
+            container,
+            cmd,
+            environment={"PATH": _EXEC_PATH},
+        )
+        if code != 0:
+            raise RuntimeError(
+                f"Failed to initialize SCM shell env in container: {output.strip() or 'unknown error'}"
+            )
 
     def _destroy_container(self, container_id: str) -> tuple[bool, str | None]:
         """销毁线程绑定容器。"""
@@ -497,6 +553,132 @@ class DockerMiddleware(AgentMiddleware):
         )
         return False, error_message
 
+    def _configure_git_runtime_in_container(
+        self,
+        *,
+        container: Container,
+        binding: dict[str, str],
+        token: str,
+    ) -> tuple[bool, str | None]:
+        """在仓库同步后初始化 git 身份与凭据，供后续原生 git 命令直接使用。"""
+        provider = str(binding.get("provider") or "").strip().lower()
+        git_name = str(binding.get("git_name") or "").strip() or "OpenWebPX Agent"
+        git_email = str(binding.get("git_email") or "").strip().lower()
+        if not git_email:
+            git_email = "openwebpx-agent@users.noreply.local"
+
+        if provider == "gitlab":
+            from app.routers.scm import _normalize_gitlab_base_url
+
+            scm_host = urlparse(
+                _normalize_gitlab_base_url(binding.get("gitlab_base_url") or None)
+            ).netloc
+            scm_user = "oauth2"
+        else:
+            scm_host = "github.com"
+            scm_user = "x-access-token"
+
+        workdir_q = shlex.quote(self.workdir)
+        configure_cmd = (
+            "set -e; "
+            f"WORKDIR={workdir_q}; "
+            'CRED_FILE="$WORKDIR/.agent-runtime/.git-credentials"; '
+            f'ENV_FILE="{_SCM_BASH_ENV}"; '
+            'WORKSPACE_ENV_FILE="$WORKDIR/.agent-runtime/openwebpx-scm.sh"; '
+            'BASHRC_FILE="/root/.bashrc"; '
+            'BASH_PROFILE_FILE="/root/.bash_profile"; '
+            'mkdir -p "$WORKDIR/.agent-runtime"; '
+            'if [ ! -d "$WORKDIR/.git" ]; then echo "git repository missing at $WORKDIR"; exit 1; fi; '
+            'git -C "$WORKDIR" config user.name "$GIT_NAME"; '
+            'git -C "$WORKDIR" config user.email "$GIT_EMAIL"; '
+            'git -C "$WORKDIR" config credential.helper "store --file=$CRED_FILE"; '
+            'printf "https://%s:%s@%s\\n" "$SCM_USER" "$SCM_TOKEN" "$SCM_HOST" > "$CRED_FILE"; '
+            'chmod 600 "$CRED_FILE"; '
+            'printf "export SCM_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" > "$ENV_FILE"; '
+            'if [ "$SCM_PROVIDER" = "gitlab" ]; then '
+            'printf "export GITLAB_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            'printf "export GLAB_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            'printf "export GITLAB_ACCESS_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            'printf "export GLAB_HOST=\\"%s\\"\\n" "$SCM_HOST" >> "$ENV_FILE"; '
+            'printf "export GITLAB_HOST=\\"%s\\"\\n" "$SCM_HOST" >> "$ENV_FILE"; '
+            "else "
+            'printf "export GH_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            'printf "export GITHUB_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            "fi; "
+            'chmod 600 "$ENV_FILE"; '
+            'cp "$ENV_FILE" "$WORKSPACE_ENV_FILE"; '
+            'chmod 600 "$WORKSPACE_ENV_FILE"; '
+            'grep -q "openwebpx-scm.sh" "$BASHRC_FILE" 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> "$BASHRC_FILE"; '
+            'chmod 600 "$BASHRC_FILE"; '
+            'grep -q ".bashrc" "$BASH_PROFILE_FILE" 2>/dev/null || echo "[ -f /root/.bashrc ] && . /root/.bashrc" >> "$BASH_PROFILE_FILE"; '
+            'chmod 600 "$BASH_PROFILE_FILE"; '
+            'grep -q "openwebpx-scm.sh" /root/.profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /root/.profile; '
+        )
+        code, output = self._exec(
+            container,
+            configure_cmd,
+            environment={
+                "PATH": _EXEC_PATH,
+                "SCM_TOKEN": token,
+                "SCM_USER": scm_user,
+                "SCM_HOST": scm_host,
+                "SCM_PROVIDER": provider,
+                "GIT_NAME": git_name,
+                "GIT_EMAIL": git_email,
+            },
+        )
+        if code == 0:
+            return True, None
+        return False, self._sanitize_repo_sync_error(output, token)
+
+    async def _resolve_thread_repo_access_token(
+        self,
+        *,
+        user_id: str,
+        provider: str,
+        gitlab_base_url: str | None,
+        github_auth_mode: str | None,
+    ) -> str:
+        from app.routers.scm import _resolve_scm_access_token
+
+        return await _resolve_scm_access_token(
+            user_id=user_id,
+            provider=provider,
+            gitlab_base_url=gitlab_base_url,
+            github_auth_mode=github_auth_mode,
+        )
+
+    async def _refresh_repo_runtime_environment(
+        self,
+        *,
+        container_id: str,
+        binding: dict[str, str],
+        token: str,
+    ) -> tuple[bool, str | None]:
+        try:
+            container = await asyncio.to_thread(
+                self.client.containers.get, container_id
+            )
+            await asyncio.to_thread(
+                lambda: self._restore_container_if_needed(
+                    container,
+                    container_id=container_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"容器不可用，无法刷新 git 运行时环境：{exc}"
+
+        configured, configure_error = await asyncio.to_thread(
+            lambda: self._configure_git_runtime_in_container(
+                container=container,
+                binding=binding,
+                token=token,
+            )
+        )
+        if configured:
+            return True, None
+        return False, configure_error or "unknown error"
+
     async def _maybe_sync_thread_repository(
         self,
         state: DockerState,
@@ -520,10 +702,54 @@ class DockerMiddleware(AgentMiddleware):
                 binding.get("github_auth_mode", ""),
             ]
         )
+        provider = binding["provider"]
+        user_id = binding["user_id"]
+        gitlab_base_url = binding.get("gitlab_base_url") or None
+        github_auth_mode = (
+            binding.get("github_auth_mode") if provider == "github" else None
+        )
+        if github_auth_mode == "":
+            github_auth_mode = None
+
         if (
             state.get("repo_sync_signature") == signature
             and state.get("repo_sync_success") is True
         ):
+            try:
+                token = await self._resolve_thread_repo_access_token(
+                    user_id=user_id,
+                    provider=provider,
+                    gitlab_base_url=gitlab_base_url,
+                    github_auth_mode=github_auth_mode,
+                )
+            except Exception as exc:  # noqa: BLE001
+                detail = getattr(exc, "detail", None)
+                message = (
+                    str(detail).strip()
+                    if isinstance(detail, str) and detail.strip()
+                    else str(exc).strip() or "unknown error"
+                )
+                self._report_progress(
+                    reporter,
+                    stage="repo",
+                    level="warning",
+                    message=f"git 凭据刷新失败：{message}",
+                )
+            else:
+                refreshed, refresh_error = await self._refresh_repo_runtime_environment(
+                    container_id=container_id,
+                    binding=binding,
+                    token=token,
+                )
+                if not refreshed:
+                    self._report_progress(
+                        reporter,
+                        stage="repo",
+                        level="warning",
+                        message=(
+                            f"git 身份/凭据刷新失败：{refresh_error or 'unknown error'}"
+                        ),
+                    )
             return {
                 "repo_auth_context": {
                     "user_id": binding["user_id"],
@@ -538,19 +764,8 @@ class DockerMiddleware(AgentMiddleware):
                 },
             }
 
-        provider = binding["provider"]
-        user_id = binding["user_id"]
-        gitlab_base_url = binding.get("gitlab_base_url") or None
-        github_auth_mode = (
-            binding.get("github_auth_mode") if provider == "github" else None
-        )
-        if github_auth_mode == "":
-            github_auth_mode = None
-
         try:
-            from app.routers.scm import _resolve_scm_access_token
-
-            token = await _resolve_scm_access_token(
+            token = await self._resolve_thread_repo_access_token(
                 user_id=user_id,
                 provider=provider,
                 gitlab_base_url=gitlab_base_url,
@@ -611,6 +826,20 @@ class DockerMiddleware(AgentMiddleware):
             )
         )
         if ok:
+            configured, configure_error = await asyncio.to_thread(
+                lambda: self._configure_git_runtime_in_container(
+                    container=container,
+                    binding=binding,
+                    token=token,
+                )
+            )
+            if not configured:
+                self._report_progress(
+                    reporter,
+                    stage="repo",
+                    level="warning",
+                    message=f"git 身份/凭据初始化失败：{configure_error or 'unknown error'}",
+                )
             return {
                 "repo_sync_signature": signature,
                 "repo_sync_success": True,
@@ -657,9 +886,9 @@ class DockerMiddleware(AgentMiddleware):
         workdir: str | None = None,
         environment: dict[str, str] | None = None,
     ) -> tuple[int, str]:
-        # 所有容器内命令统一走 sh -lc，确保 shell 语义一致（变量、重定向、&& 等）。
+        # 所有容器内命令统一走 bash -lc，确保 shell 语义与交互终端一致。
         result = container.exec_run(
-            cmd=["sh", "-lc", command],
+            cmd=["bash", "-lc", command],
             workdir=workdir or self.workdir,
             environment=environment,
         )
@@ -682,7 +911,7 @@ class DockerMiddleware(AgentMiddleware):
         api = container_client.api
         exec_create_resp = api.exec_create(
             container.id,
-            cmd=["sh", "-lc", command],
+            cmd=["bash", "-lc", command],
             workdir=workdir or self.workdir,
             environment=environment,
         )

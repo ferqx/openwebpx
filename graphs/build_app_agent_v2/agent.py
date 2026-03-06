@@ -55,7 +55,7 @@ ENABLE_ANTHROPIC_CACHE = _read_bool_env(
     False,
 )
 
-MODEL = ChatOpenAI(model=MODEL_NAME)
+MODEL = ChatOpenAI(model=MODEL_NAME, temperature=0.1)
 SYSTEM_PROMPT = build_system_prompt()
 SUMMARIZATION_DEFAULTS = _compute_summarization_defaults(MODEL)
 

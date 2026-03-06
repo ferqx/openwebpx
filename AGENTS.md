@@ -69,6 +69,12 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-06（Docker 沙箱 SCM 环境变量注入链路修复与 GitLab MR 稳定化）：
+  - 修复 Docker 沙箱内 SCM 环境变量注入问题：`DockerMiddleware` 在复用已同步仓库的旧容器时，也会重新解析 token 并刷新 git runtime 环境，避免 thread state 与容器 shell 实际值脱节。
+  - 修复 `/etc/profile.d/openwebpx-scm.sh` bootstrap 脚本会清空 exec 注入变量的问题：由 `unset` 改为保留 `SCM_TOKEN/GH_TOKEN/GITLAB_TOKEN/...` 当前值，确保 `bash -lc` 执行路径下 token 可见。
+  - `DockerBackend` / `SandboxPolicyGuard` 双层约束 GitLab MR 创建路径：禁止 `glab mr create`，统一引导 GitLab 使用 `Authorization: Bearer $GITLAB_TOKEN` 调 `POST /api/v4/projects/:id/merge_requests`；企业版优先数字 project id + `--data-urlencode`。
+  - 增加真实 Docker 集成测试与清理机制：`tests/test_docker_backend.py` 提供 `OPENWEBPX_RUN_DOCKER_INTEGRATION=1` 的端到端验证用例，并为测试容器注册 label 与 teardown 销毁逻辑。
+  - 新增排障文档沉淀：`docs/scm-auth-troubleshooting.md` 补充“Docker 沙箱 SCM 变量注入问题”的根因、复现、验证命令与复用排障步骤，后续同类问题优先按该文档执行。
 - 2026-03-05（沙箱执行策略与 SCM 凭据执行链路增强）：
   - `build_app_agent_v2` 新增 `sandbox_policy_guard.py` 并在 `PatchFilesystemMiddleware` 接入：统一拦截危险 git 变更命令、`.git` 写入、越界/批量 `rm|mv` 与 `apply_patch` 误用为 shell 命令等场景。
   - 新增 `workspace_tree_middleware.py`，在模型调用前注入工作区目录树快照到系统提示，减少“盲改”与重复探测。

@@ -222,6 +222,25 @@ def test_parse_and_apply_patch_insert_only_with_context_after() -> None:
     assert updated.endswith("\n}")
 
 
+def test_parse_patch_auto_repairs_missing_update_hunk_header() -> None:
+    patch_content = """
+*** Begin Patch
+*** Update File: number.txt
+-1
++2
+*** End Patch
+""".strip()
+
+    file_patches = parse_patch_content(patch_content)
+
+    assert len(file_patches) == 1
+    assert file_patches[0].action == "Update"
+    assert len(file_patches[0].hunks) == 1
+    assert file_patches[0].hunks[0].header == "@@"
+    assert file_patches[0].hunks[0].old_lines == ("1",)
+    assert file_patches[0].hunks[0].new_lines == ("2",)
+
+
 def test_parse_patch_insert_only_hunk_requires_context() -> None:
     patch_content = """
 *** Update File: style.css
@@ -293,6 +312,24 @@ def test_apply_patch_sync_supports_move_to() -> None:
     assert result["ok"] is True
     assert "/workspace/a.py" not in backend.files
     assert backend.files["/workspace/b.py"] == "x = 2\n"
+
+
+def test_apply_patch_sync_auto_repairs_missing_update_hunk_header() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _FakeBackend({"/workspace/number.txt": "1\n"})
+    patch_content = """
+*** Begin Patch
+*** Update File: number.txt
+-1
++2
+*** End Patch
+""".strip()
+
+    result_raw = middleware._apply_patch_sync(backend, patch_content)
+    result = json.loads(result_raw)
+
+    assert result["ok"] is True
+    assert backend.files["/workspace/number.txt"] == "2\n"
 
 
 def test_patch_filesystem_middleware_replaces_edit_file_tool() -> None:
@@ -434,6 +471,20 @@ def test_sandbox_policy_guard_blocks_interactive_scm_auth_login() -> None:
     assert "Policy blocked:" in violation
     assert "interactive SCM CLI login is blocked" in violation
     assert "token is injected automatically" in violation
+
+
+def test_sandbox_policy_guard_blocks_glab_mr_create_and_suggests_rest_api() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command(
+        'glab mr create --title "T" --description "D"'
+    )
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "`glab mr create` is unreliable" in violation
+    assert "Authorization: Bearer $GITLAB_TOKEN" in violation
+    assert "merge_requests" in violation
 
 
 def test_sandbox_policy_guard_allows_explicit_feature_branch_push() -> None:
@@ -724,6 +775,19 @@ def test_build_system_prompt_uses_single_template() -> None:
 
     assert "你是一个编码代理" in prompt
     assert "## `apply_patch`" in prompt
+    assert '`{"patch_content":"' in prompt
+    assert '`{"command":["apply_patch"' not in prompt
+    assert "`*** Update File:` 后面**只能**出现两种内容" in prompt
+    assert "错误示例（缺少 `@@`，不要这样写）" in prompt
+    assert "GitHub 使用 `gh pr create`" in prompt
+    assert "不要对 GitLab 使用 `glab mr create`" in prompt
+    assert "Authorization: Bearer $GITLAB_TOKEN" in prompt
+    assert "数字 project id" in prompt
+    assert "--data-urlencode" in prompt
+    assert "提交信息默认使用 Angular 模板" in prompt
+    assert "`<icon> <type>(<scope>): <subject>`" in prompt
+    assert "`body`" in prompt
+    assert "`footer`" in prompt
 
 
 def test_guard_blocks_write_before_submit_plan() -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 from docker.errors import NotFound
@@ -14,6 +16,7 @@ class FakeContainer:
         self.started = False
         self.unpaused = False
         self.stopped = False
+        self.exec_calls: list[dict[str, Any]] = []
 
     def reload(self) -> None:
         return None
@@ -29,6 +32,21 @@ class FakeContainer:
     def stop(self, timeout: int = 5) -> None:  # noqa: ARG002
         self.stopped = True
         self.status = "exited"
+
+    def exec_run(
+        self,
+        cmd: list[str],
+        workdir: str,
+        environment: dict[str, str] | None = None,
+    ) -> SimpleNamespace:
+        self.exec_calls.append(
+            {
+                "cmd": cmd,
+                "workdir": workdir,
+                "environment": environment or {},
+            }
+        )
+        return SimpleNamespace(exit_code=0, output=b"")
 
 
 class FakeContainerManager:
@@ -364,3 +382,86 @@ def test_after_agent_stops_container_when_dialog_finishes() -> None:
     assert result["service_status"]["container_status"] == "stopped"
     assert result["service_status"]["service_running"] is False
     assert result["service_status"]["service_pid"] is None
+
+
+def test_maybe_sync_thread_repository_refreshes_runtime_env_for_reused_repo() -> None:
+    container = FakeContainer("cid-1", status="running")
+    manager = FakeContainerManager(existing={"cid-1": container})
+    runtime = FakeRuntime(thread_id="thread-1")
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+
+    binding = {
+        "user_id": "u-1",
+        "provider": "github",
+        "repo": "owner/repo",
+        "branch": "main",
+        "git_name": "Alice",
+        "git_email": "alice@example.com",
+        "gitlab_base_url": "",
+        "github_auth_mode": "github_app",
+    }
+    calls: list[tuple[str, str]] = []
+
+    async def fake_aload_thread_repo_binding(_runtime: Any) -> dict[str, str]:
+        return binding
+
+    async def fake_resolve_token(**_kwargs: Any) -> str:
+        return "token-abc"
+
+    async def fake_refresh_runtime_environment(
+        **kwargs: Any,
+    ) -> tuple[bool, str | None]:
+        calls.append((kwargs["container_id"], kwargs["token"]))
+        assert kwargs["binding"] is binding
+        return True, None
+
+    middleware._aload_thread_repo_binding = fake_aload_thread_repo_binding  # type: ignore[method-assign]
+    middleware._resolve_thread_repo_access_token = fake_resolve_token  # type: ignore[method-assign]
+    middleware._refresh_repo_runtime_environment = fake_refresh_runtime_environment  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        middleware._maybe_sync_thread_repository(
+            state={
+                "repo_sync_signature": "cid-1|github|owner/repo|main||github_app",
+                "repo_sync_success": True,
+            },
+            runtime=runtime,
+            container_id="cid-1",
+        )
+    )
+
+    assert result is not None
+    assert calls == [("cid-1", "token-abc")]
+    assert result["repo_auth_context"]["provider"] == "github"
+    assert result["repo_git_identity"]["email"] == "alice@example.com"
+
+
+def test_configure_git_runtime_in_container_reports_missing_git_repo() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        assert 'if [ ! -d "$WORKDIR/.git" ]' in command
+        return 1, "git repository missing at /workspace"
+
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+
+    ok, err = middleware._configure_git_runtime_in_container(
+        container=object(),  # type: ignore[arg-type]
+        binding={
+            "provider": "github",
+            "git_name": "Alice",
+            "git_email": "alice@example.com",
+        },
+        token="token-abc",
+    )
+
+    assert ok is False
+    assert err == "git repository missing at /workspace"
