@@ -26,6 +26,9 @@ services:
     environment:
       - POSTGRES_HOST=postgres
       - DOCKER_HOST=unix:///var/run/docker.sock
+    user: "${AEGRA_DOCKER_USER:-0:0}"
+    group_add:
+      - "${DOCKER_GID:-998}"
     depends_on:
       postgres:
         condition: service_healthy

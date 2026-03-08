@@ -472,9 +472,18 @@ def test_configure_git_runtime_in_container_reports_missing_git_repo() -> None:
 def test_docker_unavailable_message_mentions_socket_mount_when_socket_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("middleware.docker.os.path.exists", lambda _path: False)
+    monkeypatch.setattr("middleware.docker.Path.exists", lambda _self: False)
 
     message = _docker_unavailable_message(docker.errors.DockerException("boom"))
 
     assert "/var/run/docker.sock" in message
     assert "DOCKER_HOST=unix:///var/run/docker.sock" in message
+
+
+def test_docker_unavailable_message_mentions_group_add_on_permission_denied() -> None:
+    message = _docker_unavailable_message(
+        docker.errors.DockerException("PermissionError(13, 'Permission denied')")
+    )
+
+    assert "group_add" in message
+    assert "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" in message

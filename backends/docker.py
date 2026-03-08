@@ -51,14 +51,28 @@ def _docker_unavailable_message(exc: DockerException) -> str:
     base = "Docker is not available."
     details = str(exc).strip()
     socket_exists = Path("/var/run/docker.sock").exists()
-    guidance = (
-        " If OpenWebPX is running inside Docker, mount /var/run/docker.sock into the "
-        "service container and set DOCKER_HOST=unix:///var/run/docker.sock. "
-        "Otherwise ensure Docker is installed and the daemon is running on the host."
-        if not socket_exists
-        else " Ensure the Docker daemon is running and that this process can access "
-        "/var/run/docker.sock."
+    permission_denied = (
+        "PermissionError(13" in details or "Permission denied" in details
     )
+    if permission_denied:
+        guidance = (
+            " The Docker socket is present but this process cannot access it. If "
+            "OpenWebPX is running inside Docker, add the service container to the "
+            "host Docker socket group, for example via group_add with "
+            "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock), and keep "
+            "DOCKER_HOST=unix:///var/run/docker.sock."
+        )
+    elif not socket_exists:
+        guidance = (
+            " If OpenWebPX is running inside Docker, mount /var/run/docker.sock into "
+            "the service container and set DOCKER_HOST=unix:///var/run/docker.sock. "
+            "Otherwise ensure Docker is installed and the daemon is running on the host."
+        )
+    else:
+        guidance = (
+            " Ensure the Docker daemon is running and that this process can access "
+            "/var/run/docker.sock."
+        )
     if details:
         return f"{base}{guidance} Original error: {details}"
     return f"{base}{guidance}"

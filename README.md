@@ -46,8 +46,13 @@ docker compose -f docker-compose.prod.yml up -d --build
 If you want the server to create sandbox containers from inside the `aegra` service,
 the service container must be able to reach the host Docker daemon. The provided
 compose files already mount `/var/run/docker.sock` and set
-`DOCKER_HOST=unix:///var/run/docker.sock`. If you deploy with a custom manifest,
-preserve that configuration or Docker-backed sandbox initialization will fail.
+`DOCKER_HOST=unix:///var/run/docker.sock`. For cross-platform compatibility the
+default compose files run `aegra` as `root` via `AEGRA_DOCKER_USER=0:0`, because
+Docker Desktop on macOS commonly exposes the socket as `root:root` with `660`
+permissions. On Linux, you can switch `AEGRA_DOCKER_USER=app` and set `DOCKER_GID`
+to the host socket group id after verifying the socket is group-writable. If you
+deploy with a custom manifest, preserve that configuration or Docker-backed sandbox
+initialization will fail.
 
 Your existing LangGraph code works without changes:
 
