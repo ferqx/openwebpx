@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:18
+    env_file:
+      - .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  aegra:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./aegra.json:/app/aegra.json:ro
+      - ./.env:/app/.env:ro
+    command: >
+      sh -c "
+        echo 'Running database migrations...' &&
+        /app/.venv/bin/alembic -c /app/alembic.ini upgrade head &&
+        echo 'Starting Aegra server...' &&
+        /app/.venv/bin/uvicorn aegra_api.main:app --host 0.0.0.0 --port $${PORT:-8000}
+      "
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    profiles:
+      - redis
+
+volumes:
+  postgres_data:
+  redis_data:
