@@ -4,9 +4,11 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+import docker
+import pytest
 from docker.errors import NotFound
 
-from middleware.docker import DockerMiddleware
+from middleware.docker import DockerMiddleware, _docker_unavailable_message
 
 
 class FakeContainer:
@@ -465,3 +467,14 @@ def test_configure_git_runtime_in_container_reports_missing_git_repo() -> None:
 
     assert ok is False
     assert err == "git repository missing at /workspace"
+
+
+def test_docker_unavailable_message_mentions_socket_mount_when_socket_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("middleware.docker.os.path.exists", lambda _path: False)
+
+    message = _docker_unavailable_message(docker.errors.DockerException("boom"))
+
+    assert "/var/run/docker.sock" in message
+    assert "DOCKER_HOST=unix:///var/run/docker.sock" in message

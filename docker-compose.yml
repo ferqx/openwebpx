@@ -25,10 +25,12 @@ services:
       - .env
     environment:
       - POSTGRES_HOST=postgres
+      - DOCKER_HOST=unix:///var/run/docker.sock
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - ./aegra.json:/app/aegra.json:ro
       - ./app:/app/app:ro
       - ./backends:/app/backends:ro

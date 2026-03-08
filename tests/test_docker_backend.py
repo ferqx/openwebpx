@@ -12,7 +12,7 @@ import pytest
 from docker.errors import NotFound
 from docker.models.containers import Container
 
-from backends.docker import DockerBackend
+from backends.docker import DockerBackend, _docker_unavailable_message
 
 
 class FakeContainer:
@@ -219,6 +219,17 @@ def test_build_execution_environment_injects_git_identity_and_token() -> None:
     assert env["GIT_AUTHOR_EMAIL"] == "alice@example.com"
     assert env["GH_TOKEN"] == "token-abc"
     assert env["GITHUB_TOKEN"] == "token-abc"
+
+
+def test_docker_unavailable_message_mentions_socket_mount_when_socket_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("backends.docker.os.path.exists", lambda _path: False)
+
+    message = _docker_unavailable_message(docker.errors.DockerException("boom"))
+
+    assert "/var/run/docker.sock" in message
+    assert "DOCKER_HOST=unix:///var/run/docker.sock" in message
 
 
 def test_build_execution_environment_injects_gitlab_host_and_tokens() -> None:

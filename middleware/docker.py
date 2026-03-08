@@ -17,7 +17,7 @@ import shlex
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from urllib.parse import quote, urlparse
 
@@ -36,6 +36,24 @@ DEFAULT_WEB_SANDBOX_IMAGE = "sandbox-agent:latest"
 DEFAULT_WEB_SANDBOX_CONTAINER_PORT = 3000
 _EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _SCM_BASH_ENV = "/etc/profile.d/openwebpx-scm.sh"
+
+
+def _docker_unavailable_message(exc: DockerException) -> str:
+    """返回更可操作的 Docker 不可用诊断信息。"""
+    base = "Docker is not available."
+    details = str(exc).strip()
+    socket_exists = Path("/var/run/docker.sock").exists()
+    guidance = (
+        " If OpenWebPX is running inside Docker, mount /var/run/docker.sock into the "
+        "service container and set DOCKER_HOST=unix:///var/run/docker.sock. "
+        "Otherwise ensure Docker is installed and the daemon is running on the host."
+        if not socket_exists
+        else " Ensure the Docker daemon is running and that this process can access "
+        "/var/run/docker.sock."
+    )
+    if details:
+        return f"{base}{guidance} Original error: {details}"
+    return f"{base}{guidance}"
 
 
 class DockerState(AgentState):
@@ -122,9 +140,7 @@ class DockerMiddleware(AgentMiddleware):
                 self._client = docker.from_env()
             except DockerException as exc:
                 logger.error("Failed to initialize Docker client: %s", exc)
-                raise RuntimeError(
-                    "Docker is not available. Please ensure Docker is installed and running."
-                ) from exc
+                raise RuntimeError(_docker_unavailable_message(exc)) from exc
         return self._client
 
     def _restore_container_if_needed(

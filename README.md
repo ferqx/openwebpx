@@ -43,6 +43,12 @@ For production deployment, use the non-reloading compose file:
 docker compose -f docker-compose.prod.yml up -d --build
 ```
 
+If you want the server to create sandbox containers from inside the `aegra` service,
+the service container must be able to reach the host Docker daemon. The provided
+compose files already mount `/var/run/docker.sock` and set
+`DOCKER_HOST=unix:///var/run/docker.sock`. If you deploy with a custom manifest,
+preserve that configuration or Docker-backed sandbox initialization will fail.
+
 Your existing LangGraph code works without changes:
 
 ```python

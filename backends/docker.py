@@ -46,6 +46,24 @@ _GITLAB_MR_REST_HINT = (
 )
 
 
+def _docker_unavailable_message(exc: DockerException) -> str:
+    """返回更可操作的 Docker 不可用诊断信息。"""
+    base = "Docker is not available."
+    details = str(exc).strip()
+    socket_exists = Path("/var/run/docker.sock").exists()
+    guidance = (
+        " If OpenWebPX is running inside Docker, mount /var/run/docker.sock into the "
+        "service container and set DOCKER_HOST=unix:///var/run/docker.sock. "
+        "Otherwise ensure Docker is installed and the daemon is running on the host."
+        if not socket_exists
+        else " Ensure the Docker daemon is running and that this process can access "
+        "/var/run/docker.sock."
+    )
+    if details:
+        return f"{base}{guidance} Original error: {details}"
+    return f"{base}{guidance}"
+
+
 class DockerBackend(BaseSandbox):
     """在现有Docker容器中运行命令的沙箱后端。
 
@@ -88,9 +106,7 @@ class DockerBackend(BaseSandbox):
                 self._client = docker.from_env()
             except DockerException as e:
                 logger.error("Failed to initialize Docker client: %s", e)
-                raise RuntimeError(
-                    "Docker is not available. Please ensure Docker is installed and running."
-                ) from e
+                raise RuntimeError(_docker_unavailable_message(e)) from e
         return self._client
 
     def _get_thread_id(self) -> str | None:
