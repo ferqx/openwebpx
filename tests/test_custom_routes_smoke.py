@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from aegra_api.core.auth_deps import get_current_user, require_auth
 from aegra_api.core.orm import get_session
@@ -926,6 +927,41 @@ def test_scm_oauth_callback_rejects_mismatched_redirect_uri(client: TestClient) 
     assert response.json() == {
         "ok": False,
         "error": "OAuth redirect_uri 与授权请求不匹配",
+    }
+
+
+def test_scm_repositories_returns_502_when_github_upstream_connect_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_key = scm_router._scm_token_cache_key(  # noqa: SLF001
+        user_id="local-dev",
+        provider="github",
+        github_auth_mode="github_app",
+    )
+    scm_router.SCM_TOKENS[cache_key] = {
+        "provider": "github",
+        "access_token": "token-1",
+        "github_token_source": "github_app",
+        "github_auth_mode": "github_app",
+    }
+
+    async def fake_installation_repositories(**_: Any) -> list[dict[str, Any]]:
+        raise httpx.ConnectError("tls failed")
+
+    monkeypatch.setattr(
+        scm_router,
+        "_fetch_github_installation_repositories",
+        fake_installation_repositories,
+    )
+
+    response = client.get(
+        "/integrations/scm/repositories",
+        params={"provider": "github", "auth_mode": "github_app"},
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": "SCM 仓库查询 网络连接失败，请检查服务容器的外网访问和 TLS 配置: tls failed"
     }
 
 

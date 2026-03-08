@@ -37,6 +37,12 @@ docker compose up
 
 Open [http://localhost:8000/docs](http://localhost:8000/docs) to explore the API.
 
+For production deployment, use the non-reloading compose file:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
 Your existing LangGraph code works without changes:
 
 ```python

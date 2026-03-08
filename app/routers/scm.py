@@ -693,6 +693,15 @@ def _resolve_gitlab_oauth_client_credentials(*, is_enterprise: bool) -> tuple[st
     return client_id, client_secret
 
 
+def _raise_upstream_connect_error(service: str, exc: httpx.HTTPError) -> None:
+    detail = str(exc).strip()
+    suffix = f": {detail}" if detail else ""
+    raise HTTPException(
+        502,
+        f"{service} 网络连接失败，请检查服务容器的外网访问和 TLS 配置{suffix}",
+    ) from exc
+
+
 async def _exchange_github_oauth_token(
     *,
     code: str,
@@ -703,16 +712,19 @@ async def _exchange_github_oauth_token(
     client_id, client_secret = _resolve_github_oauth_client_credentials()
 
     async with httpx.AsyncClient(timeout=20) as http_client:
-        response = await http_client.post(
-            "https://github.com/login/oauth/access_token",
-            data={
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "code": code,
-                "redirect_uri": redirect_uri,
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            response = await http_client.post(
+                "https://github.com/login/oauth/access_token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitHub token 交换", exc)
 
     if response.status_code >= 400:
         raise HTTPException(
@@ -760,16 +772,19 @@ async def _refresh_github_oauth_token(
     client_id, client_secret = _resolve_github_oauth_client_credentials()
 
     async with httpx.AsyncClient(timeout=20) as http_client:
-        response = await http_client.post(
-            "https://github.com/login/oauth/access_token",
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            response = await http_client.post(
+                "https://github.com/login/oauth/access_token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitHub token 刷新", exc)
 
     if response.status_code >= 400:
         raise HTTPException(
@@ -813,14 +828,17 @@ async def _fetch_github_authenticated_user_profile(
     access_token: str,
 ) -> dict[str, str]:
     async with httpx.AsyncClient(timeout=20) as http_client:
-        response = await http_client.get(
-            "https://api.github.com/user",
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {access_token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
+        try:
+            response = await http_client.get(
+                "https://api.github.com/user",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {access_token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        except httpx.HTTPError:
+            return {}
     if response.status_code >= 400:
         return {}
     payload = response.json() if response.content else {}
@@ -846,11 +864,14 @@ async def _fetch_github_installation_repositories(
         "Authorization": f"Bearer {access_token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    installations_response = await http_client.get(
-        "https://api.github.com/user/installations",
-        params={"per_page": 100},
-        headers=headers,
-    )
+    try:
+        installations_response = await http_client.get(
+            "https://api.github.com/user/installations",
+            params={"per_page": 100},
+            headers=headers,
+        )
+    except httpx.HTTPError as exc:
+        _raise_upstream_connect_error("GitHub 安装列表查询", exc)
     if installations_response.status_code in {403, 404}:
         return []
     if installations_response.status_code >= 400:
@@ -877,11 +898,14 @@ async def _fetch_github_installation_repositories(
         installation_id = installation.get("id")
         if not isinstance(installation_id, int):
             continue
-        repos_response = await http_client.get(
-            f"https://api.github.com/user/installations/{installation_id}/repositories",
-            params={"per_page": 100},
-            headers=headers,
-        )
+        try:
+            repos_response = await http_client.get(
+                f"https://api.github.com/user/installations/{installation_id}/repositories",
+                params={"per_page": 100},
+                headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitHub 安装仓库查询", exc)
         if repos_response.status_code in {403, 404}:
             continue
         if repos_response.status_code >= 400:
@@ -914,15 +938,18 @@ async def _fetch_github_user_repositories(
     http_client: httpx.AsyncClient,
     access_token: str,
 ) -> list[dict[str, Any]]:
-    response = await http_client.get(
-        "https://api.github.com/user/repos",
-        params={"sort": "updated", "per_page": 100},
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {access_token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+    try:
+        response = await http_client.get(
+            "https://api.github.com/user/repos",
+            params={"sort": "updated", "per_page": 100},
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {access_token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+    except httpx.HTTPError as exc:
+        _raise_upstream_connect_error("GitHub 仓库查询", exc)
     if response.status_code >= 400:
         raise HTTPException(
             response.status_code,
@@ -955,17 +982,20 @@ async def _exchange_gitlab_oauth_token(
     )
 
     async with httpx.AsyncClient(timeout=20) as http_client:
-        response = await http_client.post(
-            f"{gitlab_base_url}/oauth/token",
-            data={
-                "grant_type": "authorization_code",
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "code": code,
-                "redirect_uri": redirect_uri,
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            response = await http_client.post(
+                f"{gitlab_base_url}/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitLab token 交换", exc)
 
     if response.status_code >= 400:
         raise HTTPException(
@@ -1009,16 +1039,19 @@ async def _refresh_gitlab_oauth_token(
     )
 
     async with httpx.AsyncClient(timeout=20) as http_client:
-        response = await http_client.post(
-            f"{gitlab_base_url}/oauth/token",
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            response = await http_client.post(
+                f"{gitlab_base_url}/oauth/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitLab token 刷新", exc)
 
     if response.status_code >= 400:
         raise HTTPException(
@@ -1551,17 +1584,20 @@ async def list_scm_repositories(
                 return {"repositories": repositories}
 
             resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
-            response = await http_client.get(
-                f"{resolved_base_url}/api/v4/projects",
-                params={
-                    "membership": True,
-                    "simple": True,
-                    "per_page": 100,
-                    "order_by": "last_activity_at",
-                    "sort": "desc",
-                },
-                headers={"Authorization": f"Bearer {token}"},
-            )
+            try:
+                response = await http_client.get(
+                    f"{resolved_base_url}/api/v4/projects",
+                    params={
+                        "membership": True,
+                        "simple": True,
+                        "per_page": 100,
+                        "order_by": "last_activity_at",
+                        "sort": "desc",
+                    },
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab 仓库查询", exc)
             if response.status_code >= 400:
                 raise HTTPException(
                     response.status_code,
@@ -1586,6 +1622,8 @@ async def list_scm_repositories(
             await _delete_scm_token_payload(cache_key)
             raise HTTPException(401, "SCM 授权已失效或已被撤销，请重新授权") from exc
         raise
+    except httpx.HTTPError as exc:
+        _raise_upstream_connect_error("SCM 仓库查询", exc)
 
 
 @router.get("/integrations/scm/branches")
@@ -1622,15 +1660,18 @@ async def list_scm_branches(
     try:
         async with httpx.AsyncClient(timeout=20) as http_client:
             if normalized_provider == "github":
-                response = await http_client.get(
-                    f"https://api.github.com/repos/{repo_full_name}/branches",
-                    params={"per_page": 100},
-                    headers={
-                        "Accept": "application/vnd.github+json",
-                        "Authorization": f"Bearer {token}",
-                        "X-GitHub-Api-Version": "2022-11-28",
-                    },
-                )
+                try:
+                    response = await http_client.get(
+                        f"https://api.github.com/repos/{repo_full_name}/branches",
+                        params={"per_page": 100},
+                        headers={
+                            "Accept": "application/vnd.github+json",
+                            "Authorization": f"Bearer {token}",
+                            "X-GitHub-Api-Version": "2022-11-28",
+                        },
+                    )
+                except httpx.HTTPError as exc:
+                    _raise_upstream_connect_error("GitHub 分支查询", exc)
                 if response.status_code >= 400:
                     raise HTTPException(
                         response.status_code,
@@ -1648,11 +1689,14 @@ async def list_scm_branches(
 
             resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
             encoded_repo = quote(repo_full_name, safe="")
-            response = await http_client.get(
-                f"{resolved_base_url}/api/v4/projects/{encoded_repo}/repository/branches",
-                params={"per_page": 100},
-                headers={"Authorization": f"Bearer {token}"},
-            )
+            try:
+                response = await http_client.get(
+                    f"{resolved_base_url}/api/v4/projects/{encoded_repo}/repository/branches",
+                    params={"per_page": 100},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab 分支查询", exc)
             if response.status_code >= 400:
                 raise HTTPException(
                     response.status_code,
@@ -1672,3 +1716,5 @@ async def list_scm_branches(
             await _delete_scm_token_payload(cache_key)
             raise HTTPException(401, "SCM 授权已失效或已被撤销，请重新授权") from exc
         raise
+    except httpx.HTTPError as exc:
+        _raise_upstream_connect_error("SCM 分支查询", exc)
