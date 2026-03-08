@@ -3,12 +3,21 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "aegra"
+name = "openwebpx"
 version = "0.1.0"
 description = "Open source LangGraph Platform alternative - Self-hosted AI agent backend with FastAPI and PostgreSQL. Zero vendor lock-in, full control over your agent infrastructure."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-keywords = ["langgraph", "ai-agents", "self-hosted", "agent-backend", "fastapi", "postgresql", "langchain", "agent-protocol"]
+keywords = [
+    "langgraph",
+    "ai-agents",
+    "self-hosted",
+    "agent-backend",
+    "fastapi",
+    "postgresql",
+    "langchain",
+    "agent-protocol",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -19,12 +28,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-authors = [
-    {name = "Muhammad Ibrahim", email = "mibrahim37612@gmail.com"}
-]
-maintainers = [
-    {name = "Muhammad Ibrahim", email = "mibrahim37612@gmail.com"}
-]
+authors = [{ name = "Muhammad Ibrahim", email = "mibrahim37612@gmail.com" }]
+maintainers = [{ name = "Muhammad Ibrahim", email = "mibrahim37612@gmail.com" }]
 dependencies = [
     "alembic>=1.16.4",
     "asyncpg>=0.30.0",
@@ -59,8 +64,8 @@ dependencies = [
     "langchain-qdrant>=1.1.0",
     "pydantic-settings>=2.12.0",
     "docker>=7.1.0",
-    "aegra-cli>=0.7.4",
-    "aegra-api>=0.7.4",
+    "aegra-cli==0.7.5",
+    "aegra-api==0.7.5",
     "pytest>=9.0.2",
 ]
 
@@ -72,31 +77,39 @@ Documentation = "https://github.com/ibbybuilds/aegra#readme"
 "Feature Requests" = "https://github.com/ibbybuilds/aegra/issues"
 
 
-
 [tool.hatch.build.targets.wheel]
-packages = ["src/agent_server"]
+packages = ["app", "backends", "middleware", "graphs"]
 
-[tool.hatch.build.targets.wheel.sources]
-"graphs/react_agent" = "react_agent"
+[tool.hatch.build.targets.sdist]
+include = [
+  "/app",
+  "/backends",
+  "/middleware",
+  "/graphs",
+  "/alembic",
+  "/alembic.ini",
+  "/aegra.json",
+  "/README.md",
+]
 
 [tool.ruff]
 line-length = 88
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
-    "E",     # pycodestyle errors
-    "W",     # pycodestyle warnings
-    "F",     # pyflakes
-    "I",     # isort
-    "B",     # flake8-bugbear
-    "C4",    # flake8-comprehensions
-    "UP",    # pyupgrade
-    "ARG",   # flake8-unused-arguments
-    "SIM",   # flake8-simplify
-    "TCH",   # flake8-type-checking
-    "PTH",   # flake8-use-pathlib
-    "ERA",   # eradicate (commented-out code)
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "ARG", # flake8-unused-arguments
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+    "PTH", # flake8-use-pathlib
+    "ERA", # eradicate (commented-out code)
 ]
 ignore = [
     "E501",  # line too long (handled by formatter)
@@ -108,17 +121,17 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
-    "ARG",   # unused arguments in tests are common
-    "S101",  # assert statements are expected in tests
+    "ARG",  # unused arguments in tests are common
+    "S101", # assert statements are expected in tests
 ]
 "middleware/docker.py" = [
-    "ERA",   # keep archived commented-out lifecycle logic for reference
+    "ERA", # keep archived commented-out lifecycle logic for reference
 ]
 "middleware/tool_call_tracker.py" = [
-    "ARG",   # middleware hooks require unused parameters for signature compatibility
+    "ARG", # middleware hooks require unused parameters for signature compatibility
 ]
 "alembic/**/*.py" = [
-    "ERA",   # commented code in migrations is intentional
+    "ERA", # commented code in migrations is intentional
 ]
 
 [tool.ruff.format]
@@ -140,16 +153,14 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
 asyncio_mode = "auto"
-markers = [
-    "e2e: marks tests as end-to-end tests",
-]
+markers = ["e2e: marks tests as end-to-end tests"]
 
 [tool.bandit]
 exclude_dirs = ["tests", ".venv", "alembic"]
 skips = ["B101"]
 
 [tool.coverage.run]
-source = ["src"]
+source = ["app", "backends", "middleware", "graphs"]
 omit = ["*/tests/*", "*/__pycache__/*", "*/alembic/*"]
 
 [tool.coverage.report]
