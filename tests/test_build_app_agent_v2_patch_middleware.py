@@ -10,6 +10,7 @@ from langchain_core.messages import ToolMessage
 
 from graphs.build_app_agent_v2.guard_middleware import ToolCallGuardMiddleware
 from graphs.build_app_agent_v2.patch_filesystem_middleware import (
+    APPLY_PATCH_TOOL_DESCRIPTION,
     PatchFilesystemMiddleware,
     _resolve_patch_path,
     apply_update_patch,
@@ -151,6 +152,12 @@ def test_parse_and_apply_patch_with_multiple_hunks() -> None:
     assert "background: #222;" in updated
     assert "color: #ffffff;" not in updated
     assert "background: #fff;" not in updated
+
+
+def test_build_app_agent_v2_registers_tool_call_guard_middleware() -> None:
+    source = Path("graphs/build_app_agent_v2/agent.py").read_text(encoding="utf-8")
+
+    assert "ToolCallGuardMiddleware()," in source
 
 
 def test_parse_patch_rejects_duplicate_file_sections() -> None:
@@ -295,6 +302,28 @@ no-prefix-context
         parse_patch_content(patch_content)
 
 
+def test_apply_patch_sync_rejects_unprefixed_blank_hunk_line_as_parse_error() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _FakeBackend({"/workspace/a.txt": "line1\n\nline2\n"})
+    patch_content = """
+*** Begin Patch
+*** Update File: a.txt
+@@ bad-hunk
+ line1
+
+-line2
++line2-new
+*** End Patch
+""".strip()
+
+    result_raw = middleware._apply_patch_sync(backend, patch_content)
+    result = json.loads(result_raw)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "PATCH_PARSE_ERROR"
+    assert "invalid hunk line prefix" in result["message"]
+
+
 def test_apply_patch_sync_supports_move_to() -> None:
     middleware = PatchFilesystemMiddleware()
     backend = _FakeBackend({"/workspace/a.py": "x = 1\n"})
@@ -332,6 +361,44 @@ def test_apply_patch_sync_auto_repairs_missing_update_hunk_header() -> None:
     assert backend.files["/workspace/number.txt"] == "2\n"
 
 
+def test_apply_patch_sync_returns_structured_file_diffs_with_line_numbers() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _FakeBackend(
+        {"/workspace/README.md": "line 1\nline 2\nline 3\nold value\nline 5\n"}
+    )
+    patch_content = """
+*** Begin Patch
+*** Update File: README.md
+@@ update-readme
+ line 2
+ line 3
+-old value
++new value
+ line 5
+*** End Patch
+""".strip()
+
+    result_raw = middleware._apply_patch_sync(backend, patch_content)
+    result = json.loads(result_raw)
+
+    assert result["ok"] is True
+    assert result["details"]["file_diffs"] == [
+        {
+            "file_path": "README.md",
+            "before_line_count": 5,
+            "after_line_count": 5,
+            "hunks": [
+                {
+                    "old_start": 4,
+                    "old_count": 1,
+                    "new_start": 4,
+                    "new_count": 1,
+                }
+            ],
+        }
+    ]
+
+
 def test_patch_filesystem_middleware_replaces_edit_file_tool() -> None:
     middleware = PatchFilesystemMiddleware()
     tool_names = {tool.name for tool in middleware.tools}
@@ -349,6 +416,17 @@ def test_patch_filesystem_middleware_replaces_edit_file_tool() -> None:
     assert "glob" not in tool_names
     assert "grep" not in tool_names
     assert "edit_file" not in tool_names
+
+
+def test_patch_filesystem_middleware_execute_description_encourages_batched_reads() -> (
+    None
+):
+    middleware = PatchFilesystemMiddleware()
+    execute_tool = next(tool for tool in middleware.tools if tool.name == "execute")
+
+    assert execute_tool.description is not None
+    assert "independent read-only discovery" in execute_tool.description
+    assert "batch related checks into one call" in execute_tool.description
 
 
 def test_execute_guard_allows_git_commit_for_pr_flow() -> None:
@@ -460,6 +538,28 @@ def test_sandbox_policy_guard_blocks_apply_patch_shell_invocation() -> None:
     assert "Policy blocked:" in violation
     assert "`apply_patch` is not an executable shell binary" in violation
     assert "invoke the registered `apply_patch` tool directly" in violation
+
+
+def test_sandbox_policy_guard_blocks_cat_heredoc_file_write() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("cat > README.md <<'EOF'\nhello\nEOF")
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "shell redirection for file writes is blocked" in violation
+    assert "apply_patch" in violation
+
+
+def test_sandbox_policy_guard_blocks_tee_file_write() -> None:
+    guard = SandboxPolicyGuard()
+
+    violation = guard.validate_execute_command("printf 'hi' | tee README.md")
+
+    assert violation is not None
+    assert "Policy blocked:" in violation
+    assert "shell-based file writes via `tee` are blocked" in violation
+    assert "apply_patch" in violation
 
 
 def test_sandbox_policy_guard_blocks_interactive_scm_auth_login() -> None:
@@ -774,11 +874,26 @@ def test_build_system_prompt_uses_single_template() -> None:
     prompt = build_system_prompt()
 
     assert "你是一个编码代理" in prompt
+    assert "当前环境提供 `update_plan` 工具" in prompt
+    assert "优先调用 `update_plan` 来维护计划状态" in prompt
+    assert (
+        "如果多个操作彼此独立且可以并行推进，应在同一轮里并行发出多个工具调用" in prompt
+    )
+    assert "查看文件列表、按关键字搜索、读取候选文件内容" in prompt
+    assert "如果当前可用的只读工具实际上只有 `execute`" in prompt
     assert "## `apply_patch`" in prompt
     assert '`{"patch_content":"' in prompt
     assert '`{"command":["apply_patch"' not in prompt
+    assert "不要调用 `update_plan`：该工具在当前图中未注册" not in prompt
     assert "`*** Update File:` 后面**只能**出现两种内容" in prompt
     assert "错误示例（缺少 `@@`，不要这样写）" in prompt
+    assert "错误示例（把整文件内容当 patch 正文，解析器会拒绝）" in prompt
+    assert "不要把“文件最新完整内容”直接粘到 `*** Update File:` 后面" in prompt
+    assert "每个 `@@` hunk 里必须至少包含一行 `-` 或 `+`" in prompt
+    assert "不要输出只有 `@@` 加上下文行的空 hunk" in prompt
+    assert "不要为了 patch 去手工计算精确数字行号" in prompt
+    assert "用户最终看到的精确修改行号由工具在成功应用后计算" in prompt
+    assert "不要通过 `execute` 使用 `cat > file <<'EOF'`" in prompt
     assert "GitHub 使用 `gh pr create`" in prompt
     assert "不要对 GitLab 使用 `glab mr create`" in prompt
     assert "Authorization: Bearer $GITLAB_TOKEN" in prompt
@@ -788,6 +903,17 @@ def test_build_system_prompt_uses_single_template() -> None:
     assert "`<icon> <type>(<scope>): <subject>`" in prompt
     assert "`body`" in prompt
     assert "`footer`" in prompt
+
+
+def test_apply_patch_tool_description_forbids_pasting_full_file_after_update() -> None:
+    assert (
+        "After `*** Update File:`, write only an optional `*** Move to:` line and one or more `@@` hunks."
+        in APPLY_PATCH_TOOL_DESCRIPTION
+    )
+    assert (
+        "Never paste full file contents directly after `*** Update File:`"
+        in APPLY_PATCH_TOOL_DESCRIPTION
+    )
 
 
 def test_guard_blocks_write_before_submit_plan() -> None:

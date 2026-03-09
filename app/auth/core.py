@@ -23,6 +23,7 @@ Role = Literal["admin", "premium", "developer", "reviewer", "free"]
 _ALLOWED_ROLES: set[str] = {"admin", "premium", "developer", "reviewer", "free"}
 _HASH_SCHEME = "pbkdf2_sha256"
 _HASH_ITERATIONS = 260_000
+DEFAULT_ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30
 
 _STORE_LOCK = RLock()
 _STORE_LOADED = False
@@ -643,12 +644,19 @@ def _jwt_algorithm() -> str:
 
 
 def _token_expire_minutes() -> int:
-    raw = os.getenv("AUTH_ACCESS_TOKEN_EXPIRE_MINUTES", "1440").strip()
+    raw = os.getenv(
+        "AUTH_ACCESS_TOKEN_EXPIRE_MINUTES",
+        str(DEFAULT_ACCESS_TOKEN_EXPIRE_MINUTES),
+    ).strip()
     try:
         value = int(raw)
     except ValueError:
-        return 1440
-    return value if value > 0 else 1440
+        return DEFAULT_ACCESS_TOKEN_EXPIRE_MINUTES
+    return value if value > 0 else DEFAULT_ACCESS_TOKEN_EXPIRE_MINUTES
+
+
+def get_access_token_ttl_seconds() -> int:
+    return _token_expire_minutes() * 60
 
 
 def create_access_token(user: dict[str, Any]) -> str:

@@ -84,3 +84,29 @@ async def test_authenticate_user_supports_ldap_login(
     assert user["identity"] == "ldap_user"
     assert captured_upserts
     assert captured_upserts[0]["auth_source"] == "ldap"
+
+
+def test_access_token_expire_minutes_defaults_to_30_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AUTH_ACCESS_TOKEN_EXPIRE_MINUTES", raising=False)
+    assert auth_core._token_expire_minutes() == 43_200  # noqa: SLF001
+    assert auth_core.get_access_token_ttl_seconds() == 2_592_000
+
+
+def test_access_token_expire_minutes_uses_fallback_on_invalid_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_ACCESS_TOKEN_EXPIRE_MINUTES", "abc")
+    assert auth_core._token_expire_minutes() == 43_200  # noqa: SLF001
+
+    monkeypatch.setenv("AUTH_ACCESS_TOKEN_EXPIRE_MINUTES", "0")
+    assert auth_core._token_expire_minutes() == 43_200  # noqa: SLF001
+
+
+def test_access_token_expire_minutes_respects_env_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_ACCESS_TOKEN_EXPIRE_MINUTES", "60")
+    assert auth_core._token_expire_minutes() == 60  # noqa: SLF001
+    assert auth_core.get_access_token_ttl_seconds() == 3_600

@@ -36,7 +36,7 @@ AutoReviewMode = Literal["follow_global", "enabled", "disabled"]
 DEFAULT_REVIEW_TRIGGER: ReviewTrigger = "pr_open"
 DEFAULT_GLOBAL_AUTO_REVIEW_ENABLED = False
 DEFAULT_REVIEW_GRAPH_ID = os.getenv(
-    "OPENWEBPX_DEFAULT_TASK_GRAPH_ID", "build_app_agent_v2"
+    "OPENWEBPX_DEFAULT_TASK_GRAPH_ID", "build_app_agent_v3"
 )
 CODE_REVIEW_WEBHOOK_PATH = "/integrations/code-review/webhook"
 

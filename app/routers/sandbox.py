@@ -11,14 +11,22 @@ from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 import docker
-from aegra_api.api.runs import create_run
+from aegra_api.api.runs import (
+    _merge_jsonb,
+    active_runs,
+    execute_run_async,
+    make_run_trace_context,
+    resolve_assistant_id,
+    set_thread_status,
+    update_thread_metadata,
+)
 from aegra_api.core.auth_deps import get_current_user
+from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import RunEvent as RunEventORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker, get_session
 from aegra_api.models.auth import User as AuthUser
-from aegra_api.models.runs import RunCreate
 from aegra_api.services.langgraph_service import (
     create_thread_config,
     get_langgraph_service,
@@ -39,7 +47,7 @@ if TYPE_CHECKING:
 router = APIRouter()
 
 DEFAULT_TASK_GRAPH_ID = os.getenv(
-    "OPENWEBPX_DEFAULT_TASK_GRAPH_ID", "build_app_agent_v2"
+    "OPENWEBPX_DEFAULT_TASK_GRAPH_ID", "build_app_agent_v3"
 )
 BOOTSTRAP_METADATA_KEY = "sandbox_bootstrap"
 BOOTSTRAP_LOG_LIMIT = 80
@@ -706,31 +714,13 @@ async def _run_bootstrap_task(
                 session, thread=thread, graph_id=graph_id, state=state
             )
 
-            run_request = RunCreate(
-                assistant_id=graph_id,
-                input={"messages": [{"type": "human", "content": message}]},
-                config={},
-                context={},
-                checkpoint=None,
-                stream=False,
-                stream_mode=stream_mode,
-                on_disconnect="continue",
-                on_completion=None,
-                multitask_strategy=None,
-                command=None,
-                interrupt_before=None,
-                interrupt_after=None,
-                stream_subgraphs=False,
-                metadata={
-                    "source": "sandbox_bootstrap",
-                    "request_id": request_id,
-                },
-            )
-            run = await create_run(
+            run = await _create_bootstrap_run(
                 thread_id=thread_id,
-                request=run_request,
                 user=user,
                 session=session,
+                graph_id=graph_id,
+                message=message,
+                stream_mode=stream_mode,
             )
 
             thread, _, _, state = await _read_thread_and_bootstrap_state(
@@ -775,6 +765,122 @@ async def _run_bootstrap_task(
         task = BOOTSTRAP_TASKS.get(thread_id)
         if task is not None and task.done():
             BOOTSTRAP_TASKS.pop(thread_id, None)
+
+
+async def _run_bootstrap_execute_task(
+    *,
+    run_id: str,
+    thread_id: str,
+    graph_id: str,
+    user: User,
+    config: dict[str, Any],
+    context: dict[str, Any],
+    input_data: dict[str, Any],
+    stream_mode: list[str],
+) -> None:
+    """Run bootstrap-created execution with a task-scoped session bound on this loop."""
+
+    session_maker = _get_session_maker()
+    run_session = session_maker()
+    try:
+        # Pre-bind a connection on the current event loop to avoid reusing a
+        # pooled asyncpg connection that was created on a different loop.
+        await run_session.connection()
+        await execute_run_async(
+            run_id=run_id,
+            thread_id=thread_id,
+            graph_id=graph_id,
+            input_data=input_data,
+            user=user,
+            config=config,
+            context=context,
+            stream_mode=stream_mode,
+            session=run_session,
+            checkpoint=None,
+            command=None,
+            interrupt_before=None,
+            interrupt_after=None,
+            _multitask_strategy=None,
+            subgraphs=False,
+        )
+    finally:
+        await run_session.close()
+
+
+async def _create_bootstrap_run(
+    *,
+    thread_id: str,
+    user: User,
+    session: AsyncSession,
+    graph_id: str,
+    message: str,
+    stream_mode: list[str],
+) -> RunORM:
+    """Create the first bootstrap run without routing through create_run()."""
+
+    langgraph_service = get_langgraph_service()
+    available_graphs = langgraph_service.list_graphs()
+    resolved_assistant_id = resolve_assistant_id(graph_id, available_graphs)
+
+    assistant_stmt = select(AssistantORM).where(
+        AssistantORM.assistant_id == resolved_assistant_id
+    )
+    assistant = await session.scalar(assistant_stmt)
+    if not assistant:
+        raise HTTPException(404, f"Assistant '{graph_id}' not found")
+
+    config = _merge_jsonb(assistant.config, {})
+    context = _merge_jsonb(assistant.context, {})
+    input_data = {"messages": [{"type": "human", "content": message}]}
+
+    await update_thread_metadata(
+        session,
+        thread_id,
+        assistant.assistant_id,
+        assistant.graph_id,
+        user.identity,
+    )
+    await set_thread_status(session, thread_id, "busy")
+
+    run_id = str(uuid4())
+    now = datetime.now(UTC)
+    run = RunORM(
+        run_id=run_id,
+        thread_id=thread_id,
+        assistant_id=resolved_assistant_id,
+        status="pending",
+        input=input_data,
+        config=config,
+        context=context,
+        user_id=user.identity,
+        created_at=now,
+        updated_at=now,
+        output=None,
+        error_message=None,
+    )
+    session.add(run)
+    await session.commit()
+
+    task = asyncio.create_task(
+        _run_bootstrap_execute_task(
+            run_id=run_id,
+            thread_id=thread_id,
+            graph_id=assistant.graph_id,
+            user=user,
+            config=config,
+            context=context,
+            input_data=input_data,
+            stream_mode=stream_mode,
+        ),
+        context=make_run_trace_context(
+            run_id,
+            thread_id,
+            assistant.graph_id,
+            user.identity,
+        ),
+    )
+    active_runs[run_id] = task
+    return run
 
 
 async def _fetch_recent_run_events(

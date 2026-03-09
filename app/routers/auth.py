@@ -7,10 +7,19 @@ from aegra_api.models.auth import User
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
-from app.auth.core import authenticate_user, create_access_token, register_user
+from app.auth.core import (
+    authenticate_user,
+    create_access_token,
+    get_access_token_ttl_seconds,
+    register_user,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 ACCESS_TOKEN_COOKIE_NAME = "aegra_access_token"  # nosec B105
+
+
+def _access_token_cookie_max_age_seconds() -> int:
+    return get_access_token_ttl_seconds()
 
 
 class LoginRequest(BaseModel):
@@ -59,6 +68,7 @@ async def register(payload: RegisterRequest, response: Response) -> LoginRespons
         samesite="lax",
         secure=False,
         path="/",
+        max_age=_access_token_cookie_max_age_seconds(),
     )
     return LoginResponse(access_token=token, user=user)
 
@@ -84,6 +94,7 @@ async def login(payload: LoginRequest, response: Response) -> LoginResponse:
         samesite="lax",
         secure=False,
         path="/",
+        max_age=_access_token_cookie_max_age_seconds(),
     )
     return LoginResponse(access_token=token, user=user)
 

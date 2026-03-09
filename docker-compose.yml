@@ -29,6 +29,8 @@ services:
     user: "${AEGRA_DOCKER_USER:-0:0}"
     group_add:
       - "${DOCKER_GID:-998}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

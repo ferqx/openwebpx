@@ -65,7 +65,9 @@ def test_auth_register_and_login_smoke(client: TestClient) -> None:
     register_payload = register_response.json()
     assert isinstance(register_payload["access_token"], str)
     assert register_payload["access_token"].count(".") == 2
-    assert "aegra_access_token=" in register_response.headers.get("set-cookie", "")
+    register_cookie = register_response.headers.get("set-cookie", "")
+    assert "aegra_access_token=" in register_cookie
+    assert "Max-Age=2592000" in register_cookie
 
     login_response = client.post(
         "/auth/login",
@@ -77,7 +79,9 @@ def test_auth_register_and_login_smoke(client: TestClient) -> None:
 
     assert login_response.status_code == 200
     assert login_response.json()["user"]["identity"] == "new_user"
-    assert "aegra_access_token=" in login_response.headers.get("set-cookie", "")
+    login_cookie = login_response.headers.get("set-cookie", "")
+    assert "aegra_access_token=" in login_cookie
+    assert "Max-Age=2592000" in login_cookie
 
 
 @pytest.mark.asyncio
@@ -488,6 +492,77 @@ def test_sandbox_thread_cancel_route_smoke(
     assert payload["thread_status"] == "idle"
     assert fake_runs[0].status == "interrupted"
     assert task.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_execute_task_uses_task_scoped_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeRunSession:
+        async def connection(self) -> None:
+            events.append("connection")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    def fake_session_factory() -> FakeRunSession:
+        events.append("session")
+        return FakeRunSession()
+
+    def fake_get_session_maker() -> Any:
+        return fake_session_factory
+
+    async def fake_execute_run_async(
+        run_id: str,
+        thread_id: str,
+        graph_id: str,
+        input_data: dict[str, Any],
+        user: Any,
+        config: dict[str, Any],
+        context: dict[str, Any],
+        stream_mode: list[str],
+        session: Any,
+        checkpoint: Any = None,
+        command: Any = None,
+        interrupt_before: Any = None,
+        interrupt_after: Any = None,
+        _multitask_strategy: Any = None,
+        subgraphs: bool | None = False,
+    ) -> None:
+        assert run_id == "run-1"
+        assert thread_id == "thread-1"
+        assert graph_id == "graph-1"
+        assert input_data == {"messages": [{"type": "human", "content": "hello"}]}
+        assert user.identity == "user-1"
+        assert config == {"temperature": 0}
+        assert context == {"repo": "demo"}
+        assert stream_mode == ["messages-tuple"]
+        assert checkpoint is None
+        assert command is None
+        assert interrupt_before is None
+        assert interrupt_after is None
+        assert _multitask_strategy is None
+        assert subgraphs is False
+        assert isinstance(session, FakeRunSession)
+        events.append("execute")
+
+    monkeypatch.setattr(sandbox_router, "_get_session_maker", fake_get_session_maker)
+    monkeypatch.setattr(sandbox_router, "execute_run_async", fake_execute_run_async)
+
+    await sandbox_router._run_bootstrap_execute_task(
+        run_id="run-1",
+        thread_id="thread-1",
+        graph_id="graph-1",
+        user=SimpleNamespace(identity="user-1"),
+        config={"temperature": 0},
+        context={"repo": "demo"},
+        input_data={"messages": [{"type": "human", "content": "hello"}]},
+        stream_mode=["messages-tuple"],
+    )
+
+    assert events == ["session", "connection", "execute", "close"]
 
 
 def test_scm_branches_route_smoke(

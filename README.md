@@ -54,6 +54,11 @@ to the host socket group id after verifying the socket is group-writable. If you
 deploy with a custom manifest, preserve that configuration or Docker-backed sandbox
 initialization will fail.
 
+For Langfuse in Docker deployments, configure `LANGFUSE_BASE_URL` rather than
+`LANGFUSE_HOST`. If Langfuse runs on the Docker host, use
+`http://host.docker.internal:3000`; if it runs in another container, use that
+container's service name instead of `localhost`.
+
 Your existing LangGraph code works without changes:
 
 ```python

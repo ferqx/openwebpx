@@ -12,6 +12,11 @@ OpenWebPX can create per-thread sandbox containers through `DockerMiddleware`.
 When the main API service itself runs in Docker, that container must be able to
 talk to the host Docker daemon.
 
+Langfuse follows the same networking rule: do not use `localhost` unless
+Langfuse runs inside the same container. In Docker deployments, configure
+`LANGFUSE_BASE_URL` with either `http://host.docker.internal:3000` for a host
+service or `http://<service-name>:3000` for another container.
+
 Required service configuration:
 
 ```yaml
@@ -22,6 +27,8 @@ services:
     user: "${AEGRA_DOCKER_USER:-0:0}"
     group_add:
       - "${DOCKER_GID}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
