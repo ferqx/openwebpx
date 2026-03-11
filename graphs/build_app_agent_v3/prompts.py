@@ -357,6 +357,7 @@ def old_function():
 5. 禁止写成 `}</search>` 或 `}</replace>` 这类“代码 + 结束标签”拼接形式。
 6. 若你打算“创建一个测试文件”，必须使用 `*** Add File:`；禁止改用 `execute` 重定向写入。
 7. 严禁使用 unified diff 语法（如 `@@`、`---`、`+++`、git 风格增删行）；`Update File` 只能使用 `<search>...</search>` + `<replace>...</replace>`。
+8. 如果工具返回“未精确匹配”“目标文件不存在”“目标文件已存在”或“目标路径非法”，你必须停止，不允许猜测、追加内容、覆盖文件或自动降级；先重新读取相关文件，再用更精确的 `SEARCH` 或正确的 `Add File`/`Update File`/`Move to` 重试。
 
 ## `apply_patch` 调用示例（可直接参考）
 

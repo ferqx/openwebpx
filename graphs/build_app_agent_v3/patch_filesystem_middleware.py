@@ -7,6 +7,7 @@ import re
 import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Annotated, Any, Literal, cast
 
 from deepagents.backends.protocol import (
@@ -114,10 +115,20 @@ class PatchCommitAction:
     applied_hunks: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class TextFormat:
+    """Original text formatting preserved across normalized patch application."""
+
+    newline: str
+    has_trailing_newline: bool
+
+
 _UNIFIED_DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _UNIFIED_DIFF_MARKER_RE = re.compile(r"(?m)^(?:@@\s+-\d|---\s|\+\+\+\s)")
 _MAX_FILE_DIFFS = 20
 _MAX_HUNKS_PER_FILE = 20
+_APPLY_PATCH_STATS_STATE_KEY = "__apply_patch_stats_v1"
+_MAX_TRACKED_FILE_CHARS = 200_000
 
 
 # ===== Parse/apply primitives =====
@@ -208,7 +219,8 @@ def apply_update_patch(
     hunks: tuple[PatchHunk, ...],
 ) -> tuple[str, int]:
     """Apply parsed Patch update hunks to file content."""
-    updated_content = original_content
+    normalized_content, text_format = _normalize_text_for_patch(original_content)
+    updated_content = normalized_content
     applied_count = 0
 
     for index, hunk in enumerate(hunks, start=1):
@@ -220,39 +232,7 @@ def apply_update_patch(
         )
         applied_count += 1
 
-    return updated_content, applied_count
-
-
-def _best_effort_apply_update_patch(
-    original_content: str,
-    *,
-    hunks: tuple[PatchHunk, ...],
-) -> tuple[str, int]:
-    """Best-effort fallback updater that never raises on malformed hunks."""
-    content = original_content
-    applied = 0
-
-    for hunk in hunks:
-        old_block = hunk.search_text
-        new_block = hunk.replace_text
-
-        if old_block and old_block in content:
-            content = content.replace(old_block, new_block, 1)
-            applied += 1
-            continue
-
-        if hunk.replace_text:
-            insert_block = hunk.replace_text
-            if not insert_block:
-                continue
-            if content and not content.endswith("\n"):
-                content += "\n"
-            content += insert_block
-            if not content.endswith("\n"):
-                content += "\n"
-            applied += 1
-
-    return content, applied
+    return _restore_text_format(updated_content, text_format=text_format), applied_count
 
 
 def _compute_diff_hunks(before: str, after: str) -> list[dict[str, int]]:
@@ -287,6 +267,51 @@ def _compute_diff_hunks(before: str, after: str) -> list[dict[str, int]]:
         )
 
     return hunks
+
+
+def _normalize_text_for_patch(content: str) -> tuple[str, TextFormat]:
+    """Normalize file text to LF for matching while retaining original formatting."""
+    newline = _detect_dominant_newline(content)
+    has_trailing_newline = content.endswith(("\n", "\r"))
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized, TextFormat(
+        newline=newline,
+        has_trailing_newline=has_trailing_newline,
+    )
+
+
+def _restore_text_format(content: str, *, text_format: TextFormat) -> str:
+    """Restore original newline style and final newline preference."""
+    restored = content
+    if text_format.has_trailing_newline:
+        if restored and not restored.endswith("\n"):
+            restored += "\n"
+    elif restored.endswith("\n"):
+        restored = restored[:-1]
+
+    if text_format.newline != "\n":
+        restored = restored.replace("\n", text_format.newline)
+    return restored
+
+
+def _detect_dominant_newline(content: str) -> str:
+    """Detect a consistent newline style or fail fast on mixed text files."""
+    has_crlf = "\r\n" in content
+    normalized_without_crlf = content.replace("\r\n", "")
+    has_bare_cr = "\r" in normalized_without_crlf
+    has_bare_lf = "\n" in normalized_without_crlf
+
+    newline_kinds = int(has_crlf) + int(has_bare_cr) + int(has_bare_lf)
+    if newline_kinds > 1:
+        raise ValueError(
+            "PATCH_FORMAT_ERROR: File uses mixed line endings. "
+            "Normalize the file first, then retry apply_patch."
+        )
+    if has_crlf:
+        return "\r\n"
+    if has_bare_cr:
+        return "\r"
+    return "\n"
 
 
 # ===== Middleware and tool wiring =====
@@ -462,6 +487,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                     backend,
                     patch_content,
                     dry_run=dry_run,
+                    runtime_state=runtime.state
+                    if isinstance(runtime.state, dict)
+                    else None,
                 )
                 return self._split_tool_payload_for_frontend(content)
             except Exception as exc:
@@ -501,6 +529,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                     backend,
                     patch_content,
                     dry_run=dry_run,
+                    runtime_state=runtime.state
+                    if isinstance(runtime.state, dict)
+                    else None,
                 )
                 return self._split_tool_payload_for_frontend(content)
             except Exception as exc:
@@ -715,6 +746,34 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             retryable=retryable,
         )
 
+    def _strict_patch_error(
+        self,
+        *,
+        error_code: str,
+        message: str,
+        phase: str,
+        matched_files: int = 0,
+        changed_files: int = 0,
+        hunks_applied: int = 0,
+        actions: dict[str, int] | None = None,
+        fallbacks: list[str] | None = None,
+        retryable: bool = True,
+    ) -> str:
+        return self._error_result(
+            error_code=error_code,
+            message=message,
+            details={
+                "phase": phase,
+                "matched_files": matched_files,
+                "changed_files": changed_files,
+                "hunks_applied": hunks_applied,
+                "fallbacks": fallbacks or [],
+                "actions": actions or {"add": 0, "update": 0, "delete": 0},
+                "file_diffs": [],
+            },
+            retryable=retryable,
+        )
+
     def _build_file_diff_result(
         self,
         *,
@@ -728,14 +787,102 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
 
         hunks = _compute_diff_hunks(before_text, after_text)
         truncated_hunks = hunks[:_MAX_HUNKS_PER_FILE]
+        delta_added = sum(hunk["new_count"] for hunk in hunks)
+        delta_removed = sum(hunk["old_count"] for hunk in hunks)
         return {
             "action": action.action,
             "file_path": action.path.removeprefix("/workspace/"),
             "before_line_count": len(before_text.splitlines()),
             "after_line_count": len(after_text.splitlines()),
+            "before_content_sha256": sha256(before_text.encode("utf-8")).hexdigest(),
+            "after_content_sha256": sha256(after_text.encode("utf-8")).hexdigest(),
+            "delta_added": delta_added,
+            "delta_removed": delta_removed,
             "hunks": truncated_hunks,
             "hunks_truncated": len(hunks) > len(truncated_hunks),
         }
+
+    def _enrich_file_diff_with_session_stats(
+        self,
+        *,
+        file_diff: dict[str, Any],
+        action: PatchCommitAction,
+        runtime_state: dict[str, Any] | None,
+        persist_state: bool,
+    ) -> dict[str, Any]:
+        if runtime_state is None:
+            file_diff["file_version"] = 1
+            file_diff["net_added"] = file_diff.get("delta_added", 0)
+            file_diff["net_removed"] = file_diff.get("delta_removed", 0)
+            file_diff["net_partial"] = True
+            return file_diff
+
+        tracker_root = runtime_state.get(_APPLY_PATCH_STATS_STATE_KEY)
+        if not isinstance(tracker_root, dict):
+            tracker_root = {}
+        tracker_files = tracker_root.get("files")
+        if not isinstance(tracker_files, dict):
+            tracker_files = {}
+
+        file_key = action.path.removeprefix("/workspace/")
+        before_text = action.before_content or ""
+        after_text = action.after_content or ""
+
+        entry_obj = tracker_files.get(file_key)
+        entry = entry_obj if isinstance(entry_obj, dict) else {}
+        baseline_text = entry.get("baseline_text")
+        current_text = entry.get("current_text")
+        if not isinstance(baseline_text, str):
+            baseline_text = before_text if action.action != "Add" else ""
+        if not isinstance(current_text, str):
+            current_text = before_text if action.action != "Add" else ""
+
+        version = entry.get("version")
+        if not isinstance(version, int) or version < 0:
+            version = 0
+        partial = bool(entry.get("partial"))
+
+        if persist_state:
+            current_text = after_text
+            version += 1
+
+        if (
+            len(baseline_text) > _MAX_TRACKED_FILE_CHARS
+            or len(current_text) > _MAX_TRACKED_FILE_CHARS
+        ):
+            partial = True
+
+        net_added = file_diff.get("delta_added", 0)
+        net_removed = file_diff.get("delta_removed", 0)
+        if not partial:
+            net_hunks = _compute_diff_hunks(baseline_text, current_text)
+            net_added = sum(hunk["new_count"] for hunk in net_hunks)
+            net_removed = sum(hunk["old_count"] for hunk in net_hunks)
+
+        file_diff["file_version"] = version if version > 0 else 1
+        file_diff["net_added"] = net_added
+        file_diff["net_removed"] = net_removed
+        file_diff["net_partial"] = partial
+
+        if persist_state:
+            if partial:
+                tracker_files[file_key] = {
+                    "baseline_text": "",
+                    "current_text": "",
+                    "version": version,
+                    "partial": True,
+                }
+            else:
+                tracker_files[file_key] = {
+                    "baseline_text": baseline_text,
+                    "current_text": current_text,
+                    "version": version,
+                    "partial": False,
+                }
+            tracker_root["files"] = tracker_files
+            runtime_state[_APPLY_PATCH_STATS_STATE_KEY] = tracker_root
+
+        return file_diff
 
     def _summarize_action_counts(
         self,
@@ -754,6 +901,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         patch_content: str,
         *,
         dry_run: bool = False,
+        runtime_state: dict[str, Any] | None = None,
     ) -> str:
         # Main flow:
         # 1) parse patch sections
@@ -789,9 +937,27 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                     (file_patch, _resolve_patch_path(file_patch.path))
                 )
             except ValueError as exc:
-                fallbacks.append(f"path_resolve_skipped({file_patch.path}): {exc}")
+                return self._strict_patch_error(
+                    error_code="PATCH_PATH_ERROR",
+                    message=(
+                        f"Invalid patch path '{file_patch.path}'. "
+                        "Use a workspace-relative path that resolves inside `/workspace`."
+                    ),
+                    phase="resolve",
+                    matched_files=len(file_patches),
+                    fallbacks=[f"path_resolve_error({file_patch.path}): {exc}"],
+                )
 
         read_paths = [path for _, path in resolved_patches]
+        for file_patch, _ in resolved_patches:
+            if file_patch.move_to is None:
+                continue
+            try:
+                move_target = _resolve_patch_path(file_patch.move_to)
+            except ValueError:
+                continue
+            if move_target not in read_paths:
+                read_paths.append(move_target)
         initial_contents = self._read_files_sync(backend, read_paths)
 
         for file_patch, path in resolved_patches:
@@ -800,32 +966,39 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 (None, f"Error: Unable to read '{path}'."),
             )
             if read_error is not None:
-                fallbacks.append(f"read_error_skipped({path}): {read_error}")
-                continue
+                return self._strict_patch_error(
+                    error_code="PATCH_READ_ERROR",
+                    message=(
+                        f"Unable to read '{path}' before applying patch. "
+                        "Read the latest file state and retry with an exact SEARCH block."
+                    ),
+                    phase="read",
+                    matched_files=len(file_patches),
+                    fallbacks=[f"read_error({path}): {read_error}"],
+                )
 
             if file_patch.action == "Add":
                 add_content = "\n".join(file_patch.add_lines)
                 if current_content is not None:
-                    fallbacks.append(f"add_target_exists_overwrite_as_update({path})")
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Update",
-                            path=path,
-                            before_content=current_content,
-                            after_content=add_content,
-                            applied_hunks=0,
-                        )
+                    return self._strict_patch_error(
+                        error_code="PATCH_TARGET_EXISTS",
+                        message=(
+                            f"Cannot Add File '{path}' because it already exists. "
+                            "Use `Update File` with an exact SEARCH block instead of overwriting."
+                        ),
+                        phase="plan",
+                        matched_files=len(file_patches),
+                        fallbacks=[f"add_target_exists({path})"],
                     )
-                else:
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Add",
-                            path=path,
-                            before_content=None,
-                            after_content=add_content,
-                            applied_hunks=0,
-                        )
+                commit_actions.append(
+                    PatchCommitAction(
+                        action="Add",
+                        path=path,
+                        before_content=None,
+                        after_content=add_content,
+                        applied_hunks=0,
                     )
+                )
                 changed_files += 1
                 continue
 
@@ -846,25 +1019,34 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 continue
 
             if current_content is None:
-                fallbacks.append(f"update_missing_create_from_hunks({path})")
-                current_content = ""
-                updated_content, applied = _best_effort_apply_update_patch(
+                return self._strict_patch_error(
+                    error_code="PATCH_TARGET_MISSING",
+                    message=(
+                        f"Cannot Update File '{path}' because it does not exist. "
+                        "Use `Add File` to create a new file, or re-read the workspace if the path is wrong."
+                    ),
+                    phase="plan",
+                    matched_files=len(file_patches),
+                    fallbacks=[f"update_missing({path})"],
+                )
+
+            try:
+                updated_content, applied = apply_update_patch(
                     current_content,
+                    file_path=path,
                     hunks=file_patch.hunks,
                 )
-            else:
-                try:
-                    updated_content, applied = apply_update_patch(
-                        current_content,
-                        file_path=path,
-                        hunks=file_patch.hunks,
-                    )
-                except ValueError as exc:
-                    fallbacks.append(f"update_match_fallback({path}): {exc}")
-                    updated_content, applied = _best_effort_apply_update_patch(
-                        current_content,
-                        hunks=file_patch.hunks,
-                    )
+            except ValueError as exc:
+                return self._strict_patch_error(
+                    error_code="PATCH_APPLY_ERROR",
+                    message=(
+                        f"Failed to apply Update File for '{path}': {exc} "
+                        "Read the latest file and retry with an exact, unique SEARCH block."
+                    ),
+                    phase="apply",
+                    matched_files=len(file_patches),
+                    fallbacks=[f"update_apply_error({path}): {exc}"],
+                )
 
             if updated_content == current_content and file_patch.move_to is None:
                 continue
@@ -874,58 +1056,64 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 try:
                     move_target = _resolve_patch_path(file_patch.move_to)
                 except ValueError as exc:
-                    fallbacks.append(
-                        f"move_target_invalid_fallback_to_update({path}): {exc}"
+                    return self._strict_patch_error(
+                        error_code="PATCH_MOVE_TARGET_ERROR",
+                        message=(
+                            f"Invalid move target '{file_patch.move_to}' for '{path}'. "
+                            "Use a workspace-relative destination path."
+                        ),
+                        phase="resolve",
+                        matched_files=len(file_patches),
+                        fallbacks=[f"move_target_invalid({path}): {exc}"],
                     )
-                    move_target = None
 
-                if move_target is not None:
-                    target_current, target_read_error = initial_contents.get(
-                        move_target,
-                        (None, f"Error: Unable to read '{move_target}'."),
+                target_current, target_read_error = initial_contents.get(
+                    move_target,
+                    (None, f"Error: Unable to read '{move_target}'."),
+                )
+                if target_read_error is not None:
+                    return self._strict_patch_error(
+                        error_code="PATCH_MOVE_TARGET_READ_ERROR",
+                        message=(
+                            f"Unable to read move target '{move_target}' for '{path}'. "
+                            "Re-read the workspace and retry."
+                        ),
+                        phase="read",
+                        matched_files=len(file_patches),
+                        fallbacks=[
+                            f"move_target_read_error({path}->{move_target}): {target_read_error}"
+                        ],
                     )
-                    if target_read_error is not None:
-                        fallbacks.append(
-                            f"move_target_read_error_fallback_to_update({path}): {target_read_error}"
-                        )
-                        move_target = None
-                    elif target_current is not None:
-                        fallbacks.append(
-                            f"move_target_exists_fallback_to_update({path}->{move_target})"
-                        )
-                        move_target = None
-
-                if move_target is not None:
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Add",
-                            path=move_target,
-                            before_content=None,
-                            after_content=updated_content,
-                            applied_hunks=applied,
-                        )
+                if target_current is not None:
+                    return self._strict_patch_error(
+                        error_code="PATCH_MOVE_TARGET_EXISTS",
+                        message=(
+                            f"Cannot move '{path}' to '{move_target}' because the destination already exists. "
+                            "Pick a new destination or update the existing file explicitly."
+                        ),
+                        phase="plan",
+                        matched_files=len(file_patches),
+                        fallbacks=[f"move_target_exists({path}->{move_target})"],
                     )
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Delete",
-                            path=path,
-                            before_content=current_content,
-                            after_content=None,
-                            applied_hunks=0,
-                        )
+                commit_actions.append(
+                    PatchCommitAction(
+                        action="Add",
+                        path=move_target,
+                        before_content=None,
+                        after_content=updated_content,
+                        applied_hunks=applied,
                     )
-                    changed_files += 2
-                else:
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Update",
-                            path=path,
-                            before_content=current_content,
-                            after_content=updated_content,
-                            applied_hunks=applied,
-                        )
+                )
+                commit_actions.append(
+                    PatchCommitAction(
+                        action="Delete",
+                        path=path,
+                        before_content=current_content,
+                        after_content=None,
+                        applied_hunks=0,
                     )
-                    changed_files += 1
+                )
+                changed_files += 2
             else:
                 commit_actions.append(
                     PatchCommitAction(
@@ -940,11 +1128,20 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             updated_hunks += applied
 
         if dry_run:
-            dry_run_file_diffs = [
-                metadata
-                for action in commit_actions
-                if (metadata := self._build_file_diff_result(action=action)) is not None
-            ][:_MAX_FILE_DIFFS]
+            dry_run_file_diffs: list[dict[str, Any]] = []
+            for action in commit_actions:
+                metadata = self._build_file_diff_result(action=action)
+                if metadata is None:
+                    continue
+                enriched = self._enrich_file_diff_with_session_stats(
+                    file_diff=metadata,
+                    action=action,
+                    runtime_state=runtime_state,
+                    persist_state=False,
+                )
+                dry_run_file_diffs.append(enriched)
+                if len(dry_run_file_diffs) >= _MAX_FILE_DIFFS:
+                    break
             action_counts = self._summarize_action_counts(commit_actions)
             return self._ok_result(
                 message="Patch dry-run passed.",
@@ -1025,11 +1222,20 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 continue
             applied_actions.append(commit_action)
 
-        file_diffs = [
-            metadata
-            for action in applied_actions
-            if (metadata := self._build_file_diff_result(action=action)) is not None
-        ][:_MAX_FILE_DIFFS]
+        file_diffs: list[dict[str, Any]] = []
+        for action in applied_actions:
+            metadata = self._build_file_diff_result(action=action)
+            if metadata is None:
+                continue
+            enriched = self._enrich_file_diff_with_session_stats(
+                file_diff=metadata,
+                action=action,
+                runtime_state=runtime_state,
+                persist_state=True,
+            )
+            file_diffs.append(enriched)
+            if len(file_diffs) >= _MAX_FILE_DIFFS:
+                break
         action_counts = self._summarize_action_counts(applied_actions)
 
         return self._ok_result(
@@ -1061,6 +1267,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         patch_content: str,
         *,
         dry_run: bool = False,
+        runtime_state: dict[str, Any] | None = None,
     ) -> str:
         # Async variant mirrors _apply_patch_sync to keep behavior consistent.
         fallbacks: list[str] = []
@@ -1092,9 +1299,27 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                     (file_patch, _resolve_patch_path(file_patch.path))
                 )
             except ValueError as exc:
-                fallbacks.append(f"path_resolve_skipped({file_patch.path}): {exc}")
+                return self._strict_patch_error(
+                    error_code="PATCH_PATH_ERROR",
+                    message=(
+                        f"Invalid patch path '{file_patch.path}'. "
+                        "Use a workspace-relative path that resolves inside `/workspace`."
+                    ),
+                    phase="resolve",
+                    matched_files=len(file_patches),
+                    fallbacks=[f"path_resolve_error({file_patch.path}): {exc}"],
+                )
 
         read_paths = [path for _, path in resolved_patches]
+        for file_patch, _ in resolved_patches:
+            if file_patch.move_to is None:
+                continue
+            try:
+                move_target = _resolve_patch_path(file_patch.move_to)
+            except ValueError:
+                continue
+            if move_target not in read_paths:
+                read_paths.append(move_target)
         initial_contents = await self._read_files_async(backend, read_paths)
 
         for file_patch, path in resolved_patches:
@@ -1103,32 +1328,39 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 (None, f"Error: Unable to read '{path}'."),
             )
             if read_error is not None:
-                fallbacks.append(f"read_error_skipped({path}): {read_error}")
-                continue
+                return self._strict_patch_error(
+                    error_code="PATCH_READ_ERROR",
+                    message=(
+                        f"Unable to read '{path}' before applying patch. "
+                        "Read the latest file state and retry with an exact SEARCH block."
+                    ),
+                    phase="read",
+                    matched_files=len(file_patches),
+                    fallbacks=[f"read_error({path}): {read_error}"],
+                )
 
             if file_patch.action == "Add":
                 add_content = "\n".join(file_patch.add_lines)
                 if current_content is not None:
-                    fallbacks.append(f"add_target_exists_overwrite_as_update({path})")
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Update",
-                            path=path,
-                            before_content=current_content,
-                            after_content=add_content,
-                            applied_hunks=0,
-                        )
+                    return self._strict_patch_error(
+                        error_code="PATCH_TARGET_EXISTS",
+                        message=(
+                            f"Cannot Add File '{path}' because it already exists. "
+                            "Use `Update File` with an exact SEARCH block instead of overwriting."
+                        ),
+                        phase="plan",
+                        matched_files=len(file_patches),
+                        fallbacks=[f"add_target_exists({path})"],
                     )
-                else:
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Add",
-                            path=path,
-                            before_content=None,
-                            after_content=add_content,
-                            applied_hunks=0,
-                        )
+                commit_actions.append(
+                    PatchCommitAction(
+                        action="Add",
+                        path=path,
+                        before_content=None,
+                        after_content=add_content,
+                        applied_hunks=0,
                     )
+                )
                 changed_files += 1
                 continue
 
@@ -1149,25 +1381,34 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 continue
 
             if current_content is None:
-                fallbacks.append(f"update_missing_create_from_hunks({path})")
-                current_content = ""
-                updated_content, applied = _best_effort_apply_update_patch(
+                return self._strict_patch_error(
+                    error_code="PATCH_TARGET_MISSING",
+                    message=(
+                        f"Cannot Update File '{path}' because it does not exist. "
+                        "Use `Add File` to create a new file, or re-read the workspace if the path is wrong."
+                    ),
+                    phase="plan",
+                    matched_files=len(file_patches),
+                    fallbacks=[f"update_missing({path})"],
+                )
+
+            try:
+                updated_content, applied = apply_update_patch(
                     current_content,
+                    file_path=path,
                     hunks=file_patch.hunks,
                 )
-            else:
-                try:
-                    updated_content, applied = apply_update_patch(
-                        current_content,
-                        file_path=path,
-                        hunks=file_patch.hunks,
-                    )
-                except ValueError as exc:
-                    fallbacks.append(f"update_match_fallback({path}): {exc}")
-                    updated_content, applied = _best_effort_apply_update_patch(
-                        current_content,
-                        hunks=file_patch.hunks,
-                    )
+            except ValueError as exc:
+                return self._strict_patch_error(
+                    error_code="PATCH_APPLY_ERROR",
+                    message=(
+                        f"Failed to apply Update File for '{path}': {exc} "
+                        "Read the latest file and retry with an exact, unique SEARCH block."
+                    ),
+                    phase="apply",
+                    matched_files=len(file_patches),
+                    fallbacks=[f"update_apply_error({path}): {exc}"],
+                )
 
             if updated_content == current_content and file_patch.move_to is None:
                 continue
@@ -1177,58 +1418,64 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 try:
                     move_target = _resolve_patch_path(file_patch.move_to)
                 except ValueError as exc:
-                    fallbacks.append(
-                        f"move_target_invalid_fallback_to_update({path}): {exc}"
+                    return self._strict_patch_error(
+                        error_code="PATCH_MOVE_TARGET_ERROR",
+                        message=(
+                            f"Invalid move target '{file_patch.move_to}' for '{path}'. "
+                            "Use a workspace-relative destination path."
+                        ),
+                        phase="resolve",
+                        matched_files=len(file_patches),
+                        fallbacks=[f"move_target_invalid({path}): {exc}"],
                     )
-                    move_target = None
 
-                if move_target is not None:
-                    target_current, target_read_error = initial_contents.get(
-                        move_target,
-                        (None, f"Error: Unable to read '{move_target}'."),
+                target_current, target_read_error = initial_contents.get(
+                    move_target,
+                    (None, f"Error: Unable to read '{move_target}'."),
+                )
+                if target_read_error is not None:
+                    return self._strict_patch_error(
+                        error_code="PATCH_MOVE_TARGET_READ_ERROR",
+                        message=(
+                            f"Unable to read move target '{move_target}' for '{path}'. "
+                            "Re-read the workspace and retry."
+                        ),
+                        phase="read",
+                        matched_files=len(file_patches),
+                        fallbacks=[
+                            f"move_target_read_error({path}->{move_target}): {target_read_error}"
+                        ],
                     )
-                    if target_read_error is not None:
-                        fallbacks.append(
-                            f"move_target_read_error_fallback_to_update({path}): {target_read_error}"
-                        )
-                        move_target = None
-                    elif target_current is not None:
-                        fallbacks.append(
-                            f"move_target_exists_fallback_to_update({path}->{move_target})"
-                        )
-                        move_target = None
-
-                if move_target is not None:
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Add",
-                            path=move_target,
-                            before_content=None,
-                            after_content=updated_content,
-                            applied_hunks=applied,
-                        )
+                if target_current is not None:
+                    return self._strict_patch_error(
+                        error_code="PATCH_MOVE_TARGET_EXISTS",
+                        message=(
+                            f"Cannot move '{path}' to '{move_target}' because the destination already exists. "
+                            "Pick a new destination or update the existing file explicitly."
+                        ),
+                        phase="plan",
+                        matched_files=len(file_patches),
+                        fallbacks=[f"move_target_exists({path}->{move_target})"],
                     )
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Delete",
-                            path=path,
-                            before_content=current_content,
-                            after_content=None,
-                            applied_hunks=0,
-                        )
+                commit_actions.append(
+                    PatchCommitAction(
+                        action="Add",
+                        path=move_target,
+                        before_content=None,
+                        after_content=updated_content,
+                        applied_hunks=applied,
                     )
-                    changed_files += 2
-                else:
-                    commit_actions.append(
-                        PatchCommitAction(
-                            action="Update",
-                            path=path,
-                            before_content=current_content,
-                            after_content=updated_content,
-                            applied_hunks=applied,
-                        )
+                )
+                commit_actions.append(
+                    PatchCommitAction(
+                        action="Delete",
+                        path=path,
+                        before_content=current_content,
+                        after_content=None,
+                        applied_hunks=0,
                     )
-                    changed_files += 1
+                )
+                changed_files += 2
             else:
                 commit_actions.append(
                     PatchCommitAction(
@@ -1243,11 +1490,20 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             updated_hunks += applied
 
         if dry_run:
-            dry_run_file_diffs = [
-                metadata
-                for action in commit_actions
-                if (metadata := self._build_file_diff_result(action=action)) is not None
-            ][:_MAX_FILE_DIFFS]
+            dry_run_file_diffs: list[dict[str, Any]] = []
+            for action in commit_actions:
+                metadata = self._build_file_diff_result(action=action)
+                if metadata is None:
+                    continue
+                enriched = self._enrich_file_diff_with_session_stats(
+                    file_diff=metadata,
+                    action=action,
+                    runtime_state=runtime_state,
+                    persist_state=False,
+                )
+                dry_run_file_diffs.append(enriched)
+                if len(dry_run_file_diffs) >= _MAX_FILE_DIFFS:
+                    break
             action_counts = self._summarize_action_counts(commit_actions)
             return self._ok_result(
                 message="Patch dry-run passed.",
@@ -1328,11 +1584,20 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 continue
             applied_actions.append(commit_action)
 
-        file_diffs = [
-            metadata
-            for action in applied_actions
-            if (metadata := self._build_file_diff_result(action=action)) is not None
-        ][:_MAX_FILE_DIFFS]
+        file_diffs: list[dict[str, Any]] = []
+        for action in applied_actions:
+            metadata = self._build_file_diff_result(action=action)
+            if metadata is None:
+                continue
+            enriched = self._enrich_file_diff_with_session_stats(
+                file_diff=metadata,
+                action=action,
+                runtime_state=runtime_state,
+                persist_state=True,
+            )
+            file_diffs.append(enriched)
+            if len(file_diffs) >= _MAX_FILE_DIFFS:
+                break
         action_counts = self._summarize_action_counts(applied_actions)
 
         return self._ok_result(
@@ -1384,10 +1649,14 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             if response.content is None:
                 results[path] = (None, f"Error: Empty file payload for '{path}'.")
                 continue
-            results[path] = (
-                response.content.decode("utf-8", errors="replace"),
-                None,
+            decoded_content, decode_error = self._decode_file_content(
+                file_path=path,
+                raw_content=response.content,
             )
+            if decode_error is not None:
+                results[path] = (None, decode_error)
+                continue
+            results[path] = (decoded_content, None)
         return results
 
     async def _read_files_async(
@@ -1416,10 +1685,14 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             if response.content is None:
                 results[path] = (None, f"Error: Empty file payload for '{path}'.")
                 continue
-            results[path] = (
-                response.content.decode("utf-8", errors="replace"),
-                None,
+            decoded_content, decode_error = self._decode_file_content(
+                file_path=path,
+                raw_content=response.content,
             )
+            if decode_error is not None:
+                results[path] = (None, decode_error)
+                continue
+            results[path] = (decoded_content, None)
         return results
 
     def _read_file_sync(
@@ -1437,7 +1710,10 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             return None, f"Error: Unable to read '{file_path}': {response.error}"
         if response.content is None:
             return None, f"Error: Empty file payload for '{file_path}'."
-        return response.content.decode("utf-8", errors="replace"), None
+        return self._decode_file_content(
+            file_path=file_path,
+            raw_content=response.content,
+        )
 
     async def _read_file_async(
         self,
@@ -1454,7 +1730,10 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             return None, f"Error: Unable to read '{file_path}': {response.error}"
         if response.content is None:
             return None, f"Error: Empty file payload for '{file_path}'."
-        return response.content.decode("utf-8", errors="replace"), None
+        return self._decode_file_content(
+            file_path=file_path,
+            raw_content=response.content,
+        )
 
     def _write_file_sync(
         self,
@@ -1483,6 +1762,21 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         if response.error is not None:
             return f"Error: Unable to write '{file_path}': {response.error}"
         return None
+
+    def _decode_file_content(
+        self,
+        *,
+        file_path: str,
+        raw_content: bytes,
+    ) -> tuple[str | None, str | None]:
+        try:
+            return raw_content.decode("utf-8"), None
+        except UnicodeDecodeError as exc:
+            return (
+                None,
+                "Error: Unable to read "
+                f"'{file_path}': file is not valid UTF-8 text ({exc.reason}).",
+            )
 
     def _delete_file_sync(
         self,
@@ -1566,14 +1860,18 @@ def _build_file_patch(
     body_lines: list[str],
     seen_paths: set[str],
 ) -> FilePatch:
-    # Parsing is intentionally lenient for wrapper markers but strict for semantic blocks.
     if not path:
         raise ValueError("Encountered a file section with empty path.")
-    # Tolerate repeated sections for the same path and keep parsing.
+    if path in seen_paths:
+        raise ValueError(
+            f"File '{path}' appears multiple times. Merge all hunks into one section."
+        )
     seen_paths.add(path)
 
     if action == "Delete":
-        # Ignore extra body lines for compatibility with loose patch payloads.
+        for line in body_lines:
+            if line.strip():
+                raise ValueError(f"Delete File '{path}' must not contain body lines.")
         return FilePatch(action="Delete", path=path)
 
     if action == "Add":
@@ -1711,10 +2009,6 @@ def _apply_single_hunk(
         return content.replace(search_text, replace_text, 1)
 
     if matches == 0:
-        flexible_search = search_text.strip("\n")
-        if flexible_search and content.count(flexible_search) == 1:
-            flexible_replace = replace_text.strip("\n")
-            return content.replace(flexible_search, flexible_replace, 1)
         raise ValueError(
             f"PATCH_NO_MATCH: SEARCH block for '{file_path}' has no exact match. "
             "Read the latest file and ensure SEARCH text matches source exactly."
