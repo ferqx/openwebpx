@@ -63,6 +63,11 @@ For `Update File`:
 Hard requirements:
 - `SEARCH` block MUST exactly match the existing file content, including indentation and empty lines.
 - Include enough surrounding unique context lines in the `SEARCH` block so it matches EXACTLY ONE location in the file.
+- `Update File` is an exact replacement operation, not a best-effort edit. If the current file does not exactly match `SEARCH`, you must stop, re-read the file, and generate a smaller, more precise patch.
+- Never use one huge file-wide `SEARCH` / `REPLACE` block for a large file. Split large edits into multiple local replacements so each patch stays complete and unambiguous.
+- If a previous patch failed with parse errors such as missing `</search>` or `</replace>`, regenerate a smaller complete patch from scratch. Never try to append the missing tail onto the old failed payload.
+- If the same file already hit `PATCH_PARSE_ERROR`, your next retry for that file MUST reduce scope to a smaller local block. Do not resend another large whole-file or near-whole-file replacement.
+- For SCSS/CSS/Vue style files, treat broad top-to-bottom style rewrites as invalid. Patch one selector block or one local region at a time.
 - Do not output any line number prefixes or `+`/`-` signs. Just write the raw code.
 - `</search>` and `</replace>` MUST each be on their own line.
 - Never put code and XML close tags on the same line (for example: `}</replace>` is invalid).
@@ -912,17 +917,15 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         try:
             file_patches = parse_patch_content(patch_content)
         except ValueError as exc:
-            return self._error_result(
+            error_text = str(exc)
+            return self._strict_patch_error(
                 error_code="PATCH_PARSE_ERROR",
-                message=str(exc),
-                details={
-                    "phase": "parse",
-                    "changed_files": 0,
-                    "hunks_applied": 0,
-                    "fallbacks": [f"parse_error: {exc}"],
-                    "actions": {"add": 0, "update": 0, "delete": 0},
-                    "file_diffs": [],
-                },
+                message=_build_parse_error_message(error_text),
+                phase="parse",
+                changed_files=0,
+                hunks_applied=0,
+                fallbacks=[f"parse_error:{_classify_parse_error(error_text)}"],
+                actions={"add": 0, "update": 0, "delete": 0},
                 retryable=True,
             )
 
@@ -939,9 +942,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             except ValueError as exc:
                 return self._strict_patch_error(
                     error_code="PATCH_PATH_ERROR",
-                    message=(
-                        f"Invalid patch path '{file_patch.path}'. "
-                        "Use a workspace-relative path that resolves inside `/workspace`."
+                    message=_format_error_message(
+                        reason=f"Invalid patch path '{file_patch.path}'.",
+                        fix="Use a workspace-relative path that resolves inside `/workspace`.",
                     ),
                     phase="resolve",
                     matched_files=len(file_patches),
@@ -968,9 +971,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             if read_error is not None:
                 return self._strict_patch_error(
                     error_code="PATCH_READ_ERROR",
-                    message=(
-                        f"Unable to read '{path}' before applying patch. "
-                        "Read the latest file state and retry with an exact SEARCH block."
+                    message=_format_error_message(
+                        reason=f"Unable to read '{path}' before applying patch.",
+                        fix="Read the latest file state and retry with an exact SEARCH block.",
                     ),
                     phase="read",
                     matched_files=len(file_patches),
@@ -982,9 +985,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 if current_content is not None:
                     return self._strict_patch_error(
                         error_code="PATCH_TARGET_EXISTS",
-                        message=(
-                            f"Cannot Add File '{path}' because it already exists. "
-                            "Use `Update File` with an exact SEARCH block instead of overwriting."
+                        message=_format_error_message(
+                            reason=f"Cannot Add File '{path}' because it already exists.",
+                            fix="Use `Update File` with an exact SEARCH block instead of overwriting.",
                         ),
                         phase="plan",
                         matched_files=len(file_patches),
@@ -1021,9 +1024,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             if current_content is None:
                 return self._strict_patch_error(
                     error_code="PATCH_TARGET_MISSING",
-                    message=(
-                        f"Cannot Update File '{path}' because it does not exist. "
-                        "Use `Add File` to create a new file, or re-read the workspace if the path is wrong."
+                    message=_format_error_message(
+                        reason=f"Cannot Update File '{path}' because it does not exist.",
+                        fix="Use `Add File` to create a new file, or re-read the workspace if the path is wrong.",
                     ),
                     phase="plan",
                     matched_files=len(file_patches),
@@ -1039,9 +1042,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             except ValueError as exc:
                 return self._strict_patch_error(
                     error_code="PATCH_APPLY_ERROR",
-                    message=(
-                        f"Failed to apply Update File for '{path}': {exc} "
-                        "Read the latest file and retry with an exact, unique SEARCH block."
+                    message=_format_error_message(
+                        reason=f"Failed to apply Update File for '{path}': {exc}",
+                        fix="Read the latest file and retry with an exact, unique SEARCH block.",
                     ),
                     phase="apply",
                     matched_files=len(file_patches),
@@ -1058,9 +1061,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 except ValueError as exc:
                     return self._strict_patch_error(
                         error_code="PATCH_MOVE_TARGET_ERROR",
-                        message=(
-                            f"Invalid move target '{file_patch.move_to}' for '{path}'. "
-                            "Use a workspace-relative destination path."
+                        message=_format_error_message(
+                            reason=f"Invalid move target '{file_patch.move_to}' for '{path}'.",
+                            fix="Use a workspace-relative destination path.",
                         ),
                         phase="resolve",
                         matched_files=len(file_patches),
@@ -1074,9 +1077,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 if target_read_error is not None:
                     return self._strict_patch_error(
                         error_code="PATCH_MOVE_TARGET_READ_ERROR",
-                        message=(
-                            f"Unable to read move target '{move_target}' for '{path}'. "
-                            "Re-read the workspace and retry."
+                        message=_format_error_message(
+                            reason=f"Unable to read move target '{move_target}' for '{path}'.",
+                            fix="Re-read the workspace and retry.",
                         ),
                         phase="read",
                         matched_files=len(file_patches),
@@ -1087,9 +1090,11 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 if target_current is not None:
                     return self._strict_patch_error(
                         error_code="PATCH_MOVE_TARGET_EXISTS",
-                        message=(
-                            f"Cannot move '{path}' to '{move_target}' because the destination already exists. "
-                            "Pick a new destination or update the existing file explicitly."
+                        message=_format_error_message(
+                            reason=(
+                                f"Cannot move '{path}' to '{move_target}' because the destination already exists."
+                            ),
+                            fix="Pick a new destination or update the existing file explicitly.",
                         ),
                         phase="plan",
                         matched_files=len(file_patches),
@@ -1274,17 +1279,15 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         try:
             file_patches = parse_patch_content(patch_content)
         except ValueError as exc:
-            return self._error_result(
+            error_text = str(exc)
+            return self._strict_patch_error(
                 error_code="PATCH_PARSE_ERROR",
-                message=str(exc),
-                details={
-                    "phase": "parse",
-                    "changed_files": 0,
-                    "hunks_applied": 0,
-                    "fallbacks": [f"parse_error: {exc}"],
-                    "actions": {"add": 0, "update": 0, "delete": 0},
-                    "file_diffs": [],
-                },
+                message=_build_parse_error_message(error_text),
+                phase="parse",
+                changed_files=0,
+                hunks_applied=0,
+                fallbacks=[f"parse_error:{_classify_parse_error(error_text)}"],
+                actions={"add": 0, "update": 0, "delete": 0},
                 retryable=True,
             )
 
@@ -1301,9 +1304,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             except ValueError as exc:
                 return self._strict_patch_error(
                     error_code="PATCH_PATH_ERROR",
-                    message=(
-                        f"Invalid patch path '{file_patch.path}'. "
-                        "Use a workspace-relative path that resolves inside `/workspace`."
+                    message=_format_error_message(
+                        reason=f"Invalid patch path '{file_patch.path}'.",
+                        fix="Use a workspace-relative path that resolves inside `/workspace`.",
                     ),
                     phase="resolve",
                     matched_files=len(file_patches),
@@ -1330,9 +1333,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             if read_error is not None:
                 return self._strict_patch_error(
                     error_code="PATCH_READ_ERROR",
-                    message=(
-                        f"Unable to read '{path}' before applying patch. "
-                        "Read the latest file state and retry with an exact SEARCH block."
+                    message=_format_error_message(
+                        reason=f"Unable to read '{path}' before applying patch.",
+                        fix="Read the latest file state and retry with an exact SEARCH block.",
                     ),
                     phase="read",
                     matched_files=len(file_patches),
@@ -1344,9 +1347,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 if current_content is not None:
                     return self._strict_patch_error(
                         error_code="PATCH_TARGET_EXISTS",
-                        message=(
-                            f"Cannot Add File '{path}' because it already exists. "
-                            "Use `Update File` with an exact SEARCH block instead of overwriting."
+                        message=_format_error_message(
+                            reason=f"Cannot Add File '{path}' because it already exists.",
+                            fix="Use `Update File` with an exact SEARCH block instead of overwriting.",
                         ),
                         phase="plan",
                         matched_files=len(file_patches),
@@ -1383,9 +1386,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             if current_content is None:
                 return self._strict_patch_error(
                     error_code="PATCH_TARGET_MISSING",
-                    message=(
-                        f"Cannot Update File '{path}' because it does not exist. "
-                        "Use `Add File` to create a new file, or re-read the workspace if the path is wrong."
+                    message=_format_error_message(
+                        reason=f"Cannot Update File '{path}' because it does not exist.",
+                        fix="Use `Add File` to create a new file, or re-read the workspace if the path is wrong.",
                     ),
                     phase="plan",
                     matched_files=len(file_patches),
@@ -1401,9 +1404,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             except ValueError as exc:
                 return self._strict_patch_error(
                     error_code="PATCH_APPLY_ERROR",
-                    message=(
-                        f"Failed to apply Update File for '{path}': {exc} "
-                        "Read the latest file and retry with an exact, unique SEARCH block."
+                    message=_format_error_message(
+                        reason=f"Failed to apply Update File for '{path}': {exc}",
+                        fix="Read the latest file and retry with an exact, unique SEARCH block.",
                     ),
                     phase="apply",
                     matched_files=len(file_patches),
@@ -1420,9 +1423,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 except ValueError as exc:
                     return self._strict_patch_error(
                         error_code="PATCH_MOVE_TARGET_ERROR",
-                        message=(
-                            f"Invalid move target '{file_patch.move_to}' for '{path}'. "
-                            "Use a workspace-relative destination path."
+                        message=_format_error_message(
+                            reason=f"Invalid move target '{file_patch.move_to}' for '{path}'.",
+                            fix="Use a workspace-relative destination path.",
                         ),
                         phase="resolve",
                         matched_files=len(file_patches),
@@ -1436,9 +1439,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 if target_read_error is not None:
                     return self._strict_patch_error(
                         error_code="PATCH_MOVE_TARGET_READ_ERROR",
-                        message=(
-                            f"Unable to read move target '{move_target}' for '{path}'. "
-                            "Re-read the workspace and retry."
+                        message=_format_error_message(
+                            reason=f"Unable to read move target '{move_target}' for '{path}'.",
+                            fix="Re-read the workspace and retry.",
                         ),
                         phase="read",
                         matched_files=len(file_patches),
@@ -1449,9 +1452,11 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 if target_current is not None:
                     return self._strict_patch_error(
                         error_code="PATCH_MOVE_TARGET_EXISTS",
-                        message=(
-                            f"Cannot move '{path}' to '{move_target}' because the destination already exists. "
-                            "Pick a new destination or update the existing file explicitly."
+                        message=_format_error_message(
+                            reason=(
+                                f"Cannot move '{path}' to '{move_target}' because the destination already exists."
+                            ),
+                            fix="Pick a new destination or update the existing file explicitly.",
                         ),
                         phase="plan",
                         matched_files=len(file_patches),
@@ -1851,6 +1856,72 @@ def _strip_fence(patch_content: str) -> str:
 
 def _looks_like_unified_diff(text: str) -> bool:
     return _UNIFIED_DIFF_MARKER_RE.search(text) is not None
+
+
+def _classify_parse_error(error_text: str) -> str:
+    if "Missing </search>" in error_text:
+        return "missing_search_close"
+    if "Missing </replace>" in error_text:
+        return "missing_replace_close"
+    if "Found <replace> without a preceding </search>" in error_text:
+        return "replace_without_search"
+    if "Must contain at least one <search>...</search>" in error_text:
+        return "missing_search_block"
+    if "must not contain body lines" in error_text:
+        return "delete_body_not_allowed"
+    if "appears multiple times" in error_text:
+        return "duplicate_file_section"
+    return "invalid_patch_format"
+
+
+def _clean_parse_error_text(error_text: str) -> str:
+    cleaned = error_text.replace(" (or ======= for legacy format)", "")
+    cleaned = cleaned.replace(" (or >>>>>>> REPLACE for legacy format)", "")
+    return cleaned
+
+
+def _format_error_message(*, reason: str, fix: str) -> str:
+    return f"Reason: {reason} Fix: {fix}"
+
+
+def _build_parse_error_message(error_text: str) -> str:
+    cleaned_error = _clean_parse_error_text(error_text)
+    if "Missing </search>" in error_text:
+        return _format_error_message(
+            reason=cleaned_error,
+            fix=(
+                "Re-read the file and retry with a smaller complete patch. "
+                "Ensure `</search>` is on its own line before `<replace>`."
+            ),
+        )
+    if "Missing </replace>" in error_text:
+        return _format_error_message(
+            reason=cleaned_error,
+            fix=(
+                "Re-read the file and retry with a smaller complete patch. "
+                "Ensure `</replace>` is on its own line and the payload ends with `*** End Patch`."
+            ),
+        )
+    if "Found <replace> without a preceding </search>" in error_text:
+        return _format_error_message(
+            reason=cleaned_error,
+            fix=(
+                "Every `Update File` hunk must contain a complete "
+                "`<search>...</search>` block before `<replace>...</replace>`."
+            ),
+        )
+    if "Must contain at least one <search>...</search>" in error_text:
+        return _format_error_message(
+            reason=cleaned_error,
+            fix=(
+                "`Update File` only supports exact `<search>...</search>` "
+                "and `<replace>...</replace>` blocks."
+            ),
+        )
+    return _format_error_message(
+        reason=cleaned_error,
+        fix="Re-read the target file and regenerate a smaller, fully closed patch.",
+    )
 
 
 def _build_file_patch(

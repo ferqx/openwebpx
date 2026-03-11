@@ -358,6 +358,12 @@ def old_function():
 6. 若你打算“创建一个测试文件”，必须使用 `*** Add File:`；禁止改用 `execute` 重定向写入。
 7. 严禁使用 unified diff 语法（如 `@@`、`---`、`+++`、git 风格增删行）；`Update File` 只能使用 `<search>...</search>` + `<replace>...</replace>`。
 8. 如果工具返回“未精确匹配”“目标文件不存在”“目标文件已存在”或“目标路径非法”，你必须停止，不允许猜测、追加内容、覆盖文件或自动降级；先重新读取相关文件，再用更精确的 `SEARCH` 或正确的 `Add File`/`Update File`/`Move to` 重试。
+9. 当单个 `Update File` 需要修改较大区域时，必须拆成多个局部 patch；禁止对大文件做整文件级 `<search>...</search>` / `<replace>...</replace>` 替换。
+10. 单个 `search/replace` 应只覆盖一个局部块；如果替换内容明显偏长（例如接近几十到上百行），优先继续拆分，避免模型输出被截断。
+11. 如果一次 `apply_patch` 因 `Missing </replace>`、`Missing </search>` 或其他解析错误失败，必须重新生成一个更小且完整闭合的 patch，禁止在原失败补丁后“续写尾巴”。
+12. 同一文件一旦出现过 `PATCH_PARSE_ERROR`，下一次重试必须显著缩小修改范围；禁止再次提交覆盖同一大块区域的大型 patch。
+13. 对 SCSS/CSS/Vue 样式文件，默认按“一个选择器块或一个局部区域”拆分 `Update File`；禁止从文件头到文件尾的大段样式重写。
+14. 如果错误是 `Missing </search>` 或 `Missing </replace>`，说明补丁 payload 本身不完整；此时必须切换为更小的局部 patch，而不是重发一个更大的完整版本。
 
 ## `apply_patch` 调用示例（可直接参考）
 

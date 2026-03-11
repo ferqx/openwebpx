@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from graphs.build_app_agent_v3.patch_filesystem_middleware import (
+    APPLY_PATCH_TOOL_DESCRIPTION,
     PatchFilesystemMiddleware,
     apply_update_patch,
     parse_patch_content,
@@ -236,6 +237,8 @@ delta
 
     assert result["ok"] is False
     assert result["error_code"] == "PATCH_APPLY_ERROR"
+    assert result["message"].startswith("Reason: ")
+    assert " Fix: " in result["message"]
     assert "Read the latest file" in result["message"]
     assert backend.read_text("/workspace/a.scss") == "alpha\nbeta\n"
 
@@ -260,6 +263,8 @@ beta
 
     assert result["ok"] is False
     assert result["error_code"] == "PATCH_TARGET_MISSING"
+    assert result["message"].startswith("Reason: ")
+    assert " Fix: " in result["message"]
     assert "Use `Add File`" in result["message"]
     assert backend.files == {}
 
@@ -279,6 +284,8 @@ alpha
 
     assert result["ok"] is False
     assert result["error_code"] == "PATCH_TARGET_EXISTS"
+    assert result["message"].startswith("Reason: ")
+    assert " Fix: " in result["message"]
     assert "Use `Update File`" in result["message"]
     assert backend.read_text("/workspace/existing.scss") == "alpha\n"
 
@@ -472,6 +479,40 @@ beta
     assert result["error_code"] == "PATCH_READ_ERROR"
     assert "not valid UTF-8 text" in result["details"]["fallbacks"][0]
     assert backend.files["/workspace/binary.txt"] == b"\xff\xfe\x00\x00"
+
+
+def test_apply_patch_guidance_requires_smaller_retry_after_parse_error() -> None:
+    assert "same file already hit `PATCH_PARSE_ERROR`" in APPLY_PATCH_TOOL_DESCRIPTION
+    assert "MUST reduce scope to a smaller local block" in APPLY_PATCH_TOOL_DESCRIPTION
+    assert "SCSS/CSS/Vue style files" in APPLY_PATCH_TOOL_DESCRIPTION
+
+
+def test_apply_patch_sync_parse_error_returns_guidance_without_duplicate_text() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _FakeBackend({})
+    patch_content = """
+*** Begin Patch
+*** Update File: search-form.scss
+<search>
+alpha
+*** End Patch
+""".strip()
+
+    result_raw = middleware._apply_patch_sync(backend, patch_content)
+    result = json.loads(result_raw)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "PATCH_PARSE_ERROR"
+    assert result["message"].startswith("Reason: ")
+    assert " Fix: " in result["message"]
+    assert (
+        "Re-read the file and retry with a smaller complete patch" in result["message"]
+    )
+    assert (
+        "Ensure `</search>` is on its own line before `<replace>`" in result["message"]
+    )
+    assert "legacy format" not in result["message"]
+    assert result["details"]["fallbacks"] == ["parse_error:missing_search_close"]
 
 
 def test_apply_update_patch_rejects_mixed_line_endings() -> None:

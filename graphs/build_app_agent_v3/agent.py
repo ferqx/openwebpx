@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,22 @@ except ModuleNotFoundError:
     from repo_map_middleware import RepoMapMiddleware
 
 
-MODEL = init_chat_model(model_provider="openai", model="deepseek-chat")
+def _resolve_model_max_tokens() -> int:
+    raw_value = os.getenv("OPENWEBPX_BUILD_APP_AGENT_V3_MAX_TOKENS", "").strip()
+    if not raw_value:
+        return 4000
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return 4000
+    return value if value > 0 else 4000
+
+
+MODEL = init_chat_model(
+    model_provider="openai",
+    model="deepseek-chat",
+    max_tokens=_resolve_model_max_tokens(),
+)
 SYSTEM_PROMPT = build_system_prompt()
 SUMMARIZATION_DEFAULTS = _compute_summarization_defaults(MODEL)
 
