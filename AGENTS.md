@@ -47,6 +47,7 @@ AI 代理在本仓库工作时请遵循以下协议。
 - 不得无关格式化全仓库。
 - 不要修改与任务无关的公共接口。
 - 未经明确要求，不进行破坏性操作（如删除大量文件、重置历史）。
+- 涉及 `build_app_agent_v3` 的 `apply_patch` 时，禁止任何“猜测式”降级处理：`SEARCH` 未精确命中、目标文件缺失/已存在、路径非法、编码异常、混合换行等情况必须直接失败并把原因返回给模型；严禁自动追加内容、覆盖文件、宽松匹配或静默规范化文本。
 
 ## 7. 安全与配置
 - 禁止提交密钥、令牌、密码等敏感信息。
@@ -69,6 +70,12 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-11（build_app_agent_v3 apply_patch 严格失败与格式保真）：
+  - `build_app_agent_v3/patch_filesystem_middleware.py` 移除 `SEARCH` 未命中后的 best-effort 降级写回逻辑；未精确匹配、目标不存在、目标已存在、路径非法、`Move to` 目标冲突等场景统一返回结构化错误，不再偷偷修改文件。
+  - 文本写回链路新增格式保真：内部统一按 LF 匹配，外部保留原文件换行风格与末尾换行；混合换行文件直接报错，不做自动规范化。
+  - 文件读取改为严格 UTF-8：非 UTF-8 文本直接报错，不再使用 `errors=\"replace\"` 生成替代字符，避免字符静默丢失。
+  - 提示词同步收紧：模型在 `apply_patch` 失败时必须停止并重新读取文件，禁止猜测、追加、覆盖或其他降级修复。
+  - 新增回归测试：覆盖 Unicode、CRLF、末尾换行、`dry_run` 不落盘、`Move to`、非 UTF-8、混合换行、重复文件段与非法 `Delete File` body 等场景，确保后续修改不会重新引入字符替换丢失问题。
 - 2026-03-06（Docker 沙箱 SCM 环境变量注入链路修复与 GitLab MR 稳定化）：
   - 修复 Docker 沙箱内 SCM 环境变量注入问题：`DockerMiddleware` 在复用已同步仓库的旧容器时，也会重新解析 token 并刷新 git runtime 环境，避免 thread state 与容器 shell 实际值脱节。
   - 修复 `/etc/profile.d/openwebpx-scm.sh` bootstrap 脚本会清空 exec 注入变量的问题：由 `unset` 改为保留 `SCM_TOKEN/GH_TOKEN/GITLAB_TOKEN/...` 当前值，确保 `bash -lc` 执行路径下 token 可见。
