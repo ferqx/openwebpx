@@ -23,11 +23,14 @@ from graphs.build_app_agent_v2.sandbox_policy_guard import SandboxPolicyGuard
 class _FakeBackend:
     def __init__(
         self,
-        files: dict[str, str],
+        files: dict[str, str | bytes],
         *,
         fail_upload_for: set[str] | None = None,
     ) -> None:
-        self.files = dict(files)
+        self.files = {
+            path: content if isinstance(content, bytes) else content.encode("utf-8")
+            for path, content in files.items()
+        }
         self.fail_upload_for = set(fail_upload_for or set())
 
     def download_files(self, paths: list[str]) -> list[SimpleNamespace]:
@@ -37,7 +40,7 @@ class _FakeBackend:
                 responses.append(
                     SimpleNamespace(
                         error=None,
-                        content=self.files[path].encode("utf-8"),
+                        content=self.files[path],
                     )
                 )
             else:
@@ -55,7 +58,7 @@ class _FakeBackend:
                     SimpleNamespace(error="permission_denied", content=None)
                 )
                 continue
-            self.files[path] = raw_content.decode("utf-8")
+            self.files[path] = raw_content
             responses.append(SimpleNamespace(error=None, content=None))
         return responses
 
@@ -100,10 +103,17 @@ class _FakeBackend:
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
         return self.read(file_path=file_path, offset=offset, limit=limit)
 
+    def read_text(self, file_path: str) -> str:
+        content = self.files.get(file_path)
+        if content is None:
+            raise KeyError(file_path)
+        return content.decode("utf-8")
+
 
 class _RawReadBackend(_FakeBackend):
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
-        content = self.files.get(file_path)
+        raw_content = self.files.get(file_path)
+        content = raw_content.decode("utf-8") if raw_content is not None else None
         if content is None:
             return f"Error: File '{file_path}' not found"
         lines = content.splitlines()
@@ -340,7 +350,7 @@ def test_apply_patch_sync_supports_move_to() -> None:
 
     assert result["ok"] is True
     assert "/workspace/a.py" not in backend.files
-    assert backend.files["/workspace/b.py"] == "x = 2\n"
+    assert backend.read_text("/workspace/b.py") == "x = 2\n"
 
 
 def test_apply_patch_sync_auto_repairs_missing_update_hunk_header() -> None:
@@ -358,7 +368,7 @@ def test_apply_patch_sync_auto_repairs_missing_update_hunk_header() -> None:
     result = json.loads(result_raw)
 
     assert result["ok"] is True
-    assert backend.files["/workspace/number.txt"] == "2\n"
+    assert backend.read_text("/workspace/number.txt") == "2\n"
 
 
 def test_apply_patch_sync_returns_structured_file_diffs_with_line_numbers() -> None:
@@ -999,7 +1009,7 @@ def test_apply_patch_sync_supports_dry_run_without_writing_files() -> None:
 
     assert result["ok"] is True
     assert result["details"]["phase"] == "dry_run"
-    assert backend.files["/workspace/a.py"] == "x = 1\n"
+    assert backend.read_text("/workspace/a.py") == "x = 1\n"
 
 
 def test_apply_patch_sync_rolls_back_on_mid_commit_failure() -> None:
@@ -1028,8 +1038,8 @@ def test_apply_patch_sync_rolls_back_on_mid_commit_failure() -> None:
     assert result["ok"] is False
     assert result["error_code"] == "PATCH_PARTIAL_FORBIDDEN"
     assert result["details"]["failed_path"] == "/workspace/b.py"
-    assert backend.files["/workspace/a.py"] == "x = 1\n"
-    assert backend.files["/workspace/b.py"] == "y = 1\n"
+    assert backend.read_text("/workspace/a.py") == "x = 1\n"
+    assert backend.read_text("/workspace/b.py") == "y = 1\n"
 
 
 def test_list_resources_returns_file_uris() -> None:
@@ -1148,6 +1158,84 @@ def test_read_resource_rejects_unsupported_scheme() -> None:
 
     assert result["ok"] is False
     assert result["error_code"] == "RESOURCE_SCHEME_UNSUPPORTED"
+
+
+def test_apply_update_patch_preserves_crlf_and_final_newline_v2() -> None:
+    patch_content = """
+*** Update File: notes.txt
+@@ update-line
+-beta
++beta-updated
+""".strip()
+    original = "alpha\r\nbeta\r\n"
+
+    file_patches = parse_patch_content(patch_content)
+    updated, applied = apply_update_patch(
+        original,
+        file_path=file_patches[0].path,
+        hunks=file_patches[0].hunks,
+    )
+
+    assert applied == 1
+    assert updated == "alpha\r\nbeta-updated\r\n"
+
+
+def test_apply_update_patch_preserves_missing_final_newline_v2() -> None:
+    patch_content = """
+*** Update File: notes.txt
+@@ update-line
+-beta
++beta-updated
+""".strip()
+    original = "alpha\nbeta"
+
+    file_patches = parse_patch_content(patch_content)
+    updated, applied = apply_update_patch(
+        original,
+        file_path=file_patches[0].path,
+        hunks=file_patches[0].hunks,
+    )
+
+    assert applied == 1
+    assert updated == "alpha\nbeta-updated"
+
+
+def test_apply_patch_sync_rejects_non_utf8_file_v2() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _FakeBackend({"/workspace/binary.txt": b"\xff\xfe\x00\x00"})
+    patch_content = """
+*** Begin Patch
+*** Update File: binary.txt
+@@ update-line
+-alpha
++beta
+*** End Patch
+""".strip()
+
+    result_raw = middleware._apply_patch_sync(backend, patch_content)
+    result = json.loads(result_raw)
+
+    assert result["ok"] is False
+    assert "not valid UTF-8 text" in result["message"]
+    assert backend.files["/workspace/binary.txt"] == b"\xff\xfe\x00\x00"
+
+
+def test_apply_update_patch_rejects_mixed_line_endings_v2() -> None:
+    patch_content = """
+*** Update File: notes.txt
+@@ update-line
+-beta
++beta-updated
+""".strip()
+    original = "alpha\r\nbeta\ngamma\r\n"
+
+    file_patches = parse_patch_content(patch_content)
+    with pytest.raises(ValueError, match="PATCH_FORMAT_ERROR"):
+        apply_update_patch(
+            original,
+            file_path=file_patches[0].path,
+            hunks=file_patches[0].hunks,
+        )
 
 
 def test_agent_graph_defines_explicit_plan_act_stategraph() -> None:

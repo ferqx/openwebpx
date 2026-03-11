@@ -99,6 +99,67 @@ async def test_aegra_auth_supports_cookie_token(client: TestClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_async_task_safely_same_loop() -> None:
+    loop = asyncio.get_running_loop()
+
+    class FakeTask:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def get_loop(self) -> asyncio.AbstractEventLoop:
+            return loop
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    task = FakeTask()
+    cancelled = sandbox_router._cancel_async_task_safely(task)
+
+    assert cancelled is True
+    assert task.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_async_task_safely_cross_loop() -> None:
+    class FakeOtherLoop:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed = False
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        def call_soon_threadsafe(self, callback: Any) -> None:
+            self.calls += 1
+            callback()
+
+    other_loop = FakeOtherLoop()
+
+    class FakeTask:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def get_loop(self) -> Any:
+            return other_loop
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    task = FakeTask()
+    cancelled = sandbox_router._cancel_async_task_safely(task)
+
+    assert cancelled is True
+    assert other_loop.calls == 1
+    assert task.cancelled is True
+
+
+@pytest.mark.asyncio
 async def test_threads_delete_hook_destroys_bound_container(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -466,6 +527,16 @@ def test_sandbox_thread_cancel_route_smoke(
         def cancel(self) -> None:
             self.cancelled = True
 
+    class FakeRunTask:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
     async def override_current_user() -> Any:
         return SimpleNamespace(identity="user-1")
 
@@ -476,7 +547,9 @@ def test_sandbox_thread_cancel_route_smoke(
     app.dependency_overrides[get_session] = override_session
 
     task = FakeBootstrapTask()
+    run_task = FakeRunTask()
     monkeypatch.setitem(sandbox_router.BOOTSTRAP_TASKS, "th-1", task)
+    monkeypatch.setitem(sandbox_router.active_runs, "run-1", run_task)
 
     response = client.post(
         "/sandbox/threads/th-1/cancel", params={"action": "interrupt"}
@@ -488,10 +561,330 @@ def test_sandbox_thread_cancel_route_smoke(
     assert payload["action"] == "interrupt"
     assert payload["cancelled_run_ids"] == ["run-1"]
     assert payload["cancelled_run_count"] == 1
+    assert payload["cancel_signal_failures"] == []
     assert payload["bootstrap_task_cancelled"] is True
     assert payload["thread_status"] == "idle"
     assert fake_runs[0].status == "interrupted"
     assert task.cancelled is True
+    assert run_task.cancelled is True
+
+
+def test_sandbox_git_unstaged_route_smoke(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[str] = []
+
+    async def override_current_user() -> Any:
+        return SimpleNamespace(identity="user-1")
+
+    async def override_session() -> Any:
+        return SimpleNamespace()
+
+    async def fake_resolve_thread_git_backend(
+        *,
+        session: Any,  # noqa: ARG001
+        thread_id: str,
+        user: Any,  # noqa: ARG001
+    ) -> tuple[Any, str]:
+        assert thread_id == "th-1"
+        return SimpleNamespace(), "agent"
+
+    async def fake_run_git_command(
+        backend: Any,  # noqa: ARG001
+        command: str,
+        *,
+        detail: str,  # noqa: ARG001
+        allow_nonzero_exit: bool = False,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        commands.append(command)
+        if "status --porcelain=1" in command:
+            return (
+                0,
+                " M app/main.py\nA  app/new.py\n?? docs/new.md\n",
+            )
+        if command.endswith("diff --no-ext-diff"):
+            return (0, "diff --git a/app/main.py b/app/main.py\n+line\n")
+        if "/dev/null docs/new.md" in command:
+            return (
+                1,
+                "diff --git a/docs/new.md b/docs/new.md\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/docs/new.md\n"
+                "@@ -0,0 +1,2 @@\n"
+                "+hello\n"
+                "+world\n",
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(
+        sandbox_router,
+        "_resolve_thread_git_backend",
+        fake_resolve_thread_git_backend,
+    )
+    monkeypatch.setattr(
+        sandbox_router,
+        "_run_git_command",
+        fake_run_git_command,
+    )
+    app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_session] = override_session
+
+    response = client.get("/sandbox/threads/th-1/git/unstaged")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["thread_id"] == "th-1"
+    assert payload["graph_id"] == "agent"
+    assert payload["count"] == 2
+    assert payload["untracked_files"] == ["docs/new.md"]
+    assert isinstance(payload["diff"], str) and payload["diff"]
+    assert "diff --git a/docs/new.md b/docs/new.md" in payload["diff"]
+    assert "+hello" in payload["diff"]
+    assert any("--untracked-files=all" in command for command in commands)
+    assert any("/dev/null docs/new.md" in command for command in commands)
+
+
+def test_sandbox_git_staged_route_smoke(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def override_current_user() -> Any:
+        return SimpleNamespace(identity="user-1")
+
+    async def override_session() -> Any:
+        return SimpleNamespace()
+
+    async def fake_resolve_thread_git_backend(
+        *,
+        session: Any,  # noqa: ARG001
+        thread_id: str,
+        user: Any,  # noqa: ARG001
+    ) -> tuple[Any, str]:
+        assert thread_id == "th-1"
+        return SimpleNamespace(), "agent"
+
+    async def fake_run_git_command(
+        backend: Any,  # noqa: ARG001
+        command: str,
+        *,
+        detail: str,  # noqa: ARG001
+        allow_nonzero_exit: bool = False,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if "status --porcelain=1" in command:
+            return (
+                0,
+                " M app/main.py\nA  app/new.py\nR  old.py -> new.py\n",
+            )
+        if command.endswith("diff --cached --no-ext-diff"):
+            return (0, "diff --git a/app/new.py b/app/new.py\n+line\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(
+        sandbox_router,
+        "_resolve_thread_git_backend",
+        fake_resolve_thread_git_backend,
+    )
+    monkeypatch.setattr(
+        sandbox_router,
+        "_run_git_command",
+        fake_run_git_command,
+    )
+    app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_session] = override_session
+
+    response = client.get("/sandbox/threads/th-1/git/staged")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["thread_id"] == "th-1"
+    assert payload["graph_id"] == "agent"
+    assert payload["count"] == 2
+    assert isinstance(payload["diff"], str) and payload["diff"]
+
+
+def test_sandbox_git_staged_route_allows_unlimited_diff(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def override_current_user() -> Any:
+        return SimpleNamespace(identity="user-1")
+
+    async def override_session() -> Any:
+        return SimpleNamespace()
+
+    async def fake_resolve_thread_git_backend(
+        *,
+        session: Any,  # noqa: ARG001
+        thread_id: str,
+        user: Any,  # noqa: ARG001
+    ) -> tuple[Any, str]:
+        assert thread_id == "th-1"
+        return SimpleNamespace(), "agent"
+
+    long_line = "+" + ("x" * 10_000)
+    long_diff = f"diff --git a/app/new.py b/app/new.py\n{long_line}\n"
+
+    async def fake_run_git_command(
+        backend: Any,  # noqa: ARG001
+        command: str,
+        *,
+        detail: str,  # noqa: ARG001
+        allow_nonzero_exit: bool = False,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if "status --porcelain=1" in command:
+            return (0, "A  app/new.py\n")
+        if command.endswith("diff --cached --no-ext-diff"):
+            return (0, long_diff)
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(
+        sandbox_router,
+        "_resolve_thread_git_backend",
+        fake_resolve_thread_git_backend,
+    )
+    monkeypatch.setattr(
+        sandbox_router,
+        "_run_git_command",
+        fake_run_git_command,
+    )
+    app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_session] = override_session
+
+    response = client.get("/sandbox/threads/th-1/git/staged?diff_max_chars=0")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["diff"] == long_diff
+    assert payload["diff_truncated"] is False
+
+
+def test_sandbox_git_commit_route_supports_model_generated_message(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[str] = []
+
+    async def override_current_user() -> Any:
+        return SimpleNamespace(identity="user-1")
+
+    async def override_session() -> Any:
+        return SimpleNamespace()
+
+    async def fake_resolve_thread_git_backend(
+        *,
+        session: Any,  # noqa: ARG001
+        thread_id: str,
+        user: Any,  # noqa: ARG001
+    ) -> tuple[Any, str]:
+        assert thread_id == "th-1"
+        return SimpleNamespace(), "agent"
+
+    async def fake_generate_commit_message_from_diff(staged_diff: str) -> str:
+        assert "diff --git" in staged_diff
+        return "feat: add sandbox commit api"
+
+    async def fake_run_git_command(
+        backend: Any,  # noqa: ARG001
+        command: str,
+        *,
+        detail: str,  # noqa: ARG001
+        allow_nonzero_exit: bool = False,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        commands.append(command)
+        if "status --porcelain=1" in command:
+            if len(commands) >= 5:
+                return (0, "")
+            return (0, "M  app/main.py\n")
+        if command.endswith("diff --cached --no-ext-diff"):
+            return (0, "diff --git a/app/main.py b/app/main.py\n+line\n")
+        if "git -C /workspace commit -m" in command:
+            return (0, "[main 1234567] feat: add sandbox commit api\n 1 file changed")
+        if command.endswith("rev-parse HEAD"):
+            return (0, "1234567890abcdef\n")
+        if command.endswith("show -s --format=%s HEAD"):
+            return (0, "feat: add sandbox commit api\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(
+        sandbox_router,
+        "_resolve_thread_git_backend",
+        fake_resolve_thread_git_backend,
+    )
+    monkeypatch.setattr(
+        sandbox_router,
+        "_run_git_command",
+        fake_run_git_command,
+    )
+    monkeypatch.setattr(
+        sandbox_router,
+        "_generate_commit_message_from_diff",
+        fake_generate_commit_message_from_diff,
+    )
+    app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_session] = override_session
+
+    response = client.post(
+        "/sandbox/threads/th-1/git/commit",
+        json={"generate_message": True},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["thread_id"] == "th-1"
+    assert payload["graph_id"] == "agent"
+    assert payload["commit_id"] == "1234567890abcdef"
+    assert payload["message_source"] == "model"
+    assert payload["commit_message"] == "feat: add sandbox commit api"
+    assert payload["staged_count_before_commit"] == 1
+    assert payload["staged_count_after_commit"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ensure_backend_container_running_starts_stopped_container() -> None:
+    class FakeContainer:
+        def __init__(self) -> None:
+            self.status = "exited"
+            self.started = False
+
+        def reload(self) -> None:
+            return None
+
+        def start(self) -> None:
+            self.started = True
+            self.status = "running"
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self._container = FakeContainer()
+
+        @property
+        def container(self) -> Any:
+            return self._container
+
+    backend = FakeBackend()
+    await sandbox_router._ensure_backend_container_running(backend)  # type: ignore[arg-type]
+    assert backend.container.started is True
+    assert backend.container.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_ensure_backend_container_running_raises_when_start_fails() -> None:
+    class FakeContainer:
+        status = "exited"
+
+        def reload(self) -> None:
+            return None
+
+        def start(self) -> None:
+            raise RuntimeError("start failed")
+
+    class FakeBackend:
+        @property
+        def container(self) -> Any:
+            return FakeContainer()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sandbox_router._ensure_backend_container_running(FakeBackend())  # type: ignore[arg-type]
+    assert exc_info.value.status_code == 409
+    assert "Sandbox container is unavailable" in str(exc_info.value.detail)
 
 
 @pytest.mark.asyncio
@@ -1290,3 +1683,61 @@ def test_code_review_repo_setting_returns_manual_webhook_fallback(
     assert payload["webhook_sync"]["ok"] is False
     assert payload["webhook_sync"]["mode"] == "manual"
     assert payload["webhook_sync"]["manual_setup"]["provider"] == "gitlab"
+
+
+def test_code_review_repo_setting_handles_webhook_connect_error(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_upsert_repo_setting(**kwargs: Any) -> None:  # noqa: ANN401
+        _ = kwargs
+        return None
+
+    async def fake_list_repo_settings(user_id: str) -> list[dict[str, Any]]:
+        assert user_id == "local-dev"
+        return []
+
+    async def fake_select_profile(user_id: str) -> dict[str, Any]:
+        assert user_id == "local-dev"
+        return {
+            "user_id": user_id,
+            "auto_review_enabled": True,
+            "default_trigger": "pr_open",
+            "updated_at": None,
+            "updated_by": user_id,
+        }
+
+    async def fake_ensure_github_repository_webhook(**kwargs: Any) -> Any:  # noqa: ANN401
+        _ = kwargs
+        raise httpx.ConnectError("tls failed")
+
+    monkeypatch.setattr(
+        code_review_router, "_upsert_repo_setting", fake_upsert_repo_setting
+    )
+    monkeypatch.setattr(
+        code_review_router, "_list_repo_settings", fake_list_repo_settings
+    )
+    monkeypatch.setattr(code_review_router, "_select_profile", fake_select_profile)
+    monkeypatch.setattr(
+        code_review_router,
+        "_ensure_github_repository_webhook",
+        fake_ensure_github_repository_webhook,
+    )
+
+    response = client.put(
+        "/integrations/code-review/settings/repositories",
+        json={
+            "provider": "github",
+            "repository": "owner/repo-connect-error",
+            "auto_review": "enabled",
+            "trigger": "pr_open",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["webhook_sync"]["ok"] is False
+    assert payload["webhook_sync"]["mode"] == "manual"
+    assert (
+        payload["webhook_sync"]["message"]
+        == "代码审查 webhook 同步网络连接失败，请检查服务容器的外网访问和 TLS 配置: tls failed"
+    )

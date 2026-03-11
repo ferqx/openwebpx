@@ -13,7 +13,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shlex
+import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -34,8 +36,33 @@ logger = logging.getLogger(__name__)
 BIND_ALL_HOST = "0.0.0.0"  # nosec B104
 DEFAULT_WEB_SANDBOX_IMAGE = "sandbox-agent:latest"
 DEFAULT_WEB_SANDBOX_CONTAINER_PORT = 3000
+DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS = 30 * 60
 _EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _SCM_BASH_ENV = "/etc/profile.d/openwebpx-scm.sh"
+_RUNTIME_DIR = "/root/.agent-runtime"
+
+
+def _resolve_stop_delay_seconds_from_env() -> float:
+    raw_value = os.getenv("OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS", "").strip()
+    if not raw_value:
+        return float(DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS)
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS=%r, fallback to %s",
+            raw_value,
+            DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS,
+        )
+        return float(DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS)
+    if parsed < 0:
+        logger.warning(
+            "Negative OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS=%r, fallback to %s",
+            raw_value,
+            DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS,
+        )
+        return float(DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS)
+    return parsed
 
 
 def _docker_unavailable_message(exc: DockerException) -> str:
@@ -114,6 +141,7 @@ class DockerMiddleware(AgentMiddleware):
         max_restart_attempts: int = 2,
         service_log_path: str | None = None,
         service_pid_path: str | None = None,
+        stop_delay_seconds: float = DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS,
         **container_kwargs: Any,
     ) -> None:
         """初始化DockerMiddleware。
@@ -127,8 +155,9 @@ class DockerMiddleware(AgentMiddleware):
             startup_wait_seconds: 服务启动后等待时间（秒）（默认：2.0）。
             healthcheck_path: 健康检查路径（默认："/"）。
             max_restart_attempts: 最大重启尝试次数（默认：2）。
-            service_log_path: 服务日志文件路径（默认：<workdir>/.agent-runtime/agent-web.log）。
-            service_pid_path: 服务PID文件路径（默认：<workdir>/.agent-runtime/agent-web.pid）。
+            service_log_path: 服务日志文件路径（默认：/root/.agent-runtime/agent-web.log）。
+            service_pid_path: 服务PID文件路径（默认：/root/.agent-runtime/agent-web.pid）。
+            stop_delay_seconds: 对话结束后延迟停止容器的秒数（默认：1800）。
             **container_kwargs: 传递给docker容器创建的其他参数。
         """
         self.image = image
@@ -139,11 +168,13 @@ class DockerMiddleware(AgentMiddleware):
         self.startup_wait_seconds = startup_wait_seconds
         self.healthcheck_path = healthcheck_path
         self.max_restart_attempts = max_restart_attempts
-        runtime_dir = f"{self.workdir.rstrip('/')}/.agent-runtime"
-        self.service_log_path = service_log_path or f"{runtime_dir}/agent-web.log"
-        self.service_pid_path = service_pid_path or f"{runtime_dir}/agent-web.pid"
+        self.stop_delay_seconds = max(0.0, float(stop_delay_seconds))
+        self.service_log_path = service_log_path or f"{_RUNTIME_DIR}/agent-web.log"
+        self.service_pid_path = service_pid_path or f"{_RUNTIME_DIR}/agent-web.pid"
         self.container_kwargs = container_kwargs
         self._client: docker.DockerClient | None = None
+        self._stop_timer_lock = threading.Lock()
+        self._stop_timers: dict[str, threading.Timer] = {}
 
     @property
     def client(self) -> docker.DockerClient:
@@ -242,10 +273,10 @@ class DockerMiddleware(AgentMiddleware):
             "set -e; "
             f'ENV_FILE="{_SCM_BASH_ENV}"; '
             f"WORKDIR={shlex.quote(self.workdir)}; "
-            'WORKSPACE_ENV_FILE="$WORKDIR/.agent-runtime/openwebpx-scm.sh"; '
+            f'WORKSPACE_ENV_FILE="{_RUNTIME_DIR}/openwebpx-scm.sh"; '
             'BASHRC_FILE="/root/.bashrc"; '
             'BASH_PROFILE_FILE="/root/.bash_profile"; '
-            'mkdir -p /etc/profile.d "$WORKDIR/.agent-runtime"; '
+            f'mkdir -p /etc/profile.d "{_RUNTIME_DIR}"; '
             "cat > \"$ENV_FILE\" <<'EOF'\n"
             "# OpenWebPX SCM runtime env\n"
             'export SCM_TOKEN="${SCM_TOKEN-}"\n'
@@ -304,6 +335,46 @@ class DockerMiddleware(AgentMiddleware):
             return True, None
         except DockerException as exc:
             return False, str(exc)
+
+    def _cancel_scheduled_container_stop(self, container_id: str) -> None:
+        with self._stop_timer_lock:
+            timer = self._stop_timers.pop(container_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_container_stop(self, container_id: str) -> None:
+        if self.stop_delay_seconds <= 0:
+            stopped, stop_error = self._stop_container(container_id)
+            if not stopped and stop_error:
+                logger.warning(
+                    "Failed to stop container %s: %s",
+                    container_id,
+                    stop_error,
+                )
+            return
+
+        self._cancel_scheduled_container_stop(container_id)
+
+        def _stop_later() -> None:
+            with self._stop_timer_lock:
+                timer = self._stop_timers.get(container_id)
+                if timer is None:
+                    return
+                self._stop_timers.pop(container_id, None)
+
+            stopped, stop_error = self._stop_container(container_id)
+            if not stopped and stop_error:
+                logger.warning(
+                    "Failed to stop container %s: %s",
+                    container_id,
+                    stop_error,
+                )
+
+        timer = threading.Timer(self.stop_delay_seconds, _stop_later)
+        timer.daemon = True
+        with self._stop_timer_lock:
+            self._stop_timers[container_id] = timer
+        timer.start()
 
     def _persist_thread_container_mapping(
         self,
@@ -612,12 +683,12 @@ class DockerMiddleware(AgentMiddleware):
         configure_cmd = (
             "set -e; "
             f"WORKDIR={workdir_q}; "
-            'CRED_FILE="$WORKDIR/.agent-runtime/.git-credentials"; '
+            f'CRED_FILE="{_RUNTIME_DIR}/.git-credentials"; '
             f'ENV_FILE="{_SCM_BASH_ENV}"; '
-            'WORKSPACE_ENV_FILE="$WORKDIR/.agent-runtime/openwebpx-scm.sh"; '
+            f'WORKSPACE_ENV_FILE="{_RUNTIME_DIR}/openwebpx-scm.sh"; '
             'BASHRC_FILE="/root/.bashrc"; '
             'BASH_PROFILE_FILE="/root/.bash_profile"; '
-            'mkdir -p "$WORKDIR/.agent-runtime"; '
+            f'mkdir -p "{_RUNTIME_DIR}"; '
             'if [ ! -d "$WORKDIR/.git" ]; then echo "git repository missing at $WORKDIR"; exit 1; fi; '
             'git -C "$WORKDIR" config user.name "$GIT_NAME"; '
             'git -C "$WORKDIR" config user.email "$GIT_EMAIL"; '
@@ -2068,6 +2139,7 @@ class DockerMiddleware(AgentMiddleware):
                     )
                 ],
             }
+        self._cancel_scheduled_container_stop(container_id)
         self._persist_thread_container_mapping(
             runtime=runtime, container_id=container_id
         )
@@ -2131,14 +2203,9 @@ class DockerMiddleware(AgentMiddleware):
             return None
 
         status = self._build_runtime_status(state, container)
-        # 对话结束后主动停止容器，下一轮由 before_agent 自动恢复。
-        stopped, stop_error = self._stop_container(container_id)
-        if stopped:
-            status["container_status"] = "stopped"
-            status["service_running"] = False
-            status["service_pid"] = None
-        elif stop_error:
-            logger.warning("Failed to stop container %s: %s", container_id, stop_error)
+        # 对话结束后延迟停止容器，给后续短时间继续对话预留缓冲窗口。
+        self._schedule_container_stop(container_id)
+        status["stop_scheduled_in_seconds"] = self.stop_delay_seconds
         return {
             "container_id": container_id,
             "service_status": status,
@@ -2155,6 +2222,7 @@ def build_web_sandbox_docker_middleware(**overrides: Any) -> DockerMiddleware:
         "auto_start_service": True,
         "default_container_port": DEFAULT_WEB_SANDBOX_CONTAINER_PORT,
         "healthcheck_path": "/",
+        "stop_delay_seconds": _resolve_stop_delay_seconds_from_env(),
     }
     params.update(overrides)
     return DockerMiddleware(**params)

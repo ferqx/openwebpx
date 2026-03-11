@@ -54,6 +54,10 @@ to the host socket group id after verifying the socket is group-writable. If you
 deploy with a custom manifest, preserve that configuration or Docker-backed sandbox
 initialization will fail.
 
+You can control when sandbox containers are stopped after each dialogue via
+`OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS` (default `1800`, i.e. 30 minutes).
+Set it to `0` for immediate stop behavior.
+
 For Langfuse in Docker deployments, configure `LANGFUSE_BASE_URL` rather than
 `LANGFUSE_HOST`. If Langfuse runs on the Docker host, use
 `http://host.docker.internal:3000`; if it runs in another container, use that

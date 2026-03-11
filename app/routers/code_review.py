@@ -858,6 +858,23 @@ async def _sync_repo_webhook_if_needed(
                 webhook_url=webhook_url,
             ),
         }
+    except httpx.HTTPError as exc:
+        detail = str(exc).strip()
+        suffix = f": {detail}" if detail else ""
+        return {
+            "enabled": True,
+            "ok": False,
+            "mode": "manual",
+            "message": f"代码审查 webhook 同步网络连接失败，请检查服务容器的外网访问和 TLS 配置{suffix}",
+            "provider": provider,
+            "repository": repository,
+            "webhook_url": webhook_url,
+            "manual_setup": _build_manual_webhook_guide(
+                provider="github" if provider == "github" else "gitlab",
+                repository=repository,
+                webhook_url=webhook_url,
+            ),
+        }
 
 
 def _normalize_gitlab_base_url_from_web_url(web_url: str | None) -> str | None:

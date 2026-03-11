@@ -8,7 +8,11 @@ import docker
 import pytest
 from docker.errors import NotFound
 
-from middleware.docker import DockerMiddleware, _docker_unavailable_message
+from middleware.docker import (
+    DockerMiddleware,
+    _docker_unavailable_message,
+    build_web_sandbox_docker_middleware,
+)
 
 
 class FakeContainer:
@@ -366,11 +370,13 @@ def test_detect_package_manager_prefers_package_manager_field() -> None:
     assert detected == "pnpm"
 
 
-def test_after_agent_stops_container_when_dialog_finishes() -> None:
+def test_after_agent_schedules_delayed_stop_when_dialog_finishes() -> None:
     running = FakeContainer("cid-1", status="running")
     manager = FakeContainerManager(existing={"cid-1": running})
     middleware = DockerMiddleware()
     middleware._client = FakeDockerClient(manager)
+    scheduled: list[str] = []
+    middleware._schedule_container_stop = scheduled.append  # type: ignore[method-assign]
     middleware._build_runtime_status = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
         "service_running": True,
         "service_pid": "123",
@@ -379,11 +385,27 @@ def test_after_agent_stops_container_when_dialog_finishes() -> None:
     result = middleware.after_agent({"container_id": "cid-1"})
 
     assert result is not None
-    assert running.stopped is True
+    assert running.stopped is False
+    assert scheduled == ["cid-1"]
     assert result["container_id"] == "cid-1"
-    assert result["service_status"]["container_status"] == "stopped"
-    assert result["service_status"]["service_running"] is False
-    assert result["service_status"]["service_pid"] is None
+    assert result["service_status"]["service_running"] is True
+    assert result["service_status"]["service_pid"] == "123"
+    assert result["service_status"]["stop_scheduled_in_seconds"] == 1800.0
+
+
+def test_before_agent_cancels_scheduled_stop_for_reused_container() -> None:
+    running = FakeContainer("cid-1", status="running")
+    manager = FakeContainerManager(existing={"cid-1": running})
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+    cancelled: list[str] = []
+    middleware._cancel_scheduled_container_stop = cancelled.append  # type: ignore[method-assign]
+
+    result = middleware.before_agent({"container_id": "cid-1"}, runtime=None)
+
+    assert result is not None
+    assert cancelled == ["cid-1"]
+    assert result.get("container_id") == "cid-1"
 
 
 def test_maybe_sync_thread_repository_refreshes_runtime_env_for_reused_repo() -> None:
@@ -487,3 +509,13 @@ def test_docker_unavailable_message_mentions_group_add_on_permission_denied() ->
 
     assert "group_add" in message
     assert "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" in message
+
+
+def test_build_web_sandbox_middleware_uses_stop_delay_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS", "600")
+
+    middleware = build_web_sandbox_docker_middleware()
+
+    assert middleware.stop_delay_seconds == 600

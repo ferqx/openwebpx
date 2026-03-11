@@ -368,6 +368,8 @@ HunkLine := (" " | "-" | "+") text NEWLINE
 ```
 tool_call apply_patch {"patch_content":"*** Begin Patch\n*** Add File: hello.txt\n+Hello, world!\n*** End Patch\n"}
 ```
+
+如果工具返回“未匹配”“目标文件不存在”“目标已存在”“路径非法”或任何读写错误，你必须停止，不允许猜测、自动规范化、覆盖文件或降级处理；先重新读取相关文件，再用更精确的 patch 重试。
 """
 
 

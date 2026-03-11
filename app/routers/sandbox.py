@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 from collections.abc import AsyncGenerator
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -34,11 +35,14 @@ from aegra_api.services.langgraph_service import (
 from docker.errors import DockerException, NotFound
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backends.docker import DockerBackend
 from middleware.docker import build_web_sandbox_docker_middleware
 
 if TYPE_CHECKING:
@@ -54,6 +58,48 @@ BOOTSTRAP_LOG_LIMIT = 80
 BOOTSTRAP_EVENT_LIMIT = 400
 BOOTSTRAP_DEFAULT_STREAM_MODE: list[str] = ["messages-tuple"]
 BOOTSTRAP_TASKS: dict[str, asyncio.Task[None]] = {}
+COMMIT_MESSAGE_MODEL_PROVIDER = os.getenv(
+    "OPENWEBPX_COMMIT_MESSAGE_MODEL_PROVIDER", "openai"
+)
+COMMIT_MESSAGE_MODEL_NAME = os.getenv(
+    "OPENWEBPX_COMMIT_MESSAGE_MODEL_NAME", "deepseek-chat"
+)
+_raw_git_diff_default_max_chars = os.getenv(
+    "OPENWEBPX_GIT_DIFF_DEFAULT_MAX_CHARS", "0"
+).strip()
+try:
+    GIT_DIFF_DEFAULT_MAX_CHARS = int(_raw_git_diff_default_max_chars)
+except ValueError:
+    GIT_DIFF_DEFAULT_MAX_CHARS = 0
+GIT_DIFF_MAX_CHARS_LIMIT = 2_000_000
+GIT_DIFF_MODEL_MAX_CHARS = 12_000
+
+
+def _cancel_async_task_safely(task: asyncio.Task[Any] | Any) -> bool:
+    """Best-effort cancel that tolerates cross-event-loop task ownership."""
+    try:
+        if task.done():
+            return False
+    except Exception:
+        return False
+
+    task_loop: asyncio.AbstractEventLoop | None = None
+    with suppress(Exception):
+        task_loop = task.get_loop()
+
+    with suppress(RuntimeError):
+        running_loop = asyncio.get_running_loop()
+        if task_loop is None or task_loop is running_loop:
+            task.cancel()
+            return True
+
+    if task_loop is None or task_loop.is_closed():
+        return False
+
+    with suppress(Exception):
+        task_loop.call_soon_threadsafe(task.cancel)
+        return True
+    return False
 
 
 class SandboxBootstrapRequest(BaseModel):
@@ -72,6 +118,18 @@ class SandboxBootstrapResetRequest(BaseModel):
     destroy_container: bool = Field(
         default=True,
         description="Whether to destroy current sandbox container when resetting initialization state.",
+    )
+
+
+class SandboxThreadCommitRequest(BaseModel):
+    message: str | None = Field(
+        default=None,
+        description="提交说明。为空时可启用 generate_message 由模型生成。",
+        max_length=500,
+    )
+    generate_message: bool = Field(
+        default=False,
+        description="当 message 为空时，是否根据 staged diff 生成 commit message。",
     )
 
 
@@ -198,6 +256,212 @@ def _extract_graph_id_from_metadata(metadata: dict[str, Any] | None) -> str | No
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
     return None
+
+
+def _truncate_text(value: str, *, max_chars: int) -> tuple[str, bool]:
+    if max_chars <= 0:
+        return value, False
+    if len(value) <= max_chars:
+        return value, False
+    return value[:max_chars], True
+
+
+def _coerce_model_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+                continue
+            if isinstance(item, dict):
+                text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+        return "\n".join(parts).strip()
+
+    return ""
+
+
+def _sanitize_commit_message(value: str) -> str:
+    # git commit subject 保持单行，避免把多段内容误注入 shell。
+    line = value.replace("\r", "\n").split("\n", 1)[0].strip()
+    line = line.strip("`").strip("\"'").strip()
+    return line[:200].strip()
+
+
+def _parse_git_porcelain_line(line: str) -> dict[str, Any] | None:
+    if len(line) < 3:
+        return None
+    index_status = line[0]
+    worktree_status = line[1]
+    path_raw = line[3:].strip()
+    if not path_raw:
+        return None
+
+    old_path: str | None = None
+    path = path_raw
+    if " -> " in path_raw:
+        old_path, path = path_raw.split(" -> ", 1)
+        old_path = old_path.strip() or None
+        path = path.strip()
+
+    status = f"{index_status}{worktree_status}"
+    is_staged = index_status not in {" ", "?"}
+    is_unstaged = worktree_status != " " or status == "??"
+    return {
+        "status": status,
+        "index_status": index_status,
+        "worktree_status": worktree_status,
+        "path": path,
+        "old_path": old_path,
+        "is_staged": is_staged,
+        "is_unstaged": is_unstaged,
+    }
+
+
+def _parse_git_porcelain(output: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip("\n")
+        if not line:
+            continue
+        parsed = _parse_git_porcelain_line(line)
+        if parsed is not None:
+            entries.append(parsed)
+    return entries
+
+
+async def _resolve_thread_git_backend(
+    *,
+    session: AsyncSession,
+    thread_id: str,
+    user: User,
+) -> tuple[DockerBackend, str]:
+    stmt = select(ThreadORM).where(
+        ThreadORM.thread_id == thread_id,
+        ThreadORM.user_id == user.identity,
+    )
+    thread = await session.scalar(stmt)
+    if not thread:
+        raise HTTPException(404, f"Thread '{thread_id}' not found")
+
+    graph_id = await _resolve_thread_graph_id(session, thread=thread)
+    config_dict = create_thread_config(thread_id, user, {})
+    configurable = config_dict.get("configurable", {})
+    if not isinstance(configurable, dict):
+        configurable = {}
+
+    config = RunnableConfig(configurable=configurable)
+    langgraph_service = get_langgraph_service()
+    try:
+        async with langgraph_service.get_graph(graph_id) as agent:
+            snapshot = await agent.aget_state(config, subgraphs=False)
+    except Exception as exc:
+        raise HTTPException(
+            500, f"Failed to load sandbox state for thread '{thread_id}': {exc}"
+        ) from exc
+
+    values = snapshot.values if snapshot and isinstance(snapshot.values, dict) else {}
+    if not isinstance(values, dict):
+        values = {}
+    if not values:
+        raise HTTPException(
+            409,
+            "Sandbox runtime state is empty. Please initialize the thread environment first.",
+        )
+
+    runtime_proxy = SimpleNamespace(
+        state=values,
+        config={"configurable": configurable},
+        store=None,
+    )
+    backend = DockerBackend(runtime=runtime_proxy, workdir="/workspace")
+    await _ensure_backend_container_running(backend)
+    return backend, graph_id
+
+
+async def _ensure_backend_container_running(backend: DockerBackend) -> None:
+    def _ensure_running() -> str:
+        container = backend.container
+        container.reload()
+        current_status = str(getattr(container, "status", "")).strip().lower()
+        if current_status != "running":
+            container.start()
+            container.reload()
+            current_status = str(getattr(container, "status", "")).strip().lower()
+        return current_status
+
+    try:
+        status = await asyncio.to_thread(_ensure_running)
+    except Exception as exc:
+        raise HTTPException(
+            409,
+            f"Sandbox container is unavailable for git operations: {exc}",
+        ) from exc
+
+    if status != "running":
+        raise HTTPException(
+            409,
+            "Sandbox container is not running and could not be started.",
+        )
+
+
+async def _run_git_command(
+    backend: DockerBackend,
+    command: str,
+    *,
+    detail: str,
+    allow_nonzero_exit: bool = False,
+) -> tuple[int, str]:
+    result = await backend.aexecute(command)
+    exit_code = int(getattr(result, "exit_code", 1))
+    output = str(getattr(result, "output", "") or "")
+    if exit_code != 0 and not allow_nonzero_exit:
+        excerpt, _ = _truncate_text(output.strip(), max_chars=800)
+        raise HTTPException(
+            409,
+            f"{detail} failed (exit_code={exit_code}). {excerpt or 'no output'}",
+        )
+    return exit_code, output
+
+
+async def _generate_commit_message_from_diff(staged_diff: str) -> str:
+    diff_excerpt, _ = _truncate_text(staged_diff, max_chars=GIT_DIFF_MODEL_MAX_CHARS)
+    if not diff_excerpt.strip():
+        raise HTTPException(
+            409, "Cannot generate commit message from empty staged diff."
+        )
+
+    model = init_chat_model(
+        model_provider=COMMIT_MESSAGE_MODEL_PROVIDER,
+        model=COMMIT_MESSAGE_MODEL_NAME,
+        temperature=0.1,
+    )
+    response = await model.ainvoke(
+        [
+            SystemMessage(
+                content=(
+                    "You generate concise git commit subjects. "
+                    "Return exactly one line, plain text, no quotes, no markdown."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    "Based on this staged git diff, generate a commit message subject "
+                    "in Conventional Commits style (max 72 chars preferred):\n\n"
+                    f"{diff_excerpt}"
+                )
+            ),
+        ]
+    )
+    raw_text = _coerce_model_text(getattr(response, "content", ""))
+    message = _sanitize_commit_message(raw_text)
+    if not message:
+        raise HTTPException(500, "Model returned empty commit message.")
+    return message
 
 
 async def _resolve_thread_graph_id(
@@ -920,6 +1184,236 @@ def _format_sse_event(event_name: str, payload: dict[str, Any]) -> str:
     return f"event: {event_name}\ndata: {body}\n\n"
 
 
+@router.get("/sandbox/threads/{thread_id}/git/unstaged")
+async def get_sandbox_thread_git_unstaged_changes(
+    thread_id: str,
+    include_diff: bool = Query(
+        True,
+        description="Whether to include unstaged unified diff.",
+    ),
+    diff_max_chars: int = Query(
+        GIT_DIFF_DEFAULT_MAX_CHARS,
+        ge=0,
+        le=GIT_DIFF_MAX_CHARS_LIMIT,
+        description=(
+            "Max chars for diff payload before truncation. "
+            "Set to 0 to disable truncation."
+        ),
+    ),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    backend, graph_id = await _resolve_thread_git_backend(
+        session=session,
+        thread_id=thread_id,
+        user=user,
+    )
+    _, status_output = await _run_git_command(
+        backend,
+        "git -C /workspace status --porcelain=1 --untracked-files=all",
+        detail="read git status",
+    )
+    entries = _parse_git_porcelain(status_output)
+    unstaged_entries = [item for item in entries if item.get("is_unstaged")]
+    untracked_files = [
+        item.get("path")
+        for item in unstaged_entries
+        if item.get("status") == "??" and isinstance(item.get("path"), str)
+    ]
+
+    diff_text = ""
+    diff_truncated = False
+    if include_diff:
+        _, raw_diff = await _run_git_command(
+            backend,
+            "git -C /workspace diff --no-ext-diff",
+            detail="read unstaged diff",
+        )
+        merged_diff = raw_diff
+        for file_path in untracked_files:
+            quoted_file = shlex.quote(file_path)
+            _, untracked_diff = await _run_git_command(
+                backend,
+                (
+                    "git -C /workspace diff --no-index --no-ext-diff -- /dev/null "
+                    f"{quoted_file}"
+                ),
+                detail=f"read untracked file diff: {file_path}",
+                allow_nonzero_exit=True,
+            )
+            if untracked_diff.strip():
+                merged_diff = f"{merged_diff.rstrip()}\n{untracked_diff.lstrip()}\n"
+
+        diff_text, diff_truncated = _truncate_text(
+            merged_diff,
+            max_chars=diff_max_chars,
+        )
+
+    return {
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+        "files": unstaged_entries,
+        "count": len(unstaged_entries),
+        "untracked_files": untracked_files,
+        "diff": diff_text if include_diff else None,
+        "diff_truncated": diff_truncated if include_diff else False,
+        "timestamp": _utc_now_iso_z(),
+    }
+
+
+@router.get("/sandbox/threads/{thread_id}/git/staged")
+async def get_sandbox_thread_git_staged_changes(
+    thread_id: str,
+    include_diff: bool = Query(
+        True,
+        description="Whether to include staged unified diff.",
+    ),
+    diff_max_chars: int = Query(
+        GIT_DIFF_DEFAULT_MAX_CHARS,
+        ge=0,
+        le=GIT_DIFF_MAX_CHARS_LIMIT,
+        description=(
+            "Max chars for diff payload before truncation. "
+            "Set to 0 to disable truncation."
+        ),
+    ),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    backend, graph_id = await _resolve_thread_git_backend(
+        session=session,
+        thread_id=thread_id,
+        user=user,
+    )
+    _, status_output = await _run_git_command(
+        backend,
+        "git -C /workspace status --porcelain=1 --untracked-files=all",
+        detail="read git status",
+    )
+    entries = _parse_git_porcelain(status_output)
+    staged_entries = [item for item in entries if item.get("is_staged")]
+
+    diff_text = ""
+    diff_truncated = False
+    if include_diff:
+        _, raw_diff = await _run_git_command(
+            backend,
+            "git -C /workspace diff --cached --no-ext-diff",
+            detail="read staged diff",
+        )
+        diff_text, diff_truncated = _truncate_text(raw_diff, max_chars=diff_max_chars)
+
+    return {
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+        "files": staged_entries,
+        "count": len(staged_entries),
+        "diff": diff_text if include_diff else None,
+        "diff_truncated": diff_truncated if include_diff else False,
+        "timestamp": _utc_now_iso_z(),
+    }
+
+
+@router.post("/sandbox/threads/{thread_id}/git/commit")
+async def commit_sandbox_thread_git_changes(
+    thread_id: str,
+    payload: SandboxThreadCommitRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    backend, graph_id = await _resolve_thread_git_backend(
+        session=session,
+        thread_id=thread_id,
+        user=user,
+    )
+
+    _, status_output = await _run_git_command(
+        backend,
+        "git -C /workspace status --porcelain=1 --untracked-files=all",
+        detail="read git status",
+    )
+    entries = _parse_git_porcelain(status_output)
+    staged_entries = [item for item in entries if item.get("is_staged")]
+    if not staged_entries:
+        raise HTTPException(409, "No staged changes to commit.")
+
+    _, staged_diff = await _run_git_command(
+        backend,
+        "git -C /workspace diff --cached --no-ext-diff",
+        detail="read staged diff",
+    )
+
+    message_source = "user"
+    resolved_message = (
+        payload.message.strip() if isinstance(payload.message, str) else ""
+    )
+    if not resolved_message:
+        if not payload.generate_message:
+            raise HTTPException(
+                400,
+                "Commit message is required when generate_message is false.",
+            )
+        resolved_message = await _generate_commit_message_from_diff(staged_diff)
+        message_source = "model"
+
+    commit_message = _sanitize_commit_message(resolved_message)
+    if not commit_message:
+        raise HTTPException(400, "Commit message cannot be empty.")
+
+    _, commit_output = await _run_git_command(
+        backend,
+        f"git -C /workspace commit -m {shlex.quote(commit_message)}",
+        detail="git commit",
+    )
+    _, commit_id_output = await _run_git_command(
+        backend,
+        "git -C /workspace rev-parse HEAD",
+        detail="read commit id",
+    )
+
+    commit_id = commit_id_output.strip().splitlines()[0] if commit_id_output else ""
+    if not commit_id:
+        raise HTTPException(500, "Commit succeeded but failed to read commit id.")
+
+    _, head_subject_output = await _run_git_command(
+        backend,
+        "git -C /workspace show -s --format=%s HEAD",
+        detail="read commit subject",
+    )
+    head_subject = (
+        head_subject_output.strip().splitlines()[0] if head_subject_output else ""
+    )
+
+    _, latest_status_output = await _run_git_command(
+        backend,
+        "git -C /workspace status --porcelain=1 --untracked-files=all",
+        detail="read git status",
+    )
+    latest_entries = _parse_git_porcelain(latest_status_output)
+    staged_remaining = len([item for item in latest_entries if item.get("is_staged")])
+    unstaged_remaining = len(
+        [item for item in latest_entries if item.get("is_unstaged")]
+    )
+
+    commit_output_excerpt, commit_output_truncated = _truncate_text(
+        commit_output,
+        max_chars=4_000,
+    )
+    return {
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+        "commit_id": commit_id,
+        "commit_message": head_subject or commit_message,
+        "message_source": message_source,
+        "staged_count_before_commit": len(staged_entries),
+        "staged_count_after_commit": staged_remaining,
+        "unstaged_count_after_commit": unstaged_remaining,
+        "commit_output": commit_output_excerpt,
+        "commit_output_truncated": commit_output_truncated,
+        "timestamp": _utc_now_iso_z(),
+    }
+
+
 @router.get("/sandbox/threads/{thread_id}/runtime")
 async def get_sandbox_runtime(
     thread_id: str,
@@ -1159,7 +1653,7 @@ async def start_sandbox_thread_bootstrap(
     )
 
     if active_task is not None:
-        active_task.cancel()
+        _cancel_async_task_safely(active_task)
 
     task = asyncio.create_task(
         _run_bootstrap_task(
@@ -1266,10 +1760,10 @@ async def cancel_sandbox_thread(
         )
         .order_by(RunORM.created_at.desc())
     )
-    active_runs = (await session.scalars(active_runs_stmt)).all()
+    active_run_rows = (await session.scalars(active_runs_stmt)).all()
 
     cancelled_run_ids: list[str] = []
-    for run in active_runs:
+    for run in active_run_rows:
         run.status = "interrupted"
         if hasattr(run, "error_message"):
             run.error_message = (
@@ -1279,12 +1773,17 @@ async def cancel_sandbox_thread(
         cancelled_run_ids.append(run.run_id)
 
     cancel_signal_failures: list[str] = []
+    for run in active_run_rows:
+        task = active_runs.get(run.run_id)
+        if task is None:
+            continue
+        if not _cancel_async_task_safely(task):
+            cancel_signal_failures.append(run.run_id)
 
     bootstrap_task_cancelled = False
     active_task = BOOTSTRAP_TASKS.pop(thread_id, None)
-    if active_task is not None and not active_task.done():
-        active_task.cancel()
-        bootstrap_task_cancelled = True
+    if active_task is not None:
+        bootstrap_task_cancelled = _cancel_async_task_safely(active_task)
 
     if bootstrap_state.get("status") == "running":
         now = _utc_now_iso_z()
@@ -1346,8 +1845,8 @@ async def reset_sandbox_thread_bootstrap(
         )
 
     active_task = BOOTSTRAP_TASKS.pop(thread_id, None)
-    if active_task is not None and not active_task.done():
-        active_task.cancel()
+    if active_task is not None:
+        _cancel_async_task_safely(active_task)
 
     now = _utc_now_iso_z()
     reset_state: dict[str, Any] = {

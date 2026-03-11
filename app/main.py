@@ -3,12 +3,16 @@ import logging
 import os
 import re
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from aegra_api.core import orm as aegra_orm
 from aegra_api.core.auth_deps import require_auth
+from aegra_api.core.database import db_manager
+from aegra_api.settings import settings
 from fastapi import Depends, FastAPI
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.routers.auth import router as auth_router
 from app.routers.code_review import public_router as code_review_public_router
@@ -18,6 +22,10 @@ from app.routers.sandbox import router as sandbox_router
 from app.routers.scm import router as scm_router
 
 logger = logging.getLogger(__name__)
+
+USE_SQLALCHEMY_NULLPOOL = os.getenv(
+    "OPENWEBPX_SQLALCHEMY_USE_NULLPOOL", "true"
+).strip().lower() not in {"0", "false", "no"}
 
 
 @asynccontextmanager
@@ -44,6 +52,53 @@ def _install_loop_safe_session_maker_patch() -> None:
         return
 
     original_get_session_maker: Callable[..., Any] = aegra_orm._get_session_maker
+    pool_size = settings.pool.SQLALCHEMY_POOL_SIZE
+    max_overflow = settings.pool.SQLALCHEMY_MAX_OVERFLOW
+    echo = settings.db.DB_ECHO_LOG
+
+    def _create_loop_safe_engine():
+        engine_kwargs: dict[str, Any] = {
+            "pool_pre_ping": True,
+            "echo": echo,
+        }
+        if USE_SQLALCHEMY_NULLPOOL:
+            engine_kwargs["poolclass"] = NullPool
+        else:
+            engine_kwargs["pool_size"] = pool_size
+            engine_kwargs["max_overflow"] = max_overflow
+        return create_async_engine(db_manager._database_url, **engine_kwargs)
+
+    def _is_engine_pool_bound_to_current_loop() -> bool:
+        if USE_SQLALCHEMY_NULLPOOL:
+            return False
+        engine = db_manager.engine
+        if engine is None:
+            return False
+        with suppress(RuntimeError):
+            current_loop = asyncio.get_running_loop()
+            pool = getattr(engine, "pool", None)
+            async_adapted_pool = getattr(pool, "_pool", None)
+            raw_queue = getattr(async_adapted_pool, "_queue", None)
+            bound_loop = getattr(raw_queue, "_loop", None)
+            if bound_loop is not None and bound_loop is not current_loop:
+                return True
+        return False
+
+    def _rebind_sqlalchemy_engine_for_current_loop() -> None:
+        old_engine = db_manager.engine
+        if old_engine is None:
+            return
+
+        db_manager.engine = _create_loop_safe_engine()
+        # Best-effort cleanup of old engine pool; ignore failures caused by stale loop.
+        with suppress(Exception):
+            loop = asyncio.get_running_loop()
+
+            async def _dispose_old_engine() -> None:
+                with suppress(Exception):
+                    await old_engine.dispose()
+
+            loop.create_task(_dispose_old_engine())
 
     def _loop_safe_get_session_maker():
         try:
@@ -52,7 +107,16 @@ def _install_loop_safe_session_maker_patch() -> None:
             loop_id = None
 
         cached_loop_id = getattr(aegra_orm, "_openwebpx_session_maker_loop_id", None)
-        if loop_id is not None and cached_loop_id != loop_id:
+        loop_changed = loop_id is not None and cached_loop_id != loop_id
+        pool_loop_mismatch = _is_engine_pool_bound_to_current_loop()
+        if loop_changed or pool_loop_mismatch:
+            if pool_loop_mismatch and not loop_changed:
+                logger.warning(
+                    "Detected SQLAlchemy pool bound to stale event loop; rebinding engine."
+                )
+            if USE_SQLALCHEMY_NULLPOOL:
+                logger.warning("Using SQLAlchemy NullPool for loop-safe DB access.")
+            _rebind_sqlalchemy_engine_for_current_loop()
             aegra_orm.async_session_maker = None
             aegra_orm._openwebpx_session_maker_loop_id = loop_id
         return original_get_session_maker()

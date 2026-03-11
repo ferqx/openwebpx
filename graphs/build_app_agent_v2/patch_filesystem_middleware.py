@@ -117,6 +117,14 @@ class PatchCommitAction:
     applied_hunks: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class TextFormat:
+    """Original text formatting preserved across normalized patch application."""
+
+    newline: str
+    has_trailing_newline: bool
+
+
 def parse_patch_content(patch_content: str) -> tuple[FilePatch, ...]:
     """Parse Patch content into structured file operations."""
     stripped = _strip_fence(patch_content)
@@ -268,7 +276,8 @@ def apply_update_patch(
     hunks: tuple[PatchHunk, ...],
 ) -> tuple[str, int]:
     """Apply parsed Patch update hunks to file content."""
-    updated_content = original_content
+    normalized_content, text_format = _normalize_text_for_patch(original_content)
+    updated_content = normalized_content
     applied_count = 0
 
     for index, hunk in enumerate(hunks, start=1):
@@ -280,7 +289,52 @@ def apply_update_patch(
         )
         applied_count += 1
 
-    return updated_content, applied_count
+    return _restore_text_format(updated_content, text_format=text_format), applied_count
+
+
+def _normalize_text_for_patch(content: str) -> tuple[str, TextFormat]:
+    """Normalize file text to LF for matching while retaining original formatting."""
+    newline = _detect_dominant_newline(content)
+    has_trailing_newline = content.endswith(("\n", "\r"))
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized, TextFormat(
+        newline=newline,
+        has_trailing_newline=has_trailing_newline,
+    )
+
+
+def _restore_text_format(content: str, *, text_format: TextFormat) -> str:
+    """Restore original newline style and final newline preference."""
+    restored = content
+    if text_format.has_trailing_newline:
+        if restored and not restored.endswith("\n"):
+            restored += "\n"
+    elif restored.endswith("\n"):
+        restored = restored[:-1]
+
+    if text_format.newline != "\n":
+        restored = restored.replace("\n", text_format.newline)
+    return restored
+
+
+def _detect_dominant_newline(content: str) -> str:
+    """Detect a consistent newline style or fail fast on mixed text files."""
+    has_crlf = "\r\n" in content
+    normalized_without_crlf = content.replace("\r\n", "")
+    has_bare_cr = "\r" in normalized_without_crlf
+    has_bare_lf = "\n" in normalized_without_crlf
+
+    newline_kinds = int(has_crlf) + int(has_bare_cr) + int(has_bare_lf)
+    if newline_kinds > 1:
+        raise ValueError(
+            "PATCH_FORMAT_ERROR: File uses mixed line endings. "
+            "Normalize the file first, then retry apply_patch."
+        )
+    if has_crlf:
+        return "\r\n"
+    if has_bare_cr:
+        return "\r"
+    return "\n"
 
 
 class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]):
@@ -1223,7 +1277,10 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             return None, f"Error: Unable to read '{file_path}': {response.error}"
         if response.content is None:
             return None, f"Error: Empty file payload for '{file_path}'."
-        return response.content.decode("utf-8", errors="replace"), None
+        return self._decode_file_content(
+            file_path=file_path,
+            raw_content=response.content,
+        )
 
     async def _read_file_async(
         self,
@@ -1240,7 +1297,10 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
             return None, f"Error: Unable to read '{file_path}': {response.error}"
         if response.content is None:
             return None, f"Error: Empty file payload for '{file_path}'."
-        return response.content.decode("utf-8", errors="replace"), None
+        return self._decode_file_content(
+            file_path=file_path,
+            raw_content=response.content,
+        )
 
     def _write_file_sync(
         self,
@@ -1269,6 +1329,21 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         if response.error is not None:
             return f"Error: Unable to write '{file_path}': {response.error}"
         return None
+
+    def _decode_file_content(
+        self,
+        *,
+        file_path: str,
+        raw_content: bytes,
+    ) -> tuple[str | None, str | None]:
+        try:
+            return raw_content.decode("utf-8"), None
+        except UnicodeDecodeError as exc:
+            return (
+                None,
+                "Error: Unable to read "
+                f"'{file_path}': file is not valid UTF-8 text ({exc.reason}).",
+            )
 
     def _delete_file_sync(
         self,

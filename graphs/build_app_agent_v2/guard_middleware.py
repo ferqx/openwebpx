@@ -168,7 +168,10 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
         response = responses[0]
         if response.error is not None or response.content is None:
             return None
-        return response.content.decode("utf-8", errors="replace")
+        try:
+            return response.content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     async def _aread_file_content(
         self,
@@ -189,7 +192,10 @@ class ToolCallGuardMiddleware(AgentMiddleware[ToolGuardState, Any, Any]):
         response = responses[0]
         if response.error is not None or response.content is None:
             return None
-        return response.content.decode("utf-8", errors="replace")
+        try:
+            return response.content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     def _compute_hunks(self, before: str, after: str) -> list[dict[str, int]]:
         """Compute unified-diff hunk ranges with line numbers."""
