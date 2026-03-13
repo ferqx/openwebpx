@@ -645,6 +645,55 @@ def test_sandbox_git_unstaged_route_smoke(
     assert any("/dev/null docs/new.md" in command for command in commands)
 
 
+def test_sandbox_git_unstaged_route_returns_pending_during_bootstrap(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def override_current_user() -> Any:
+        return SimpleNamespace(identity="user-1")
+
+    async def override_session() -> Any:
+        async def scalar(stmt: Any) -> Any:  # noqa: ARG001
+            return SimpleNamespace(
+                thread_id="th-1",
+                metadata_json={"graph_id": "agent"},
+            )
+
+        return SimpleNamespace(scalar=scalar)
+
+    async def fake_resolve_thread_git_backend(
+        *,
+        session: Any,  # noqa: ARG001
+        thread_id: str,
+        user: Any,  # noqa: ARG001
+    ) -> tuple[Any, str]:
+        assert thread_id == "th-1"
+        raise HTTPException(
+            409,
+            "Sandbox runtime state is empty. Please initialize the thread environment first.",
+        )
+
+    monkeypatch.setattr(
+        sandbox_router,
+        "_resolve_thread_git_backend",
+        fake_resolve_thread_git_backend,
+    )
+    app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_session] = override_session
+
+    response = client.get("/sandbox/threads/th-1/git/unstaged?include_diff=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["thread_id"] == "th-1"
+    assert payload["graph_id"] == "agent"
+    assert payload["pending_initialization"] is True
+    assert payload["count"] == 0
+    assert payload["files"] == []
+    assert payload["untracked_files"] == []
+    assert payload["diff"] == ""
+    assert payload["diff_truncated"] is False
+
+
 def test_sandbox_git_staged_route_smoke(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -700,6 +749,55 @@ def test_sandbox_git_staged_route_smoke(
     assert payload["graph_id"] == "agent"
     assert payload["count"] == 2
     assert isinstance(payload["diff"], str) and payload["diff"]
+
+
+def test_sandbox_git_staged_route_returns_pending_during_bootstrap(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def override_current_user() -> Any:
+        return SimpleNamespace(identity="user-1")
+
+    async def override_session() -> Any:
+        async def scalar(stmt: Any) -> Any:  # noqa: ARG001
+            return SimpleNamespace(
+                thread_id="th-1",
+                metadata_json={"graph_id": "agent"},
+            )
+
+        return SimpleNamespace(scalar=scalar)
+
+    async def fake_resolve_thread_git_backend(
+        *,
+        session: Any,  # noqa: ARG001
+        thread_id: str,
+        user: Any,  # noqa: ARG001
+    ) -> tuple[Any, str]:
+        assert thread_id == "th-1"
+        raise HTTPException(
+            409,
+            "Sandbox runtime state is empty. Please initialize the thread environment first.",
+        )
+
+    monkeypatch.setattr(
+        sandbox_router,
+        "_resolve_thread_git_backend",
+        fake_resolve_thread_git_backend,
+    )
+    app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_session] = override_session
+
+    response = client.get("/sandbox/threads/th-1/git/staged?include_diff=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["thread_id"] == "th-1"
+    assert payload["graph_id"] == "agent"
+    assert payload["pending_initialization"] is True
+    assert payload["count"] == 0
+    assert payload["files"] == []
+    assert payload["untracked_files"] == []
+    assert payload["diff"] == ""
+    assert payload["diff_truncated"] is False
 
 
 def test_sandbox_git_staged_route_allows_unlimited_diff(

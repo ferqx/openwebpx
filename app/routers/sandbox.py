@@ -702,6 +702,32 @@ def _normalize_bootstrap_state(raw_state: Any) -> dict[str, Any]:
     return normalized
 
 
+def _is_runtime_state_initializing_error(exc: HTTPException) -> bool:
+    detail = exc.detail
+    if exc.status_code != 409 or not isinstance(detail, str):
+        return False
+    return detail.startswith("Sandbox runtime state is empty.")
+
+
+def _build_pending_git_changes_response(
+    *,
+    thread_id: str,
+    graph_id: str,
+    include_diff: bool,
+) -> dict[str, Any]:
+    return {
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+        "files": [],
+        "count": 0,
+        "untracked_files": [],
+        "diff": "" if include_diff else None,
+        "diff_truncated": False,
+        "pending_initialization": True,
+        "timestamp": _utc_now_iso_z(),
+    }
+
+
 def _build_bootstrap_response(
     *,
     thread_id: str,
@@ -1203,11 +1229,32 @@ async def get_sandbox_thread_git_unstaged_changes(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    backend, graph_id = await _resolve_thread_git_backend(
-        session=session,
-        thread_id=thread_id,
-        user=user,
-    )
+    try:
+        backend, graph_id = await _resolve_thread_git_backend(
+            session=session,
+            thread_id=thread_id,
+            user=user,
+        )
+    except HTTPException as exc:
+        if _is_runtime_state_initializing_error(exc):
+            thread = await session.scalar(
+                select(ThreadORM).where(
+                    ThreadORM.thread_id == thread_id,
+                    ThreadORM.user_id == user.identity,
+                )
+            )
+            if thread is None:
+                raise exc
+            graph_id = await _resolve_thread_graph_id(
+                session,
+                thread=thread,
+            )
+            return _build_pending_git_changes_response(
+                thread_id=thread_id,
+                graph_id=graph_id,
+                include_diff=include_diff,
+            )
+        raise
     _, status_output = await _run_git_command(
         backend,
         "git -C /workspace status --porcelain=1 --untracked-files=all",
@@ -1280,11 +1327,32 @@ async def get_sandbox_thread_git_staged_changes(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    backend, graph_id = await _resolve_thread_git_backend(
-        session=session,
-        thread_id=thread_id,
-        user=user,
-    )
+    try:
+        backend, graph_id = await _resolve_thread_git_backend(
+            session=session,
+            thread_id=thread_id,
+            user=user,
+        )
+    except HTTPException as exc:
+        if _is_runtime_state_initializing_error(exc):
+            thread = await session.scalar(
+                select(ThreadORM).where(
+                    ThreadORM.thread_id == thread_id,
+                    ThreadORM.user_id == user.identity,
+                )
+            )
+            if thread is None:
+                raise exc
+            graph_id = await _resolve_thread_graph_id(
+                session,
+                thread=thread,
+            )
+            return _build_pending_git_changes_response(
+                thread_id=thread_id,
+                graph_id=graph_id,
+                include_diff=include_diff,
+            )
+        raise
     _, status_output = await _run_git_command(
         backend,
         "git -C /workspace status --porcelain=1 --untracked-files=all",

@@ -9,6 +9,8 @@ import pytest
 from graphs.build_app_agent_v3.patch_filesystem_middleware import (
     APPLY_PATCH_TOOL_DESCRIPTION,
     PatchFilesystemMiddleware,
+    PatchFilesystemState,
+    _compute_line_change_counts,
     apply_update_patch,
     parse_patch_content,
 )
@@ -431,6 +433,319 @@ beta-updated
     assert result["ok"] is True
     assert result["details"]["phase"] == "dry_run"
     assert backend.read_text("/workspace/a.scss") == "alpha\nbeta\n"
+
+
+def test_patch_filesystem_state_schema_tracks_apply_patch_stats() -> None:
+    assert PatchFilesystemMiddleware.state_schema is PatchFilesystemState
+    assert "apply_patch_stats_v1" in PatchFilesystemState.__annotations__
+
+
+def test_apply_patch_sync_tracks_net_changes_across_multiple_calls() -> None:
+    middleware = PatchFilesystemMiddleware()
+    backend = _FakeBackend({"/workspace/a.scss": "alpha\nbeta\ngamma\n"})
+    runtime_state: dict[str, object] = {}
+    first_patch = """
+*** Begin Patch
+*** Update File: a.scss
+<search>
+beta
+</search>
+<replace>
+beta-updated
+</replace>
+*** End Patch
+""".strip()
+    second_patch = """
+*** Begin Patch
+*** Update File: a.scss
+<search>
+gamma
+</search>
+<replace>
+gamma-updated
+delta
+</replace>
+*** End Patch
+""".strip()
+
+    first_result = json.loads(
+        middleware._apply_patch_sync(backend, first_patch, runtime_state=runtime_state)
+    )
+    second_result = json.loads(
+        middleware._apply_patch_sync(
+            backend,
+            second_patch,
+            runtime_state=runtime_state,
+        )
+    )
+
+    first_diff = first_result["details"]["file_diffs"][0]
+    second_diff = second_result["details"]["file_diffs"][0]
+
+    assert first_diff["file_version"] == 1
+    assert first_diff["net_added"] == 1
+    assert first_diff["net_removed"] == 1
+    assert second_diff["file_version"] == 2
+    assert second_diff["delta_added"] == 2
+    assert second_diff["delta_removed"] == 1
+    assert second_diff["net_added"] == 3
+    assert second_diff["net_removed"] == 2
+
+
+def test_apply_patch_sync_uses_minimal_line_counts_for_search_replace_stats() -> None:
+    middleware = PatchFilesystemMiddleware()
+    original = """
+.search-panel {
+  width: 100%;
+  &-body {
+    background: #ffffff;
+    border-radius: 3px;
+    &-tree {
+      &-group {
+        h2 {
+          background: #f5f7fa;
+          border-radius: 3px 3px 0px 0px;
+          font-family: PingFangSC-Medium;
+          font-size: var(--el-font-size-base);
+          color: var(--el-text-color-primary);
+          padding: 0 24px;
+          font-weight: 500;
+          height: 36px;
+          line-height: 36px;
+          margin-bottom: 16px;
+        }
+        &-title {
+          background: #f5f7fa;
+          border-radius: 3px 3px 0px 0px;
+          font-family: PingFangSC-Medium;
+          font-size: var(--el-font-size-base);
+          color: var(--el-text-color-primary);
+          padding: 0 24px;
+          font-weight: 500;
+          height: 36px;
+          line-height: 36px;
+          margin-bottom: 16px;
+        }
+        &-name {
+          padding: 0 24px;
+          font-family: PingFangSC-Regular;
+          font-size: var(--el-font-size-base);
+          color: var(--el-text-color-primary);
+          margin-bottom: 10px;
+        }
+        &-tags {
+          padding: 0 24px;
+          &--item {
+            margin-right: 8px !important;
+            margin-bottom: 12px !important;
+          }
+        }
+        &__del {
+          margin-top: 8px;
+          text-align: right;
+        }
+        span {
+          cursor: pointer;
+        }
+      }
+    }
+  }
+}
+""".strip()
+    backend = _FakeBackend({"/workspace/tag-search.scss": f"{original}\n"})
+    patch_content = """
+*** Begin Patch
+*** Update File: tag-search.scss
+<search>
+.search-panel {
+  width: 100%;
+  &-body {
+    background: #ffffff;
+    border-radius: 3px;
+    &-tree {
+      &-group {
+        h2 {
+          background: #f5f7fa;
+          border-radius: 3px 3px 0px 0px;
+          font-family: PingFangSC-Medium;
+          font-size: var(--el-font-size-base);
+          color: var(--el-text-color-primary);
+          padding: 0 24px;
+          font-weight: 500;
+          height: 36px;
+          line-height: 36px;
+          margin-bottom: 16px;
+        }
+        &-title {
+          background: #f5f7fa;
+          border-radius: 3px 3px 0px 0px;
+          font-family: PingFangSC-Medium;
+          font-size: var(--el-font-size-base);
+          color: var(--el-text-color-primary);
+          padding: 0 24px;
+          font-weight: 500;
+          height: 36px;
+          line-height: 36px;
+          margin-bottom: 16px;
+        }
+        &-name {
+          padding: 0 24px;
+          font-family: PingFangSC-Regular;
+          font-size: var(--el-font-size-base);
+          color: var(--el-text-color-primary);
+          margin-bottom: 10px;
+        }
+        &-tags {
+          padding: 0 24px;
+          &--item {
+            margin-right: 8px !important;
+            margin-bottom: 12px !important;
+          }
+        }
+        &__del {
+          margin-top: 8px;
+          text-align: right;
+        }
+        span {
+          cursor: pointer;
+        }
+      }
+    }
+  }
+}
+</search>
+<replace>
+.search-panel {
+  width: 100%;
+
+  &-body {
+    background: #ffffff;
+    border-radius: 6px;
+    border: 1px solid var(--el-border-color-lighter);
+    padding: 20px;
+
+    &-tree {
+      &-group {
+        margin-bottom: 24px;
+        padding-bottom: 16px;
+        border-bottom: 1px solid var(--el-border-color-lighter);
+
+        &:last-child {
+          margin-bottom: 0;
+          padding-bottom: 0;
+          border-bottom: none;
+        }
+
+        h2 {
+          background: var(--el-fill-color-lighter);
+          border-radius: 4px;
+          font-family: inherit;
+          font-size: var(--el-font-size-medium);
+          color: var(--el-text-color-primary);
+          padding: 0 16px;
+          font-weight: 600;
+          height: 40px;
+          line-height: 40px;
+          margin-bottom: 16px;
+          border: 1px solid var(--el-border-color-lighter);
+        }
+
+        &-title {
+          background: var(--el-fill-color-lighter);
+          border-radius: 4px;
+          font-family: inherit;
+          font-size: var(--el-font-size-medium);
+          color: var(--el-text-color-primary);
+          padding: 0 16px;
+          font-weight: 600;
+          height: 40px;
+          line-height: 40px;
+          margin-bottom: 16px;
+          border: 1px solid var(--el-border-color-lighter);
+        }
+
+        &-name {
+          padding: 0 16px;
+          font-family: inherit;
+          font-size: var(--el-font-size-base);
+          color: var(--el-text-color-primary);
+          margin-bottom: 12px;
+          font-weight: 500;
+        }
+
+        &-tags {
+          padding: 0 16px;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+
+          &--item {
+            margin: 0 !important;
+
+            .el-tag {
+              border-radius: 4px;
+              border-width: 1px;
+              font-weight: 500;
+              transition: all 0.15s ease;
+
+              &:hover {
+                border-color: var(--el-color-primary-light-5);
+                color: var(--el-color-primary);
+                background-color: var(--el-fill-color-light);
+              }
+            }
+          }
+        }
+
+        &__del {
+          margin-top: 12px;
+          text-align: right;
+          padding: 0 16px;
+
+          .el-button {
+            border: 1px solid var(--el-border-color);
+            background-color: #fff;
+            color: var(--el-text-color-regular);
+            font-weight: 500;
+            border-radius: 4px;
+
+            &:hover {
+              border-color: var(--el-color-primary-light-5);
+              color: var(--el-color-primary);
+              background-color: var(--el-fill-color-light);
+            }
+          }
+        }
+
+        span {
+          cursor: pointer;
+        }
+      }
+    }
+  }
+}
+</replace>
+*** End Patch
+""".strip()
+
+    result = json.loads(middleware._apply_patch_sync(backend, patch_content))
+
+    assert result["ok"] is True
+    file_diff = result["details"]["file_diffs"][0]
+    assert file_diff["delta_added"] == 77
+    assert file_diff["delta_removed"] == 24
+    assert file_diff["net_added"] == 77
+    assert file_diff["net_removed"] == 24
+
+
+def test_compute_line_change_counts_handles_large_repetitive_files_exactly() -> None:
+    old_text = "\n".join(["a"] * 2500 + ["x"] + ["a"] * 2500)
+    new_text = "\n".join(["a"] * 2500 + ["y"] + ["a"] * 2500)
+
+    added, removed = _compute_line_change_counts(old_text, new_text)
+
+    assert added == 1
+    assert removed == 1
 
 
 def test_apply_patch_sync_move_to_preserves_unicode_and_crlf() -> None:

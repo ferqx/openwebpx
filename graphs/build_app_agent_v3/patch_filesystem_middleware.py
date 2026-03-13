@@ -8,7 +8,7 @@ import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, NotRequired, cast
 
 from deepagents.backends.protocol import (
     BACKEND_TYPES,
@@ -132,8 +132,14 @@ _UNIFIED_DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@
 _UNIFIED_DIFF_MARKER_RE = re.compile(r"(?m)^(?:@@\s+-\d|---\s|\+\+\+\s)")
 _MAX_FILE_DIFFS = 20
 _MAX_HUNKS_PER_FILE = 20
-_APPLY_PATCH_STATS_STATE_KEY = "__apply_patch_stats_v1"
+_APPLY_PATCH_STATS_STATE_KEY = "apply_patch_stats_v1"
 _MAX_TRACKED_FILE_CHARS = 200_000
+
+
+class PatchFilesystemState(FilesystemState):
+    """Filesystem state plus apply_patch session diff tracking."""
+
+    apply_patch_stats_v1: NotRequired[dict[str, Any]]
 
 
 # ===== Parse/apply primitives =====
@@ -274,6 +280,52 @@ def _compute_diff_hunks(before: str, after: str) -> list[dict[str, int]]:
     return hunks
 
 
+def _compute_line_change_counts(before: str, after: str) -> tuple[int, int]:
+    """Count minimal added/removed lines so summary stats match rendered diffs."""
+    old_lines = before.splitlines()
+    new_lines = after.splitlines()
+
+    if not old_lines and not new_lines:
+        return 0, 0
+    if not old_lines:
+        return len(new_lines), 0
+    if not new_lines:
+        return 0, len(old_lines)
+
+    # Myers computes the shortest edit script exactly without the O(n*m) DP blowup.
+    frontier: dict[int, int] = {1: 0}
+    old_len = len(old_lines)
+    new_len = len(new_lines)
+
+    for distance in range(old_len + new_len + 1):
+        for diagonal in range(-distance, distance + 1, 2):
+            if diagonal == -distance or (
+                diagonal != distance
+                and frontier.get(diagonal - 1, -1) < frontier.get(diagonal + 1, -1)
+            ):
+                old_index = frontier.get(diagonal + 1, 0)
+            else:
+                old_index = frontier.get(diagonal - 1, 0) + 1
+
+            new_index = old_index - diagonal
+            while (
+                old_index < old_len
+                and new_index < new_len
+                and old_lines[old_index] == new_lines[new_index]
+            ):
+                old_index += 1
+                new_index += 1
+
+            frontier[diagonal] = old_index
+            if old_index >= old_len and new_index >= new_len:
+                delta = new_len - old_len
+                added = (distance + delta) // 2
+                removed = distance - added
+                return added, removed
+
+    raise RuntimeError("Unable to compute shortest edit script for apply_patch stats.")
+
+
 def _normalize_text_for_patch(content: str) -> tuple[str, TextFormat]:
     """Normalize file text to LF for matching while retaining original formatting."""
     newline = _detect_dominant_newline(content)
@@ -320,10 +372,12 @@ def _detect_dominant_newline(content: str) -> str:
 
 
 # ===== Middleware and tool wiring =====
-class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]):
+class PatchFilesystemMiddleware(
+    AgentMiddleware[PatchFilesystemState, ContextT, ResponseT]
+):
     """Filesystem middleware that replaces `edit_file` with `apply_patch`."""
 
-    state_schema = FilesystemState
+    state_schema = PatchFilesystemState
 
     def __init__(
         self,
@@ -396,7 +450,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
 
         def sync_execute(
             command: Annotated[str, "Shell command to execute in sandbox."],
-            runtime: ToolRuntime[None, FilesystemState],
+            runtime: ToolRuntime[None, PatchFilesystemState],
             timeout: Annotated[int | None, "Optional timeout seconds."] = None,
         ) -> str:
             violation = self._validate_execute_command(command)
@@ -427,7 +481,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
 
         async def async_execute(
             command: Annotated[str, "Shell command to execute in sandbox."],
-            runtime: ToolRuntime[None, FilesystemState],
+            runtime: ToolRuntime[None, PatchFilesystemState],
             timeout: Annotated[int | None, "Optional timeout seconds."] = None,
         ) -> str:
             violation = self._validate_execute_command(command)
@@ -480,7 +534,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                     "Paths must be relative and are resolved from `/workspace`."
                 ),
             ],
-            runtime: ToolRuntime[None, FilesystemState],
+            runtime: ToolRuntime[None, PatchFilesystemState],
             dry_run: Annotated[
                 bool,
                 "Validate patch match/applicability only; do not write files.",
@@ -522,7 +576,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                     "Paths must be relative and are resolved from `/workspace`."
                 ),
             ],
-            runtime: ToolRuntime[None, FilesystemState],
+            runtime: ToolRuntime[None, PatchFilesystemState],
             dry_run: Annotated[
                 bool,
                 "Validate patch match/applicability only; do not write files.",
@@ -602,7 +656,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 list[dict[str, Any]],
                 "Ordered plan items with `step` and `status`.",
             ],
-            runtime: ToolRuntime[None, FilesystemState],
+            runtime: ToolRuntime[None, PatchFilesystemState],
             explanation: Annotated[
                 str | None,
                 "Optional explanation for plan update.",
@@ -657,7 +711,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
                 list[dict[str, Any]],
                 "Ordered plan items with `step` and `status`.",
             ],
-            runtime: ToolRuntime[None, FilesystemState],
+            runtime: ToolRuntime[None, PatchFilesystemState],
             explanation: Annotated[
                 str | None,
                 "Optional explanation for plan update.",
@@ -792,8 +846,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
 
         hunks = _compute_diff_hunks(before_text, after_text)
         truncated_hunks = hunks[:_MAX_HUNKS_PER_FILE]
-        delta_added = sum(hunk["new_count"] for hunk in hunks)
-        delta_removed = sum(hunk["old_count"] for hunk in hunks)
+        delta_added, delta_removed = _compute_line_change_counts(
+            before_text, after_text
+        )
         return {
             "action": action.action,
             "file_path": action.path.removeprefix("/workspace/"),
@@ -812,7 +867,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         *,
         file_diff: dict[str, Any],
         action: PatchCommitAction,
-        runtime_state: dict[str, Any] | None,
+        runtime_state: PatchFilesystemState | None,
         persist_state: bool,
     ) -> dict[str, Any]:
         if runtime_state is None:
@@ -860,9 +915,9 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         net_added = file_diff.get("delta_added", 0)
         net_removed = file_diff.get("delta_removed", 0)
         if not partial:
-            net_hunks = _compute_diff_hunks(baseline_text, current_text)
-            net_added = sum(hunk["new_count"] for hunk in net_hunks)
-            net_removed = sum(hunk["old_count"] for hunk in net_hunks)
+            net_added, net_removed = _compute_line_change_counts(
+                baseline_text, current_text
+            )
 
         file_diff["file_version"] = version if version > 0 else 1
         file_diff["net_added"] = net_added
@@ -906,7 +961,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         patch_content: str,
         *,
         dry_run: bool = False,
-        runtime_state: dict[str, Any] | None = None,
+        runtime_state: PatchFilesystemState | None = None,
     ) -> str:
         # Main flow:
         # 1) parse patch sections
@@ -1272,7 +1327,7 @@ class PatchFilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, Respo
         patch_content: str,
         *,
         dry_run: bool = False,
-        runtime_state: dict[str, Any] | None = None,
+        runtime_state: PatchFilesystemState | None = None,
     ) -> str:
         # Async variant mirrors _apply_patch_sync to keep behavior consistent.
         fallbacks: list[str] = []

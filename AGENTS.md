@@ -71,6 +71,10 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-13（服务重启后的线程运行态自动回收）：
+  - `app/main.py` 新增启动期恢复逻辑：服务启动时自动扫描遗留的 `pending/running` run 与 `busy` 线程，统一回收为 `interrupted` / `idle`，避免服务重启后线程永久卡住且无法重新发起任务。
+  - 对 `sandbox_bootstrap` 元数据增加重启兜底收敛：若线程初始化状态仍停留在 `running`，会自动改写为 `error`，补充“服务重启中断”的日志与事件，便于前端和排障接口感知真实状态。
+  - 新增回归测试 `tests/test_app_main_recovery.py`，覆盖 run/thread/bootstrap 状态恢复链路；并兼容数据库尚未初始化的启动场景，避免 `TestClient` 或轻量启动路径直接失败。
 - 2026-03-11（build_app_agent_v3 apply_patch 严格失败与格式保真）：
   - `build_app_agent_v3/patch_filesystem_middleware.py` 移除 `SEARCH` 未命中后的 best-effort 降级写回逻辑；未精确匹配、目标不存在、目标已存在、路径非法、`Move to` 目标冲突等场景统一返回结构化错误，不再偷偷修改文件。
   - 文本写回链路新增格式保真：内部统一按 LF 匹配，外部保留原文件换行风格与末尾换行；混合换行文件直接报错，不做自动规范化。

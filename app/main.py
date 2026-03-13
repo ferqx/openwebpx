@@ -4,13 +4,17 @@ import os
 import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from typing import Any
 
 from aegra_api.core import orm as aegra_orm
 from aegra_api.core.auth_deps import require_auth
 from aegra_api.core.database import db_manager
+from aegra_api.core.orm import Run as RunORM
+from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.settings import settings
 from fastapi import Depends, FastAPI
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -26,6 +30,9 @@ logger = logging.getLogger(__name__)
 USE_SQLALCHEMY_NULLPOOL = os.getenv(
     "OPENWEBPX_SQLALCHEMY_USE_NULLPOOL", "true"
 ).strip().lower() not in {"0", "false", "no"}
+BOOTSTRAP_METADATA_KEY = "sandbox_bootstrap"
+BOOTSTRAP_LOG_LIMIT = 80
+BOOTSTRAP_EVENT_LIMIT = 400
 
 
 @asynccontextmanager
@@ -34,11 +41,159 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     aegra_orm.async_session_maker = None
     _install_loop_safe_session_maker_patch()
     _install_langgraph_missing_graph_fallback_patch()
+    await _recover_interrupted_runtime_state()
     yield
     aegra_orm.async_session_maker = None
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _utc_now_iso_z() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _append_bootstrap_restart_log(
+    state: dict[str, Any],
+    *,
+    now_iso: str,
+    message: str,
+) -> None:
+    logs = state.get("logs")
+    if not isinstance(logs, list):
+        logs = []
+    logs.append(
+        {
+            "timestamp": now_iso,
+            "level": "error",
+            "message": message,
+        }
+    )
+    state["logs"] = logs[-BOOTSTRAP_LOG_LIMIT:]
+
+    current_seq = state.get("event_seq")
+    next_seq = int(current_seq) + 1 if isinstance(current_seq, int) else 1
+    state["event_seq"] = next_seq
+
+    events = state.get("events")
+    if not isinstance(events, list):
+        events = []
+    events.append(
+        {
+            "seq": next_seq,
+            "type": "log",
+            "timestamp": now_iso,
+            "level": "error",
+            "message": message,
+        }
+    )
+    state["events"] = events[-BOOTSTRAP_EVENT_LIMIT:]
+    state["updated_at"] = now_iso
+
+
+def _recover_thread_metadata_after_restart(
+    metadata: Any,
+    *,
+    now_iso: str,
+) -> tuple[dict[str, Any], bool]:
+    next_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+
+    raw_state = next_metadata.get(BOOTSTRAP_METADATA_KEY)
+    if not isinstance(raw_state, dict):
+        return next_metadata, False
+
+    status = raw_state.get("status")
+    if status != "running":
+        return next_metadata, False
+
+    next_state = dict(raw_state)
+    next_state["status"] = "error"
+    next_state["error"] = "服务重启导致初始化任务中断，请重新触发。"
+    next_state["finished_at"] = now_iso
+    next_state["updated_at"] = now_iso
+
+    run_status = next_state.get("run_status")
+    if not isinstance(run_status, str) or run_status in {"pending", "running"}:
+        next_state["run_status"] = "interrupted"
+
+    steps = next_state.get("steps")
+    if isinstance(steps, list):
+        normalized_steps: list[dict[str, Any]] = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            next_step = dict(step)
+            if next_step.get("status") == "running":
+                next_step["status"] = "error"
+                next_step.setdefault("detail", "服务重启中断")
+            normalized_steps.append(next_step)
+        next_state["steps"] = normalized_steps
+
+    _append_bootstrap_restart_log(
+        next_state,
+        now_iso=now_iso,
+        message="后台初始化任务因服务重启中断，状态已自动回收。",
+    )
+    next_metadata[BOOTSTRAP_METADATA_KEY] = next_state
+    return next_metadata, True
+
+
+async def _recover_interrupted_runtime_state() -> None:
+    try:
+        maker = aegra_orm._get_session_maker()
+    except RuntimeError as exc:
+        if "Database not initialized" in str(exc):
+            logger.info(
+                "Skipping stranded runtime recovery because database is not initialized yet."
+            )
+            return
+        raise
+    now = datetime.now(UTC)
+    now_iso = now.isoformat().replace("+00:00", "Z")
+
+    async with maker() as session:
+        pending_runs = (
+            await session.scalars(
+                select(RunORM).where(RunORM.status.in_(["pending", "running"]))
+            )
+        ).all()
+        busy_threads = (
+            await session.scalars(select(ThreadORM).where(ThreadORM.status == "busy"))
+        ).all()
+
+        recovered_runs = 0
+        recovered_threads = 0
+
+        for run in pending_runs:
+            run.status = "interrupted"
+            run.updated_at = now
+            run.error_message = (
+                "Run interrupted because the service restarted before execution "
+                "finished. Please retry the thread."
+            )
+            recovered_runs += 1
+
+        for thread in busy_threads:
+            thread.status = "idle"
+            thread.updated_at = now
+
+            next_metadata, metadata_changed = _recover_thread_metadata_after_restart(
+                getattr(thread, "metadata_json", None),
+                now_iso=now_iso,
+            )
+            if metadata_changed:
+                thread.metadata_json = next_metadata
+            recovered_threads += 1
+
+        if not recovered_runs and not recovered_threads:
+            return
+
+        await session.commit()
+        logger.warning(
+            "Recovered stranded runtime state after service restart: %s runs, %s threads.",
+            recovered_runs,
+            recovered_threads,
+        )
 
 
 def _install_loop_safe_session_maker_patch() -> None:
