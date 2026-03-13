@@ -23,6 +23,8 @@ AI 代理在本仓库工作时请遵循以下协议。
 - 遵循现有分层：API 层 / Service 层 / Core 基础设施层。
 - 保持导入、命名、类型标注、错误处理风格与现有代码一致。
 - 非必要不引入新依赖、不做大规模重构。
+- 进行重构/优化时，优先把“规则判断、状态归一化、命令构造、纯函数逻辑”下沉到 `app/services`；路由与中间件保留编排职责，不要把新逻辑继续堆回超大文件。
+- 重构期优先补“编排层测试 + service 单测”，再继续拆生产代码；若新边界没有测试保护，禁止继续深拆高风险主流程。
 - 涉及数据库变更时，使用 `scripts/migrate.py` 和 Alembic 流程。
 - 新增或修改的“非直观逻辑”必须添加简短注释，说明意图与约束（避免解释显而易见的语句）。
 
@@ -58,6 +60,8 @@ AI 代理在本仓库工作时请遵循以下协议。
 - 项目总览、启动、测试、迁移、规范：`CLAUDE.md`
 - Docker 快速启动：`README.md`（`docker compose up`）
 - 运行入口：`run_server.py`、`app/main.py`
+- 沙箱路由编排入口：`app/routers/sandbox.py`
+- 沙箱/容器服务层入口：`app/services/sandbox_*.py`、`app/services/docker_*.py`
 - 代码审查后端入口：`app/routers/code_review.py`（设置接口 + webhook 触发）
 - 迁移脚本：`scripts/migrate.py`
 - 测试目录：`tests/`
@@ -71,6 +75,11 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-13（sandbox / docker 服务化重构与编排层测试补强）：
+  - `app/routers/sandbox.py` 将 git 查询、bootstrap 状态归一化、graph 解析等规则逻辑下沉到 `app/services/sandbox_git.py` 与 `app/services/sandbox_bootstrap.py`，路由层收敛为请求编排与响应组装。
+  - `middleware/docker.py` 将 repo-sync 规则、runtime 规则、bootstrap 命令构造与执行 helper 逐步下沉到 `app/services/docker_repo.py`、`app/services/docker_runtime.py`、`app/services/docker_bootstrap.py`、`app/services/docker_executor.py`，中间件职责聚焦在容器生命周期、状态流转与 service 协调。
+  - `tests/test_docker_services.py` 新增 service 单测，覆盖 repo binding、runtime diagnostics、bootstrap command helper、sandbox helper 等纯规则层；`tests/test_docker_middleware.py` 同步补充编排层测试，覆盖 executor 接线与 runtime status 组装。
+  - 当前重构阶段的默认策略：继续优化时优先补测试，再拆剩余编排主流程；未补测试前，不建议继续深入重写 `app/main.py` 中的 monkey patch 或 `DockerMiddleware` 主生命周期逻辑。
 - 2026-03-13（服务重启后的线程运行态自动回收）：
   - `app/main.py` 新增启动期恢复逻辑：服务启动时自动扫描遗留的 `pending/running` run 与 `busy` 线程，统一回收为 `interrupted` / `idle`，避免服务重启后线程永久卡住且无法重新发起任务。
   - 对 `sandbox_bootstrap` 元数据增加重启兜底收敛：若线程初始化状态仍停留在 `running`，会自动改写为 `error`，补充“服务重启中断”的日志与事件，便于前端和排障接口感知真实状态。
