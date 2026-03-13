@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -18,6 +19,8 @@ import jwt
 from aegra_api.core.orm import _get_session_maker
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+logger = logging.getLogger(__name__)
 
 Role = Literal["admin", "premium", "developer", "reviewer", "free"]
 _ALLOWED_ROLES: set[str] = {"admin", "premium", "developer", "reviewer", "free"}
@@ -134,6 +137,11 @@ def _ensure_store_loaded() -> None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
+            logger.warning(
+                "Failed to load auth users file %s; falling back to empty in-memory store.",
+                path,
+                exc_info=True,
+            )
             payload = {}
 
         if isinstance(payload, dict):
@@ -562,6 +570,11 @@ async def register_user(
         except (SQLAlchemyError, RuntimeError) as exc:
             if not _file_fallback_enabled():
                 raise ValueError("用户数据库不可用，请稍后重试") from exc
+            logger.warning(
+                "Auth DB unavailable during registration for %s; falling back to file store.",
+                identity,
+                exc_info=True,
+            )
 
     return _file_register_user(
         identity=identity,
@@ -581,6 +594,11 @@ async def authenticate_user(*, username: str, password: str) -> dict[str, Any]:
         except (SQLAlchemyError, RuntimeError) as exc:
             if not _file_fallback_enabled():
                 raise ValueError("用户数据库不可用，请稍后重试") from exc
+            logger.warning(
+                "Auth DB unavailable during login for %s; falling back to file store.",
+                identity,
+                exc_info=True,
+            )
             stored = None
         if stored:
             password_hash = stored.get("password_hash")
@@ -623,6 +641,11 @@ async def authenticate_user(*, username: str, password: str) -> dict[str, Any]:
             except (SQLAlchemyError, RuntimeError) as exc:
                 if not _file_fallback_enabled():
                     raise ValueError("用户数据库不可用，请稍后重试") from exc
+                logger.warning(
+                    "Auth DB unavailable while mirroring LDAP user %s; keeping login result without DB sync.",
+                    identity,
+                    exc_info=True,
+                )
         return _record_to_user_payload(ldap_record)
 
     if saw_local_user:

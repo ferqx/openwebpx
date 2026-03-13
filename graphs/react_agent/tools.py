@@ -7,7 +7,6 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.runtime import get_runtime
 from qdrant_client import QdrantClient, models
-
 from react_agent.context import Context
 from react_agent.utils import load_embedding_model
 

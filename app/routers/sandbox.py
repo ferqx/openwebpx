@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shlex
 from collections.abc import AsyncGenerator
 from contextlib import suppress
@@ -35,44 +34,43 @@ from aegra_api.services.langgraph_service import (
 from docker.errors import DockerException, NotFound
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
-from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backends.docker import DockerBackend
+from app.services.sandbox_bootstrap import (
+    append_bootstrap_log,
+    build_bootstrap_response,
+    can_destroy_container_for_bootstrap_reset,
+    default_bootstrap_steps,
+    normalize_bootstrap_steps,
+    normalize_stream_mode,
+    persist_bootstrap_state,
+    read_thread_and_bootstrap_state,
+    snapshot_user_payload,
+    utc_now_iso_z,
+)
+from app.services.sandbox_git import (
+    GIT_DIFF_DEFAULT_MAX_CHARS,
+    GIT_DIFF_MAX_CHARS_LIMIT,
+    build_pending_git_changes_response,
+    extract_graph_id_from_metadata,
+    generate_commit_message_from_diff,
+    parse_git_porcelain,
+    resolve_thread_git_backend,
+    resolve_thread_graph_id,
+    run_git_command,
+    sanitize_commit_message,
+    truncate_text,
+)
 from middleware.docker import build_web_sandbox_docker_middleware
 
 if TYPE_CHECKING:
     from aegra_api.models.auth import User
 
 router = APIRouter()
-
-DEFAULT_TASK_GRAPH_ID = os.getenv(
-    "OPENWEBPX_DEFAULT_TASK_GRAPH_ID", "build_app_agent_v3"
-)
-BOOTSTRAP_METADATA_KEY = "sandbox_bootstrap"
-BOOTSTRAP_LOG_LIMIT = 80
-BOOTSTRAP_EVENT_LIMIT = 400
-BOOTSTRAP_DEFAULT_STREAM_MODE: list[str] = ["messages-tuple"]
 BOOTSTRAP_TASKS: dict[str, asyncio.Task[None]] = {}
-COMMIT_MESSAGE_MODEL_PROVIDER = os.getenv(
-    "OPENWEBPX_COMMIT_MESSAGE_MODEL_PROVIDER", "openai"
-)
-COMMIT_MESSAGE_MODEL_NAME = os.getenv(
-    "OPENWEBPX_COMMIT_MESSAGE_MODEL_NAME", "deepseek-chat"
-)
-_raw_git_diff_default_max_chars = os.getenv(
-    "OPENWEBPX_GIT_DIFF_DEFAULT_MAX_CHARS", "0"
-).strip()
-try:
-    GIT_DIFF_DEFAULT_MAX_CHARS = int(_raw_git_diff_default_max_chars)
-except ValueError:
-    GIT_DIFF_DEFAULT_MAX_CHARS = 0
-GIT_DIFF_MAX_CHARS_LIMIT = 2_000_000
-GIT_DIFF_MODEL_MAX_CHARS = 12_000
 
 
 def _cancel_async_task_safely(task: asyncio.Task[Any] | Any) -> bool:
@@ -131,11 +129,6 @@ class SandboxThreadCommitRequest(BaseModel):
         default=False,
         description="当 message 为空时，是否根据 staged diff 生成 commit message。",
     )
-
-
-def _utc_now_iso_z() -> str:
-    """返回 UTC ISO 时间戳（以 Z 结尾）。"""
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _build_log_excerpt(
@@ -241,586 +234,11 @@ def _pick_preview_url(service_status: dict[str, Any] | None) -> str | None:
     return preview_urls[0]
 
 
-def _extract_graph_id_from_metadata(metadata: dict[str, Any] | None) -> str | None:
-    """从线程 metadata 中提取 graph_id。"""
-    if not isinstance(metadata, dict):
-        return None
-
-    candidates = [
-        metadata.get("graph_id"),
-        metadata.get("graphId"),
-        metadata.get("assistant_id"),
-        metadata.get("assistantId"),
-    ]
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return None
-
-
-def _truncate_text(value: str, *, max_chars: int) -> tuple[str, bool]:
-    if max_chars <= 0:
-        return value, False
-    if len(value) <= max_chars:
-        return value, False
-    return value[:max_chars], True
-
-
-def _coerce_model_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content.strip()
-
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str) and item.strip():
-                parts.append(item.strip())
-                continue
-            if isinstance(item, dict):
-                text_value = item.get("text")
-                if isinstance(text_value, str) and text_value.strip():
-                    parts.append(text_value.strip())
-        return "\n".join(parts).strip()
-
-    return ""
-
-
-def _sanitize_commit_message(value: str) -> str:
-    # git commit subject 保持单行，避免把多段内容误注入 shell。
-    line = value.replace("\r", "\n").split("\n", 1)[0].strip()
-    line = line.strip("`").strip("\"'").strip()
-    return line[:200].strip()
-
-
-def _parse_git_porcelain_line(line: str) -> dict[str, Any] | None:
-    if len(line) < 3:
-        return None
-    index_status = line[0]
-    worktree_status = line[1]
-    path_raw = line[3:].strip()
-    if not path_raw:
-        return None
-
-    old_path: str | None = None
-    path = path_raw
-    if " -> " in path_raw:
-        old_path, path = path_raw.split(" -> ", 1)
-        old_path = old_path.strip() or None
-        path = path.strip()
-
-    status = f"{index_status}{worktree_status}"
-    is_staged = index_status not in {" ", "?"}
-    is_unstaged = worktree_status != " " or status == "??"
-    return {
-        "status": status,
-        "index_status": index_status,
-        "worktree_status": worktree_status,
-        "path": path,
-        "old_path": old_path,
-        "is_staged": is_staged,
-        "is_unstaged": is_unstaged,
-    }
-
-
-def _parse_git_porcelain(output: str) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    for raw_line in output.splitlines():
-        line = raw_line.strip("\n")
-        if not line:
-            continue
-        parsed = _parse_git_porcelain_line(line)
-        if parsed is not None:
-            entries.append(parsed)
-    return entries
-
-
-async def _resolve_thread_git_backend(
-    *,
-    session: AsyncSession,
-    thread_id: str,
-    user: User,
-) -> tuple[DockerBackend, str]:
-    stmt = select(ThreadORM).where(
-        ThreadORM.thread_id == thread_id,
-        ThreadORM.user_id == user.identity,
-    )
-    thread = await session.scalar(stmt)
-    if not thread:
-        raise HTTPException(404, f"Thread '{thread_id}' not found")
-
-    graph_id = await _resolve_thread_graph_id(session, thread=thread)
-    config_dict = create_thread_config(thread_id, user, {})
-    configurable = config_dict.get("configurable", {})
-    if not isinstance(configurable, dict):
-        configurable = {}
-
-    config = RunnableConfig(configurable=configurable)
-    langgraph_service = get_langgraph_service()
-    try:
-        async with langgraph_service.get_graph(graph_id) as agent:
-            snapshot = await agent.aget_state(config, subgraphs=False)
-    except Exception as exc:
-        raise HTTPException(
-            500, f"Failed to load sandbox state for thread '{thread_id}': {exc}"
-        ) from exc
-
-    values = snapshot.values if snapshot and isinstance(snapshot.values, dict) else {}
-    if not isinstance(values, dict):
-        values = {}
-    if not values:
-        raise HTTPException(
-            409,
-            "Sandbox runtime state is empty. Please initialize the thread environment first.",
-        )
-
-    runtime_proxy = SimpleNamespace(
-        state=values,
-        config={"configurable": configurable},
-        store=None,
-    )
-    backend = DockerBackend(runtime=runtime_proxy, workdir="/workspace")
-    await _ensure_backend_container_running(backend)
-    return backend, graph_id
-
-
-async def _ensure_backend_container_running(backend: DockerBackend) -> None:
-    def _ensure_running() -> str:
-        container = backend.container
-        container.reload()
-        current_status = str(getattr(container, "status", "")).strip().lower()
-        if current_status != "running":
-            container.start()
-            container.reload()
-            current_status = str(getattr(container, "status", "")).strip().lower()
-        return current_status
-
-    try:
-        status = await asyncio.to_thread(_ensure_running)
-    except Exception as exc:
-        raise HTTPException(
-            409,
-            f"Sandbox container is unavailable for git operations: {exc}",
-        ) from exc
-
-    if status != "running":
-        raise HTTPException(
-            409,
-            "Sandbox container is not running and could not be started.",
-        )
-
-
-async def _run_git_command(
-    backend: DockerBackend,
-    command: str,
-    *,
-    detail: str,
-    allow_nonzero_exit: bool = False,
-) -> tuple[int, str]:
-    result = await backend.aexecute(command)
-    exit_code = int(getattr(result, "exit_code", 1))
-    output = str(getattr(result, "output", "") or "")
-    if exit_code != 0 and not allow_nonzero_exit:
-        excerpt, _ = _truncate_text(output.strip(), max_chars=800)
-        raise HTTPException(
-            409,
-            f"{detail} failed (exit_code={exit_code}). {excerpt or 'no output'}",
-        )
-    return exit_code, output
-
-
-async def _generate_commit_message_from_diff(staged_diff: str) -> str:
-    diff_excerpt, _ = _truncate_text(staged_diff, max_chars=GIT_DIFF_MODEL_MAX_CHARS)
-    if not diff_excerpt.strip():
-        raise HTTPException(
-            409, "Cannot generate commit message from empty staged diff."
-        )
-
-    model = init_chat_model(
-        model_provider=COMMIT_MESSAGE_MODEL_PROVIDER,
-        model=COMMIT_MESSAGE_MODEL_NAME,
-        temperature=0.1,
-    )
-    response = await model.ainvoke(
-        [
-            SystemMessage(
-                content=(
-                    "You generate concise git commit subjects. "
-                    "Return exactly one line, plain text, no quotes, no markdown."
-                )
-            ),
-            HumanMessage(
-                content=(
-                    "Based on this staged git diff, generate a commit message subject "
-                    "in Conventional Commits style (max 72 chars preferred):\n\n"
-                    f"{diff_excerpt}"
-                )
-            ),
-        ]
-    )
-    raw_text = _coerce_model_text(getattr(response, "content", ""))
-    message = _sanitize_commit_message(raw_text)
-    if not message:
-        raise HTTPException(500, "Model returned empty commit message.")
-    return message
-
-
-async def _resolve_thread_graph_id(
-    session: AsyncSession,
-    *,
-    thread: ThreadORM,
-) -> str:
-    """解析线程 graph_id；兼容旧线程并在缺失时回退到默认值。"""
-
-    metadata = thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
-    graph_id = _extract_graph_id_from_metadata(metadata)
-    if graph_id:
-        return graph_id
-
-    latest_assistant_id_stmt = (
-        select(RunORM.assistant_id)
-        .where(RunORM.thread_id == thread.thread_id)
-        .order_by(RunORM.created_at.desc())
-        .limit(1)
-    )
-    latest_assistant_id = await session.scalar(latest_assistant_id_stmt)
-    if isinstance(latest_assistant_id, str) and latest_assistant_id.strip():
-        return latest_assistant_id.strip()
-
-    return DEFAULT_TASK_GRAPH_ID
-
-
-def _default_bootstrap_steps() -> list[dict[str, Any]]:
-    return [
-        {"key": "container", "title": "容器创建", "status": "pending"},
-        {"key": "repo", "title": "拉取代码", "status": "pending"},
-        {"key": "bootstrap", "title": "下载依赖并启动", "status": "pending"},
-    ]
-
-
-def _normalize_bootstrap_steps(raw_steps: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_steps, list):
-        return _default_bootstrap_steps()
-
-    normalized: list[dict[str, Any]] = []
-    allowed_status = {"pending", "running", "success", "error", "skipped"}
-    for raw_step in raw_steps:
-        if not isinstance(raw_step, dict):
-            continue
-        key = raw_step.get("key")
-        title = raw_step.get("title")
-        status = raw_step.get("status")
-        detail = raw_step.get("detail")
-        if not isinstance(key, str) or not key.strip():
-            continue
-        if not isinstance(title, str) or not title.strip():
-            continue
-        if not isinstance(status, str) or status not in allowed_status:
-            continue
-        step: dict[str, Any] = {
-            "key": key.strip(),
-            "title": title.strip(),
-            "status": status,
-        }
-        if isinstance(detail, str) and detail.strip():
-            step["detail"] = detail.strip()
-        normalized.append(step)
-
-    return normalized or _default_bootstrap_steps()
-
-
-def _normalize_stream_mode(stream_mode: str | list[str] | None) -> list[str]:
-    if isinstance(stream_mode, str):
-        value = stream_mode.strip()
-        return [value] if value else BOOTSTRAP_DEFAULT_STREAM_MODE.copy()
-    if isinstance(stream_mode, list):
-        normalized = [
-            item.strip()
-            for item in stream_mode
-            if isinstance(item, str) and item.strip()
-        ]
-        return normalized or BOOTSTRAP_DEFAULT_STREAM_MODE.copy()
-    return BOOTSTRAP_DEFAULT_STREAM_MODE.copy()
-
-
-def _can_destroy_container_for_bootstrap_reset(state: dict[str, Any]) -> bool:
-    steps = state.get("steps")
-    if not isinstance(steps, list):
-        return False
-
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        key = step.get("key")
-        status = step.get("status")
-        if key in {"container", "repo"} and status == "error":
-            return True
-    return False
-
-
-def _append_bootstrap_log(
-    state: dict[str, Any],
-    *,
-    level: str,
-    message: str,
-    step: str | None = None,
-) -> None:
-    logs = state.get("logs")
-    if not isinstance(logs, list):
-        logs = []
-    timestamp = _utc_now_iso_z()
-    log_entry: dict[str, Any] = {
-        "timestamp": timestamp,
-        "level": level,
-        "message": message,
-    }
-    if isinstance(step, str) and step.strip():
-        log_entry["step"] = step.strip()
-    logs.append(log_entry)
-    if len(logs) > BOOTSTRAP_LOG_LIMIT:
-        logs = logs[-BOOTSTRAP_LOG_LIMIT:]
-    state["logs"] = logs
-    state["updated_at"] = timestamp
-
-    current_seq = state.get("event_seq")
-    event_seq = int(current_seq) + 1 if isinstance(current_seq, int) else 1
-    state["event_seq"] = event_seq
-    events = state.get("events")
-    if not isinstance(events, list):
-        events = []
-    event_payload = {
-        "seq": event_seq,
-        "type": "log",
-        "timestamp": timestamp,
-        "level": level,
-        "message": message,
-    }
-    if isinstance(step, str) and step.strip():
-        event_payload["step"] = step.strip()
-    events.append(event_payload)
-    if len(events) > BOOTSTRAP_EVENT_LIMIT:
-        events = events[-BOOTSTRAP_EVENT_LIMIT:]
-    state["events"] = events
-
-
-def _normalize_bootstrap_state(raw_state: Any) -> dict[str, Any]:
-    if not isinstance(raw_state, dict):
-        return {
-            "status": "idle",
-            "steps": _default_bootstrap_steps(),
-            "logs": [],
-            "events": [],
-            "event_seq": 0,
-        }
-
-    status = raw_state.get("status")
-    if not isinstance(status, str) or not status.strip():
-        status = "idle"
-
-    normalized: dict[str, Any] = {
-        "status": status,
-        "steps": _normalize_bootstrap_steps(raw_state.get("steps")),
-    }
-
-    for key in (
-        "request_id",
-        "error",
-        "run_id",
-        "run_status",
-        "started_at",
-        "updated_at",
-        "finished_at",
-    ):
-        value = raw_state.get(key)
-        if isinstance(value, str) and value.strip():
-            normalized[key] = value.strip()
-
-    event_seq = raw_state.get("event_seq")
-    normalized["event_seq"] = (
-        event_seq if isinstance(event_seq, int) and event_seq >= 0 else 0
-    )
-
-    logs = raw_state.get("logs")
-    if isinstance(logs, list):
-        normalized_logs: list[dict[str, Any]] = []
-        for item in logs[-BOOTSTRAP_LOG_LIMIT:]:
-            if not isinstance(item, dict):
-                continue
-            timestamp = item.get("timestamp")
-            level = item.get("level")
-            message = item.get("message")
-            if not isinstance(message, str) or not message.strip():
-                continue
-            normalized_logs.append(
-                {
-                    "timestamp": timestamp if isinstance(timestamp, str) else None,
-                    "level": level if isinstance(level, str) else "info",
-                    "message": message.strip(),
-                }
-            )
-        normalized["logs"] = normalized_logs
-    else:
-        normalized["logs"] = []
-
-    events = raw_state.get("events")
-    if isinstance(events, list):
-        normalized_events: list[dict[str, Any]] = []
-        for item in events[-BOOTSTRAP_EVENT_LIMIT:]:
-            if not isinstance(item, dict):
-                continue
-            seq = item.get("seq")
-            message = item.get("message")
-            level = item.get("level")
-            if not isinstance(seq, int) or seq <= 0:
-                continue
-            if not isinstance(message, str) or not message.strip():
-                continue
-            event_payload: dict[str, Any] = {
-                "seq": seq,
-                "type": "log",
-                "timestamp": (
-                    item.get("timestamp")
-                    if isinstance(item.get("timestamp"), str)
-                    else None
-                ),
-                "level": level if isinstance(level, str) else "info",
-                "message": message.strip(),
-            }
-            step = item.get("step")
-            if isinstance(step, str) and step.strip():
-                event_payload["step"] = step.strip()
-            normalized_events.append(event_payload)
-        normalized["events"] = normalized_events
-        if normalized_events:
-            max_seq = max(
-                (event.get("seq", 0) for event in normalized_events), default=0
-            )
-            if normalized["event_seq"] < max_seq:
-                normalized["event_seq"] = max_seq
-    else:
-        normalized["events"] = []
-
-    return normalized
-
-
 def _is_runtime_state_initializing_error(exc: HTTPException) -> bool:
     detail = exc.detail
     if exc.status_code != 409 or not isinstance(detail, str):
         return False
     return detail.startswith("Sandbox runtime state is empty.")
-
-
-def _build_pending_git_changes_response(
-    *,
-    thread_id: str,
-    graph_id: str,
-    include_diff: bool,
-) -> dict[str, Any]:
-    return {
-        "thread_id": thread_id,
-        "graph_id": graph_id,
-        "files": [],
-        "count": 0,
-        "untracked_files": [],
-        "diff": "" if include_diff else None,
-        "diff_truncated": False,
-        "pending_initialization": True,
-        "timestamp": _utc_now_iso_z(),
-    }
-
-
-def _build_bootstrap_response(
-    *,
-    thread_id: str,
-    graph_id: str,
-    state: dict[str, Any],
-    accepted: bool | None = None,
-) -> dict[str, Any]:
-    response: dict[str, Any] = {
-        "thread_id": thread_id,
-        "graph_id": graph_id,
-        "status": state.get("status", "idle"),
-        "steps": state.get("steps") or _default_bootstrap_steps(),
-        "logs": state.get("logs") or [],
-        "event_seq": (
-            state.get("event_seq") if isinstance(state.get("event_seq"), int) else 0
-        ),
-        "error": state.get("error"),
-        "request_id": state.get("request_id"),
-        "run_id": state.get("run_id"),
-        "run_status": state.get("run_status"),
-        "started_at": state.get("started_at"),
-        "updated_at": state.get("updated_at"),
-        "finished_at": state.get("finished_at"),
-    }
-    if accepted is not None:
-        response["accepted"] = accepted
-    return response
-
-
-def _snapshot_user_payload(user: User) -> dict[str, Any]:
-    as_dict: Any = None
-    try:
-        as_dict = user.to_dict()
-    except Exception:
-        as_dict = None
-    if isinstance(as_dict, dict):
-        return as_dict
-
-    payload = {
-        "identity": user.identity,
-        "display_name": getattr(user, "display_name", None),
-        "permissions": getattr(user, "permissions", []),
-        "is_authenticated": getattr(user, "is_authenticated", True),
-    }
-    if hasattr(user, "role"):
-        payload["role"] = user.role
-    if hasattr(user, "team_id"):
-        payload["team_id"] = user.team_id
-    if hasattr(user, "email"):
-        payload["email"] = user.email
-    return payload
-
-
-async def _persist_bootstrap_state(
-    session: AsyncSession,
-    *,
-    thread: ThreadORM,
-    graph_id: str,
-    state: dict[str, Any],
-) -> None:
-    metadata = thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
-    metadata = dict(metadata)
-    if _extract_graph_id_from_metadata(metadata) is None:
-        metadata["graph_id"] = graph_id
-    metadata[BOOTSTRAP_METADATA_KEY] = state
-    thread.metadata_json = metadata
-    await session.commit()
-
-
-async def _read_thread_and_bootstrap_state(
-    session: AsyncSession,
-    *,
-    thread_id: str,
-    user_id: str,
-) -> tuple[ThreadORM | None, str, dict[str, Any], dict[str, Any]]:
-    stmt = select(ThreadORM).where(
-        ThreadORM.thread_id == thread_id,
-        ThreadORM.user_id == user_id,
-    )
-    thread = await session.scalar(stmt)
-    if not thread:
-        return None, DEFAULT_TASK_GRAPH_ID, {}, _normalize_bootstrap_state(None)
-
-    graph_id = await _resolve_thread_graph_id(session, thread=thread)
-    metadata = thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
-    metadata = dict(metadata)
-    if _extract_graph_id_from_metadata(metadata) is None:
-        metadata["graph_id"] = graph_id
-        thread.metadata_json = metadata
-        await session.commit()
-
-    bootstrap_state = _normalize_bootstrap_state(metadata.get(BOOTSTRAP_METADATA_KEY))
-    return thread, graph_id, metadata, bootstrap_state
 
 
 async def _run_bootstrap_task(
@@ -838,7 +256,7 @@ async def _run_bootstrap_task(
 
     try:
         async with session_maker() as session:
-            thread, _, _, state = await _read_thread_and_bootstrap_state(
+            thread, _, _, state = await read_thread_and_bootstrap_state(
                 session, thread_id=thread_id, user_id=user.identity
             )
             if not thread:
@@ -846,8 +264,8 @@ async def _run_bootstrap_task(
             if state.get("request_id") != request_id:
                 return
 
-            _append_bootstrap_log(state, level="info", message="开始初始化执行环境。")
-            await _persist_bootstrap_state(
+            append_bootstrap_log(state, level="info", message="开始初始化执行环境。")
+            await persist_bootstrap_state(
                 session, thread=thread, graph_id=graph_id, state=state
             )
 
@@ -866,7 +284,7 @@ async def _run_bootstrap_task(
                         _,
                         _,
                         progress_state,
-                    ) = await _read_thread_and_bootstrap_state(
+                    ) = await read_thread_and_bootstrap_state(
                         progress_session,
                         thread_id=thread_id,
                         user_id=user.identity,
@@ -877,14 +295,14 @@ async def _run_bootstrap_task(
                         return
 
                     for step_key, log_level, log_message in batch:
-                        _append_bootstrap_log(
+                        append_bootstrap_log(
                             progress_state,
                             level=log_level,
                             message=log_message,
                             step=step_key,
                         )
 
-                    await _persist_bootstrap_state(
+                    await persist_bootstrap_state(
                         progress_session,
                         thread=progress_thread,
                         graph_id=graph_id,
@@ -971,13 +389,13 @@ async def _run_bootstrap_task(
                 progress_flush_stop.set()
                 await progress_flusher
 
-            thread, _, _, state = await _read_thread_and_bootstrap_state(
+            thread, _, _, state = await read_thread_and_bootstrap_state(
                 session, thread_id=thread_id, user_id=user.identity
             )
             if not thread or state.get("request_id") != request_id:
                 return
 
-            state["steps"] = _normalize_bootstrap_steps(init_result.get("steps"))
+            state["steps"] = normalize_bootstrap_steps(init_result.get("steps"))
             init_success = bool(init_result.get("success"))
             init_error = init_result.get("error")
 
@@ -989,18 +407,18 @@ async def _run_bootstrap_task(
                 )
                 state["status"] = "error"
                 state["error"] = message_text
-                state["finished_at"] = _utc_now_iso_z()
-                _append_bootstrap_log(state, level="error", message=message_text)
-                await _persist_bootstrap_state(
+                state["finished_at"] = utc_now_iso_z()
+                append_bootstrap_log(state, level="error", message=message_text)
+                await persist_bootstrap_state(
                     session, thread=thread, graph_id=graph_id, state=state
                 )
                 return
 
-            _append_bootstrap_log(
+            append_bootstrap_log(
                 state, level="info", message="环境初始化完成，准备提交首条消息。"
             )
             state["error"] = None
-            await _persist_bootstrap_state(
+            await persist_bootstrap_state(
                 session, thread=thread, graph_id=graph_id, state=state
             )
 
@@ -1013,7 +431,7 @@ async def _run_bootstrap_task(
                 stream_mode=stream_mode,
             )
 
-            thread, _, _, state = await _read_thread_and_bootstrap_state(
+            thread, _, _, state = await read_thread_and_bootstrap_state(
                 session, thread_id=thread_id, user_id=user.identity
             )
             if not thread or state.get("request_id") != request_id:
@@ -1022,30 +440,30 @@ async def _run_bootstrap_task(
             state["status"] = "success"
             state["run_id"] = run.run_id
             state["run_status"] = run.status
-            state["finished_at"] = _utc_now_iso_z()
-            _append_bootstrap_log(
+            state["finished_at"] = utc_now_iso_z()
+            append_bootstrap_log(
                 state,
                 level="info",
                 message=f"首条消息已提交（run_id={run.run_id}）。",
             )
-            await _persist_bootstrap_state(
+            await persist_bootstrap_state(
                 session, thread=thread, graph_id=graph_id, state=state
             )
     except Exception as exc:
         async with session_maker() as session:
-            thread, _, _, state = await _read_thread_and_bootstrap_state(
+            thread, _, _, state = await read_thread_and_bootstrap_state(
                 session, thread_id=thread_id, user_id=user.identity
             )
             if thread and state.get("request_id") == request_id:
                 state["status"] = "error"
                 state["error"] = f"环境初始化任务异常：{exc}"
-                state["finished_at"] = _utc_now_iso_z()
-                _append_bootstrap_log(
+                state["finished_at"] = utc_now_iso_z()
+                append_bootstrap_log(
                     state,
                     level="error",
                     message=f"环境初始化任务异常：{exc}",
                 )
-                await _persist_bootstrap_state(
+                await persist_bootstrap_state(
                     session,
                     thread=thread,
                     graph_id=graph_id,
@@ -1230,7 +648,7 @@ async def get_sandbox_thread_git_unstaged_changes(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        backend, graph_id = await _resolve_thread_git_backend(
+        backend, graph_id = await resolve_thread_git_backend(
             session=session,
             thread_id=thread_id,
             user=user,
@@ -1245,22 +663,22 @@ async def get_sandbox_thread_git_unstaged_changes(
             )
             if thread is None:
                 raise exc
-            graph_id = await _resolve_thread_graph_id(
+            graph_id = await resolve_thread_graph_id(
                 session,
                 thread=thread,
             )
-            return _build_pending_git_changes_response(
+            return build_pending_git_changes_response(
                 thread_id=thread_id,
                 graph_id=graph_id,
                 include_diff=include_diff,
             )
         raise
-    _, status_output = await _run_git_command(
+    _, status_output = await run_git_command(
         backend,
         "git -C /workspace status --porcelain=1 --untracked-files=all",
         detail="read git status",
     )
-    entries = _parse_git_porcelain(status_output)
+    entries = parse_git_porcelain(status_output)
     unstaged_entries = [item for item in entries if item.get("is_unstaged")]
     untracked_files = [
         item.get("path")
@@ -1271,7 +689,7 @@ async def get_sandbox_thread_git_unstaged_changes(
     diff_text = ""
     diff_truncated = False
     if include_diff:
-        _, raw_diff = await _run_git_command(
+        _, raw_diff = await run_git_command(
             backend,
             "git -C /workspace diff --no-ext-diff",
             detail="read unstaged diff",
@@ -1279,7 +697,7 @@ async def get_sandbox_thread_git_unstaged_changes(
         merged_diff = raw_diff
         for file_path in untracked_files:
             quoted_file = shlex.quote(file_path)
-            _, untracked_diff = await _run_git_command(
+            _, untracked_diff = await run_git_command(
                 backend,
                 (
                     "git -C /workspace diff --no-index --no-ext-diff -- /dev/null "
@@ -1291,7 +709,7 @@ async def get_sandbox_thread_git_unstaged_changes(
             if untracked_diff.strip():
                 merged_diff = f"{merged_diff.rstrip()}\n{untracked_diff.lstrip()}\n"
 
-        diff_text, diff_truncated = _truncate_text(
+        diff_text, diff_truncated = truncate_text(
             merged_diff,
             max_chars=diff_max_chars,
         )
@@ -1304,7 +722,7 @@ async def get_sandbox_thread_git_unstaged_changes(
         "untracked_files": untracked_files,
         "diff": diff_text if include_diff else None,
         "diff_truncated": diff_truncated if include_diff else False,
-        "timestamp": _utc_now_iso_z(),
+        "timestamp": utc_now_iso_z(),
     }
 
 
@@ -1328,7 +746,7 @@ async def get_sandbox_thread_git_staged_changes(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        backend, graph_id = await _resolve_thread_git_backend(
+        backend, graph_id = await resolve_thread_git_backend(
             session=session,
             thread_id=thread_id,
             user=user,
@@ -1343,33 +761,33 @@ async def get_sandbox_thread_git_staged_changes(
             )
             if thread is None:
                 raise exc
-            graph_id = await _resolve_thread_graph_id(
+            graph_id = await resolve_thread_graph_id(
                 session,
                 thread=thread,
             )
-            return _build_pending_git_changes_response(
+            return build_pending_git_changes_response(
                 thread_id=thread_id,
                 graph_id=graph_id,
                 include_diff=include_diff,
             )
         raise
-    _, status_output = await _run_git_command(
+    _, status_output = await run_git_command(
         backend,
         "git -C /workspace status --porcelain=1 --untracked-files=all",
         detail="read git status",
     )
-    entries = _parse_git_porcelain(status_output)
+    entries = parse_git_porcelain(status_output)
     staged_entries = [item for item in entries if item.get("is_staged")]
 
     diff_text = ""
     diff_truncated = False
     if include_diff:
-        _, raw_diff = await _run_git_command(
+        _, raw_diff = await run_git_command(
             backend,
             "git -C /workspace diff --cached --no-ext-diff",
             detail="read staged diff",
         )
-        diff_text, diff_truncated = _truncate_text(raw_diff, max_chars=diff_max_chars)
+        diff_text, diff_truncated = truncate_text(raw_diff, max_chars=diff_max_chars)
 
     return {
         "thread_id": thread_id,
@@ -1378,7 +796,7 @@ async def get_sandbox_thread_git_staged_changes(
         "count": len(staged_entries),
         "diff": diff_text if include_diff else None,
         "diff_truncated": diff_truncated if include_diff else False,
-        "timestamp": _utc_now_iso_z(),
+        "timestamp": utc_now_iso_z(),
     }
 
 
@@ -1389,23 +807,23 @@ async def commit_sandbox_thread_git_changes(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    backend, graph_id = await _resolve_thread_git_backend(
+    backend, graph_id = await resolve_thread_git_backend(
         session=session,
         thread_id=thread_id,
         user=user,
     )
 
-    _, status_output = await _run_git_command(
+    _, status_output = await run_git_command(
         backend,
         "git -C /workspace status --porcelain=1 --untracked-files=all",
         detail="read git status",
     )
-    entries = _parse_git_porcelain(status_output)
+    entries = parse_git_porcelain(status_output)
     staged_entries = [item for item in entries if item.get("is_staged")]
     if not staged_entries:
         raise HTTPException(409, "No staged changes to commit.")
 
-    _, staged_diff = await _run_git_command(
+    _, staged_diff = await run_git_command(
         backend,
         "git -C /workspace diff --cached --no-ext-diff",
         detail="read staged diff",
@@ -1421,19 +839,19 @@ async def commit_sandbox_thread_git_changes(
                 400,
                 "Commit message is required when generate_message is false.",
             )
-        resolved_message = await _generate_commit_message_from_diff(staged_diff)
+        resolved_message = await generate_commit_message_from_diff(staged_diff)
         message_source = "model"
 
-    commit_message = _sanitize_commit_message(resolved_message)
+    commit_message = sanitize_commit_message(resolved_message)
     if not commit_message:
         raise HTTPException(400, "Commit message cannot be empty.")
 
-    _, commit_output = await _run_git_command(
+    _, commit_output = await run_git_command(
         backend,
         f"git -C /workspace commit -m {shlex.quote(commit_message)}",
         detail="git commit",
     )
-    _, commit_id_output = await _run_git_command(
+    _, commit_id_output = await run_git_command(
         backend,
         "git -C /workspace rev-parse HEAD",
         detail="read commit id",
@@ -1443,7 +861,7 @@ async def commit_sandbox_thread_git_changes(
     if not commit_id:
         raise HTTPException(500, "Commit succeeded but failed to read commit id.")
 
-    _, head_subject_output = await _run_git_command(
+    _, head_subject_output = await run_git_command(
         backend,
         "git -C /workspace show -s --format=%s HEAD",
         detail="read commit subject",
@@ -1452,18 +870,18 @@ async def commit_sandbox_thread_git_changes(
         head_subject_output.strip().splitlines()[0] if head_subject_output else ""
     )
 
-    _, latest_status_output = await _run_git_command(
+    _, latest_status_output = await run_git_command(
         backend,
         "git -C /workspace status --porcelain=1 --untracked-files=all",
         detail="read git status",
     )
-    latest_entries = _parse_git_porcelain(latest_status_output)
+    latest_entries = parse_git_porcelain(latest_status_output)
     staged_remaining = len([item for item in latest_entries if item.get("is_staged")])
     unstaged_remaining = len(
         [item for item in latest_entries if item.get("is_unstaged")]
     )
 
-    commit_output_excerpt, commit_output_truncated = _truncate_text(
+    commit_output_excerpt, commit_output_truncated = truncate_text(
         commit_output,
         max_chars=4_000,
     )
@@ -1478,7 +896,7 @@ async def commit_sandbox_thread_git_changes(
         "unstaged_count_after_commit": unstaged_remaining,
         "commit_output": commit_output_excerpt,
         "commit_output_truncated": commit_output_truncated,
-        "timestamp": _utc_now_iso_z(),
+        "timestamp": utc_now_iso_z(),
     }
 
 
@@ -1514,9 +932,9 @@ async def get_sandbox_runtime(
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    graph_id = await _resolve_thread_graph_id(session, thread=thread)
+    graph_id = await resolve_thread_graph_id(session, thread=thread)
     metadata = thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
-    if _extract_graph_id_from_metadata(metadata) is None:
+    if extract_graph_id_from_metadata(metadata) is None:
         metadata = {**metadata, "graph_id": graph_id}
         thread.metadata_json = metadata
         await session.commit()
@@ -1576,7 +994,7 @@ async def get_sandbox_runtime(
         response["container_details"] = _get_safe_container_details(
             response["container_id"]
         )
-        response["runtime_timestamp"] = _utc_now_iso_z()
+        response["runtime_timestamp"] = utc_now_iso_z()
 
     if include_state_values:
         response["state_values"] = values
@@ -1599,9 +1017,9 @@ async def initialize_sandbox_thread_environment(
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    graph_id = await _resolve_thread_graph_id(session, thread=thread)
+    graph_id = await resolve_thread_graph_id(session, thread=thread)
     metadata = thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
-    if _extract_graph_id_from_metadata(metadata) is None:
+    if extract_graph_id_from_metadata(metadata) is None:
         metadata = {**metadata, "graph_id": graph_id}
         thread.metadata_json = metadata
         await session.commit()
@@ -1656,7 +1074,7 @@ async def initialize_sandbox_thread_environment(
         "steps": init_result.get("steps") or [],
         "container_id": init_result.get("container_id"),
         "service_status": init_result.get("service_status"),
-        "runtime_timestamp": _utc_now_iso_z(),
+        "runtime_timestamp": utc_now_iso_z(),
     }
 
 
@@ -1669,7 +1087,7 @@ async def start_sandbox_thread_bootstrap(
 ) -> dict[str, Any]:
     """异步初始化线程环境并由后端自动提交首条消息。"""
 
-    thread, graph_id, _, bootstrap_state = await _read_thread_and_bootstrap_state(
+    thread, graph_id, _, bootstrap_state = await read_thread_and_bootstrap_state(
         session,
         thread_id=thread_id,
         user_id=user.identity,
@@ -1683,7 +1101,7 @@ async def start_sandbox_thread_bootstrap(
         active_task = None
 
     if not payload.force and active_task is not None:
-        return _build_bootstrap_response(
+        return build_bootstrap_response(
             thread_id=thread_id,
             graph_id=graph_id,
             state=bootstrap_state,
@@ -1691,7 +1109,7 @@ async def start_sandbox_thread_bootstrap(
         )
 
     if not payload.force and bootstrap_state.get("status") == "running":
-        return _build_bootstrap_response(
+        return build_bootstrap_response(
             thread_id=thread_id,
             graph_id=graph_id,
             state=bootstrap_state,
@@ -1699,12 +1117,12 @@ async def start_sandbox_thread_bootstrap(
         )
 
     request_id = str(uuid4())
-    normalized_stream_mode = _normalize_stream_mode(payload.stream_mode)
-    now = _utc_now_iso_z()
+    normalized_stream_mode = normalize_stream_mode(payload.stream_mode)
+    now = utc_now_iso_z()
     next_state: dict[str, Any] = {
         "request_id": request_id,
         "status": "running",
-        "steps": _default_bootstrap_steps(),
+        "steps": default_bootstrap_steps(),
         "logs": [],
         "events": [],
         "event_seq": 0,
@@ -1715,8 +1133,8 @@ async def start_sandbox_thread_bootstrap(
         "updated_at": now,
         "finished_at": None,
     }
-    _append_bootstrap_log(next_state, level="info", message="已接收环境初始化任务。")
-    await _persist_bootstrap_state(
+    append_bootstrap_log(next_state, level="info", message="已接收环境初始化任务。")
+    await persist_bootstrap_state(
         session, thread=thread, graph_id=graph_id, state=next_state
     )
 
@@ -1730,13 +1148,13 @@ async def start_sandbox_thread_bootstrap(
             request_id=request_id,
             message=payload.message.strip(),
             stream_mode=normalized_stream_mode,
-            user_payload=_snapshot_user_payload(user),
+            user_payload=snapshot_user_payload(user),
         )
     )
     BOOTSTRAP_TASKS[thread_id] = task
     task.add_done_callback(lambda _task: BOOTSTRAP_TASKS.pop(thread_id, None))
 
-    return _build_bootstrap_response(
+    return build_bootstrap_response(
         thread_id=thread_id,
         graph_id=graph_id,
         state=next_state,
@@ -1752,7 +1170,7 @@ async def get_sandbox_thread_bootstrap_status(
 ) -> dict[str, Any]:
     """获取线程环境初始化任务状态（支持前端重连恢复）。"""
 
-    thread, graph_id, _, bootstrap_state = await _read_thread_and_bootstrap_state(
+    thread, graph_id, _, bootstrap_state = await read_thread_and_bootstrap_state(
         session,
         thread_id=thread_id,
         user_id=user.identity,
@@ -1768,13 +1186,13 @@ async def get_sandbox_thread_bootstrap_status(
     if bootstrap_state.get("status") == "running" and active_task is None:
         bootstrap_state["status"] = "error"
         bootstrap_state["error"] = "环境初始化任务已中断，请重试。"
-        bootstrap_state["finished_at"] = _utc_now_iso_z()
-        _append_bootstrap_log(
+        bootstrap_state["finished_at"] = utc_now_iso_z()
+        append_bootstrap_log(
             bootstrap_state,
             level="error",
             message="后台任务不存在，可能因服务重启中断。",
         )
-        await _persist_bootstrap_state(
+        await persist_bootstrap_state(
             session,
             thread=thread,
             graph_id=graph_id,
@@ -1792,7 +1210,7 @@ async def get_sandbox_thread_bootstrap_status(
         if isinstance(run_status, str) and run_status.strip():
             bootstrap_state["run_status"] = run_status
 
-    return _build_bootstrap_response(
+    return build_bootstrap_response(
         thread_id=thread_id,
         graph_id=graph_id,
         state=bootstrap_state,
@@ -1811,7 +1229,7 @@ async def cancel_sandbox_thread(
 ) -> dict[str, Any]:
     """按线程维度取消活跃任务，用于 run_id 丢失时的兜底恢复。"""
 
-    thread, graph_id, _, bootstrap_state = await _read_thread_and_bootstrap_state(
+    thread, graph_id, _, bootstrap_state = await read_thread_and_bootstrap_state(
         session,
         thread_id=thread_id,
         user_id=user.identity,
@@ -1836,7 +1254,7 @@ async def cancel_sandbox_thread(
         if hasattr(run, "error_message"):
             run.error_message = (
                 "Interrupted by thread-level cancel endpoint "
-                f"(action={action}, at={_utc_now_iso_z()})."
+                f"(action={action}, at={utc_now_iso_z()})."
             )
         cancelled_run_ids.append(run.run_id)
 
@@ -1854,16 +1272,16 @@ async def cancel_sandbox_thread(
         bootstrap_task_cancelled = _cancel_async_task_safely(active_task)
 
     if bootstrap_state.get("status") == "running":
-        now = _utc_now_iso_z()
+        now = utc_now_iso_z()
         bootstrap_state["status"] = "idle"
         bootstrap_state["error"] = "已通过线程级取消接口中断当前初始化任务。"
         bootstrap_state["finished_at"] = now
-        _append_bootstrap_log(
+        append_bootstrap_log(
             bootstrap_state,
             level="warning",
             message=f"收到线程取消请求，action={action}，已中断初始化任务。",
         )
-        await _persist_bootstrap_state(
+        await persist_bootstrap_state(
             session,
             thread=thread,
             graph_id=graph_id,
@@ -1883,7 +1301,7 @@ async def cancel_sandbox_thread(
         "cancel_signal_failures": cancel_signal_failures,
         "bootstrap_task_cancelled": bootstrap_task_cancelled,
         "thread_status": thread.status,
-        "timestamp": _utc_now_iso_z(),
+        "timestamp": utc_now_iso_z(),
     }
 
 
@@ -1896,7 +1314,7 @@ async def reset_sandbox_thread_bootstrap(
 ) -> dict[str, Any]:
     """重置线程环境初始化状态，可选销毁当前容器。"""
 
-    thread, graph_id, _, bootstrap_state = await _read_thread_and_bootstrap_state(
+    thread, graph_id, _, bootstrap_state = await read_thread_and_bootstrap_state(
         session,
         thread_id=thread_id,
         user_id=user.identity,
@@ -1904,7 +1322,7 @@ async def reset_sandbox_thread_bootstrap(
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    if payload.destroy_container and not _can_destroy_container_for_bootstrap_reset(
+    if payload.destroy_container and not can_destroy_container_for_bootstrap_reset(
         bootstrap_state
     ):
         raise HTTPException(
@@ -1916,10 +1334,10 @@ async def reset_sandbox_thread_bootstrap(
     if active_task is not None:
         _cancel_async_task_safely(active_task)
 
-    now = _utc_now_iso_z()
+    now = utc_now_iso_z()
     reset_state: dict[str, Any] = {
         "status": "idle",
-        "steps": _default_bootstrap_steps(),
+        "steps": default_bootstrap_steps(),
         "logs": [],
         "events": [],
         "event_seq": 0,
@@ -1931,12 +1349,12 @@ async def reset_sandbox_thread_bootstrap(
         "updated_at": now,
         "finished_at": now,
     }
-    _append_bootstrap_log(
+    append_bootstrap_log(
         reset_state,
         level="info",
         message="环境初始化已重置，可重新执行初始化。",
     )
-    await _persist_bootstrap_state(
+    await persist_bootstrap_state(
         session,
         thread=thread,
         graph_id=graph_id,
@@ -1976,12 +1394,12 @@ async def reset_sandbox_thread_bootstrap(
             reset_error = reset_result.get("error")
             if isinstance(reset_error, str) and reset_error.strip():
                 reset_state["error"] = reset_error.strip()
-                _append_bootstrap_log(
+                append_bootstrap_log(
                     reset_state,
                     level="error",
                     message=f"环境重置失败：{reset_error.strip()}",
                 )
-                await _persist_bootstrap_state(
+                await persist_bootstrap_state(
                     session,
                     thread=thread,
                     graph_id=graph_id,
@@ -1993,7 +1411,7 @@ async def reset_sandbox_thread_bootstrap(
             f"Failed to reset sandbox environment for thread '{thread_id}': {exc}",
         ) from exc
 
-    response = _build_bootstrap_response(
+    response = build_bootstrap_response(
         thread_id=thread_id,
         graph_id=graph_id,
         state=reset_state,
@@ -2035,7 +1453,7 @@ async def stream_sandbox_thread_bootstrap_status(
                     graph_id,
                     _,
                     bootstrap_state,
-                ) = await _read_thread_and_bootstrap_state(
+                ) = await read_thread_and_bootstrap_state(
                     stream_session,
                     thread_id=thread_id,
                     user_id=user.identity,
@@ -2065,7 +1483,7 @@ async def stream_sandbox_thread_bootstrap_status(
                     current_seq = seq
                     yield _format_sse_event("bootstrap_event", event)
 
-            snapshot = _build_bootstrap_response(
+            snapshot = build_bootstrap_response(
                 thread_id=thread_id,
                 graph_id=graph_id,
                 state=bootstrap_state,
@@ -2218,7 +1636,7 @@ async def get_sandbox_debug_bundle(
                 ]
             ),
             "has_runtime_diagnostic": bool(runtime.get("last_diagnostic_fingerprint")),
-            "timestamp": _utc_now_iso_z(),
+            "timestamp": utc_now_iso_z(),
         },
     }
 

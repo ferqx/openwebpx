@@ -415,6 +415,44 @@ async def _list_scm_token_rows_for_user(user_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in result.mappings().all()]
 
 
+async def _dedupe_scm_connections(
+    connections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Deduplicate by connection_key and keep the newest record."""
+    deduped: dict[str, dict[str, Any]] = {}
+    stale_cache_keys: list[str] = []
+
+    for connection in connections:
+        connection_key = connection.get("connection_key")
+        cache_key = connection.get("cache_key")
+        if not isinstance(connection_key, str) or not connection_key.strip():
+            continue
+        if not isinstance(cache_key, str) or not cache_key.strip():
+            continue
+
+        existing = deduped.get(connection_key)
+        if existing is None:
+            deduped[connection_key] = connection
+            continue
+
+        current_updated_at = _coerce_float(connection.get("updated_at")) or 0.0
+        existing_updated_at = _coerce_float(existing.get("updated_at")) or 0.0
+        if current_updated_at >= existing_updated_at:
+            stale_cache_keys.append(str(existing["cache_key"]))
+            deduped[connection_key] = connection
+        else:
+            stale_cache_keys.append(cache_key)
+
+    for cache_key in stale_cache_keys:
+        await _delete_scm_token_payload(cache_key)
+
+    return sorted(
+        deduped.values(),
+        key=lambda item: _coerce_float(item.get("updated_at")) or 0.0,
+        reverse=True,
+    )
+
+
 def _build_scm_connection_item(row: dict[str, Any]) -> dict[str, Any] | None:
     provider_raw = str(row.get("provider") or "").strip().lower()
     if provider_raw not in {"github", "gitlab"}:
@@ -1389,7 +1427,7 @@ async def list_scm_connections(request: Request = None) -> dict[str, Any]:
     user_id = _resolve_request_user_identity(request)
     rows = await _list_scm_token_rows_for_user(user_id)
 
-    connections: list[dict[str, Any]] = []
+    raw_connections: list[dict[str, Any]] = []
     for row in rows:
         connection = _build_scm_connection_item(row)
         if connection is None:
@@ -1400,11 +1438,13 @@ async def list_scm_connections(request: Request = None) -> dict[str, Any]:
         if isinstance(row.get("token_encrypted"), str) and not connection.get(
             "expired"
         ):
-            connections.append(connection)
+            raw_connections.append(connection)
             continue
 
         # token missing/corrupted/expired: keep entry but mark as expired.
-        connections.append(connection)
+        raw_connections.append(connection)
+
+    connections = await _dedupe_scm_connections(raw_connections)
 
     return {
         "connections": [

@@ -11,25 +11,66 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import shlex
 import threading
-import time
 from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import docker
-import httpx
 from docker.errors import DockerException, NotFound
 from docker.models.containers import Container
 from langchain.agents.middleware.types import AgentMiddleware, AgentState, hook_config
 from langchain_core.messages import AIMessage
 from sqlalchemy import select
+
+from app.services.docker_bootstrap import (
+    build_corepack_prepare_command,
+)
+from app.services.docker_executor import (
+    install_dependencies as install_dependencies_exec,
+)
+from app.services.docker_executor import (
+    is_service_running as is_service_running_exec,
+)
+from app.services.docker_executor import (
+    probe_preview_urls,
+)
+from app.services.docker_executor import (
+    start_service as start_service_exec,
+)
+from app.services.docker_executor import (
+    tail_service_logs as tail_service_logs_exec,
+)
+from app.services.docker_repo import (
+    build_repo_auth_context,
+    build_repo_binding,
+    build_repo_git_identity,
+    build_repo_remote_urls,
+    build_repo_sync_signature,
+    extract_error_message,
+    normalize_repo_auth_mode,
+    normalize_repo_provider,
+    sanitize_repo_sync_error,
+)
+from app.services.docker_runtime import (
+    build_diagnostic_message,
+    build_preview_urls,
+    build_start_command,
+    collect_port_bindings_from_attrs,
+    detect_framework,
+    detect_package_manager_from_package_json,
+    extract_error_lines,
+    lockfile_checks,
+    parse_package_json,
+    resolve_package_manager_spec,
+    resolve_start_script,
+    strict_package_manager_reason,
+)
 
 logger = logging.getLogger(__name__)
 # 沙盒内服务必须监听全接口，才能通过 Docker 端口映射被宿主机预览访问。
@@ -450,21 +491,12 @@ class DockerMiddleware(AgentMiddleware):
         metadata = (
             thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
         )
-        repo = str(metadata.get("repo") or "").strip()
-        if not repo or repo in {"未绑定仓库", "none", "null"}:
+        provider = normalize_repo_provider(str(metadata.get("provider") or ""))
+        if provider is None:
             return None
-
-        provider_raw = str(metadata.get("provider") or "").strip().lower()
-        if provider_raw == "github":
-            provider = "github"
-        elif provider_raw in {"gitlab", "gitlab_enterprise"}:
-            provider = "gitlab"
-        else:
-            return None
-
-        branch = str(metadata.get("branch") or "main").strip() or "main"
         gitlab_base_url = str(metadata.get("gitlab_base_url") or "").strip()
         github_auth_mode = str(metadata.get("github_auth_mode") or "").strip().lower()
+
         scm_user_login = ""
         scm_user_name = ""
         scm_user_email = ""
@@ -489,26 +521,14 @@ class DockerMiddleware(AgentMiddleware):
                 thread_id,
                 exc_info=True,
             )
-
-        git_name = scm_user_name or scm_user_login
-        git_email = scm_user_email
-        if not git_email and scm_user_login:
-            if provider == "github":
-                git_email = f"{scm_user_login}@users.noreply.github.com"
-            elif provider == "gitlab":
-                git_email = f"{scm_user_login}@users.noreply.gitlab.com"
-
-        return {
-            "thread_id": thread_id,
-            "user_id": str(thread.user_id),
-            "provider": provider,
-            "repo": repo,
-            "branch": branch,
-            "gitlab_base_url": gitlab_base_url,
-            "github_auth_mode": github_auth_mode,
-            "git_name": git_name,
-            "git_email": git_email,
-        }
+        return build_repo_binding(
+            thread_id=thread_id,
+            user_id=str(thread.user_id),
+            metadata=metadata,
+            scm_user_login=scm_user_login,
+            scm_user_name=scm_user_name,
+            scm_user_email=scm_user_email,
+        )
 
     def _build_repo_remote_urls(
         self,
@@ -519,33 +539,16 @@ class DockerMiddleware(AgentMiddleware):
         gitlab_base_url: str | None,
     ) -> tuple[str, str]:
         """构建公开 remote URL 与临时鉴权 URL。"""
-        if provider == "github":
-            public_url = f"https://github.com/{repo}.git"
-            username = "x-access-token"
-        else:
-            from app.routers.scm import _normalize_gitlab_base_url
-
-            normalized_base = _normalize_gitlab_base_url(gitlab_base_url)
-            public_url = f"{normalized_base.rstrip('/')}/{repo}.git"
-            username = "oauth2"
-
-        parsed = urlparse(public_url)
-        token_escaped = quote(token, safe="")
-        auth_netloc = f"{username}:{token_escaped}@{parsed.netloc}"
-        auth_url = f"{parsed.scheme}://{auth_netloc}{parsed.path}"
-        if parsed.query:
-            auth_url = f"{auth_url}?{parsed.query}"
-        return public_url, auth_url
+        return build_repo_remote_urls(
+            provider=provider,
+            repo=repo,
+            token=token,
+            gitlab_base_url=gitlab_base_url,
+        )
 
     def _sanitize_repo_sync_error(self, output: str, token: str) -> str:
         """清理错误输出里的敏感 token。"""
-        cleaned = output or ""
-        if token:
-            cleaned = cleaned.replace(token, "***")
-            escaped = quote(token, safe="")
-            if escaped:
-                cleaned = cleaned.replace(escaped, "***")
-        return cleaned[-4000:]
+        return sanitize_repo_sync_error(output, token)
 
     def _report_progress(
         self,
@@ -793,24 +796,13 @@ class DockerMiddleware(AgentMiddleware):
         if not binding:
             return None
 
-        signature = "|".join(
-            [
-                container_id,
-                binding["provider"],
-                binding["repo"],
-                binding["branch"],
-                binding.get("gitlab_base_url", ""),
-                binding.get("github_auth_mode", ""),
-            ]
+        signature = build_repo_sync_signature(
+            container_id=container_id,
+            binding=binding,
         )
         provider = binding["provider"]
         user_id = binding["user_id"]
-        gitlab_base_url = binding.get("gitlab_base_url") or None
-        github_auth_mode = (
-            binding.get("github_auth_mode") if provider == "github" else None
-        )
-        if github_auth_mode == "":
-            github_auth_mode = None
+        gitlab_base_url, github_auth_mode = normalize_repo_auth_mode(binding)
 
         if (
             state.get("repo_sync_signature") == signature
@@ -824,17 +816,18 @@ class DockerMiddleware(AgentMiddleware):
                     github_auth_mode=github_auth_mode,
                 )
             except Exception as exc:  # noqa: BLE001
-                detail = getattr(exc, "detail", None)
-                message = (
-                    str(detail).strip()
-                    if isinstance(detail, str) and detail.strip()
-                    else str(exc).strip() or "unknown error"
-                )
+                message = extract_error_message(exc)
                 self._report_progress(
                     reporter,
                     stage="repo",
                     level="warning",
                     message=f"git 凭据刷新失败：{message}",
+                )
+                logger.warning(
+                    "Failed to refresh repo credentials for thread repo %s@%s: %s",
+                    binding["repo"],
+                    binding["branch"],
+                    message,
                 )
             else:
                 refreshed, refresh_error = await self._refresh_repo_runtime_environment(
@@ -851,18 +844,16 @@ class DockerMiddleware(AgentMiddleware):
                             f"git 身份/凭据刷新失败：{refresh_error or 'unknown error'}"
                         ),
                     )
+                    logger.warning(
+                        "Failed to refresh repo runtime environment for %s@%s in container %s: %s",
+                        binding["repo"],
+                        binding["branch"],
+                        container_id,
+                        refresh_error or "unknown error",
+                    )
             return {
-                "repo_auth_context": {
-                    "user_id": binding["user_id"],
-                    "provider": binding["provider"],
-                    "repo": binding["repo"],
-                    "gitlab_base_url": binding.get("gitlab_base_url", ""),
-                    "github_auth_mode": binding.get("github_auth_mode", ""),
-                },
-                "repo_git_identity": {
-                    "name": str(binding.get("git_name") or "").strip(),
-                    "email": str(binding.get("git_email") or "").strip().lower(),
-                },
+                "repo_auth_context": build_repo_auth_context(binding),
+                "repo_git_identity": build_repo_git_identity(binding),
             }
 
         try:
@@ -873,12 +864,13 @@ class DockerMiddleware(AgentMiddleware):
                 github_auth_mode=github_auth_mode,
             )
         except Exception as exc:  # noqa: BLE001
-            detail = getattr(exc, "detail", None)
-            message = (
-                str(detail).strip()
-                if isinstance(detail, str) and detail.strip()
-                else str(exc).strip() or "unknown error"
+            logger.warning(
+                "Failed to resolve repo access token for %s@%s: %s",
+                binding["repo"],
+                binding["branch"],
+                exc,
             )
+            message = extract_error_message(exc)
             return {
                 "repo_sync_signature": signature,
                 "repo_sync_success": False,
@@ -893,6 +885,12 @@ class DockerMiddleware(AgentMiddleware):
                 gitlab_base_url=gitlab_base_url,
             )
         except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to build repo remote URLs for %s@%s: %s",
+                binding["repo"],
+                binding["branch"],
+                exc,
+            )
             return {
                 "repo_sync_signature": signature,
                 "repo_sync_success": False,
@@ -910,6 +908,13 @@ class DockerMiddleware(AgentMiddleware):
                 )
             )
         except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to access container %s for repo sync %s@%s: %s",
+                container_id,
+                binding["repo"],
+                binding["branch"],
+                exc,
+            )
             return {
                 "repo_sync_signature": signature,
                 "repo_sync_success": False,
@@ -945,17 +950,8 @@ class DockerMiddleware(AgentMiddleware):
                 "repo_sync_signature": signature,
                 "repo_sync_success": True,
                 "repo_sync_error": None,
-                "repo_auth_context": {
-                    "user_id": user_id,
-                    "provider": provider,
-                    "repo": binding["repo"],
-                    "gitlab_base_url": gitlab_base_url or "",
-                    "github_auth_mode": github_auth_mode or "",
-                },
-                "repo_git_identity": {
-                    "name": str(binding.get("git_name") or "").strip(),
-                    "email": str(binding.get("git_email") or "").strip().lower(),
-                },
+                "repo_auth_context": build_repo_auth_context(binding),
+                "repo_git_identity": build_repo_git_identity(binding),
             }
 
         return {
@@ -1067,11 +1063,7 @@ class DockerMiddleware(AgentMiddleware):
             return None
         if code != 0:
             return None
-        try:
-            payload = json.loads(output)
-        except json.JSONDecodeError:
-            return None
-        return payload if isinstance(payload, dict) else None
+        return parse_package_json(output)
 
     def _detect_package_manager(
         self,
@@ -1080,27 +1072,12 @@ class DockerMiddleware(AgentMiddleware):
         package_json: dict[str, Any] | None = None,
     ) -> str:
         # package.json#packageManager 优先级最高，显式声明即视为强约束。
-        if isinstance(package_json, dict):
-            pm_raw = package_json.get("packageManager")
-            if isinstance(pm_raw, str):
-                normalized = pm_raw.strip().lower()
-                for manager in ("pnpm", "yarn", "npm"):
-                    if normalized.startswith(f"{manager}@"):
-                        return manager
+        package_manager = detect_package_manager_from_package_json(package_json)
+        if package_manager is not None:
+            return package_manager
 
         # 锁文件强约束：存在锁文件时必须使用对应包管理器，避免误用导致依赖树漂移。
-        lockfile_checks: list[tuple[str, str]] = [
-            (
-                "pnpm",
-                "[ -f pnpm.lock ] || [ -f pnpm-lock.yaml ] || [ -f pnpm-lock.yml ]",
-            ),
-            ("yarn", "[ -f yarn.lock ]"),
-            (
-                "npm",
-                "[ -f npm.lock ] || [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]",
-            ),
-        ]
-        for manager, cond in lockfile_checks:
+        for manager, cond in lockfile_checks():
             code, _ = self._exec(container, cond)
             if code == 0:
                 return manager
@@ -1113,52 +1090,17 @@ class DockerMiddleware(AgentMiddleware):
         return "npm"
 
     def _has_workspace_protocol(self, package_json: dict[str, Any] | None) -> bool:
-        if not isinstance(package_json, dict):
-            return False
-        dependency_sections = (
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        )
-        for section_name in dependency_sections:
-            section = package_json.get(section_name)
-            if not isinstance(section, dict):
-                continue
-            for value in section.values():
-                if isinstance(value, str) and value.strip().startswith("workspace:"):
-                    return True
-        return False
+        from app.services.docker_runtime import has_workspace_protocol
+
+        return has_workspace_protocol(package_json)
 
     def _resolve_start_script(self, package_json: dict[str, Any]) -> str | None:
         # 优先 dev，其次 start/preview，兼容大多数前端项目脚本约定。
-        scripts = package_json.get("scripts")
-        if not isinstance(scripts, dict):
-            return None
-        for name in ("dev", "start", "preview"):
-            if isinstance(scripts.get(name), str):
-                return name
-        return None
+        return resolve_start_script(package_json)
 
     def _detect_framework(self, package_json: dict[str, Any]) -> str:
         # 仅做轻量依赖检测：不追求 100% 准确，但用于拼接启动参数足够稳定。
-        dependencies: dict[str, Any] = {}
-        for key in ("dependencies", "devDependencies"):
-            section = package_json.get(key)
-            if isinstance(section, dict):
-                dependencies.update(section)
-
-        if "next" in dependencies:
-            return "next"
-        if "nuxt" in dependencies:
-            return "nuxt"
-        if "react-scripts" in dependencies:
-            return "cra"
-        if "vite" in dependencies:
-            return "vite"
-        if "astro" in dependencies:
-            return "astro"
-        return "unknown"
+        return detect_framework(package_json)
 
     def _build_start_command(
         self,
@@ -1169,12 +1111,12 @@ class DockerMiddleware(AgentMiddleware):
         port: int,
     ) -> str:
         # 不同框架对 host/port 参数名称不同，这里做统一策略，保证容器外可访问。
-        base = f"{package_manager} run {start_script}"
-        if framework == "next":
-            return f"{base} -- --hostname {BIND_ALL_HOST} --port {port}"
-        if framework in {"vite", "nuxt", "astro"}:
-            return f"{base} -- --host {BIND_ALL_HOST} --port {port}"
-        return base
+        return build_start_command(
+            package_manager=package_manager,
+            start_script=start_script,
+            framework=framework,
+            port=port,
+        )
 
     def _resolve_package_manager_spec(
         self,
@@ -1183,14 +1125,10 @@ class DockerMiddleware(AgentMiddleware):
         package_json: dict[str, Any] | None,
     ) -> str:
         """解析包管理器版本规格，优先读取 package.json#packageManager。"""
-        if not isinstance(package_json, dict):
-            return f"{package_manager}@latest"
-        raw = package_json.get("packageManager")
-        if isinstance(raw, str):
-            normalized = raw.strip()
-            if normalized.lower().startswith(f"{package_manager}@"):
-                return normalized
-        return f"{package_manager}@latest"
+        return resolve_package_manager_spec(
+            package_manager=package_manager,
+            package_json=package_json,
+        )
 
     def _ensure_package_manager_available(
         self,
@@ -1223,12 +1161,7 @@ class DockerMiddleware(AgentMiddleware):
             level="info",
             message=f"检测到缺少 {package_manager}，尝试通过 corepack 激活：{pm_spec}",
         )
-        setup_cmd = (
-            "if command -v corepack >/dev/null 2>&1; then "
-            "corepack enable >/dev/null 2>&1 || true; "
-            f"corepack prepare {shlex.quote(pm_spec)} --activate; "
-            "else exit 127; fi"
-        )
+        setup_cmd = build_corepack_prepare_command(pm_spec)
         code, output = self._exec_stream(
             container,
             setup_cmd,
@@ -1303,20 +1236,11 @@ class DockerMiddleware(AgentMiddleware):
             return detected_manager, None
 
         if detected_manager in {"pnpm", "yarn"}:
-            strict_manager_declared = False
-            if isinstance(package_json, dict):
-                pm_raw = package_json.get("packageManager")
-                if isinstance(pm_raw, str):
-                    normalized = pm_raw.strip().lower()
-                    strict_manager_declared = normalized.startswith(
-                        f"{detected_manager}@"
-                    )
-            if strict_manager_declared or self._has_workspace_protocol(package_json):
-                strict_reason = (
-                    "package.json#packageManager"
-                    if strict_manager_declared
-                    else "workspace protocol dependencies"
-                )
+            strict_reason = strict_package_manager_reason(
+                detected_manager=detected_manager,
+                package_json=package_json,
+            )
+            if strict_reason is not None:
                 message = (
                     f"Package manager '{detected_manager}' is required by {strict_reason}; "
                     "refusing fallback to npm."
@@ -1358,74 +1282,42 @@ class DockerMiddleware(AgentMiddleware):
         )
         if not pm_ready:
             return False, pm_error
-
-        # 若 node_modules 已存在则跳过安装，加速增量修复场景。
-        has_node_modules, _ = self._exec(container, "[ -d node_modules ]")
-        if has_node_modules == 0:
-            self._report_progress(
-                reporter,
-                stage="bootstrap",
-                level="info",
-                message="检测到 node_modules，跳过依赖安装。",
-            )
-            return True, None
-
-        install_cmd_by_manager = {
-            "pnpm": "pnpm install",
-            "yarn": "yarn install",
-            "npm": "npm install",
-        }
-        install_cmd = install_cmd_by_manager.get(package_manager, "npm install")
-        self._report_progress(
-            reporter,
-            stage="bootstrap",
-            level="info",
-            message=f"开始安装依赖：{install_cmd}",
-        )
-        code, output = self._exec_stream(
-            container,
-            install_cmd,
-            on_output_line=(
-                (
-                    lambda line: self._report_progress(
-                        reporter,
-                        stage="bootstrap",
-                        level="info",
-                        message=f"[deps] {line}",
-                    )
-                )
-                if reporter is not None
-                else None
+        return install_dependencies_exec(
+            exec_fn=lambda current_container, command: self._exec(
+                current_container,
+                command,
             ),
+            exec_stream_fn=lambda current_container,
+            command,
+            on_output_line: self._exec_stream(
+                current_container,
+                command,
+                on_output_line=on_output_line,
+            ),
+            report_progress=lambda current_reporter,
+            stage,
+            level,
+            message: self._report_progress(
+                current_reporter,
+                stage=stage,
+                level=level,
+                message=message,
+            ),
+            container=container,
+            package_manager=package_manager,
+            reporter=reporter,
         )
-        if code != 0:
-            return (
-                False,
-                f"Dependency install failed ({install_cmd}):\n{output[-3000:]}",
-            )
-        self._report_progress(
-            reporter,
-            stage="bootstrap",
-            level="info",
-            message="依赖安装完成。",
-        )
-        return True, None
 
     def _is_service_running(self, container: Container) -> tuple[bool, str | None]:
         # 通过 PID 文件 + kill -0 判断存活，避免仅靠日志判断“假启动”。
-        code, output = self._exec(
-            container,
-            (
-                f"if [ -f {shlex.quote(self.service_pid_path)} ]; then "
-                f"PID=$(cat {shlex.quote(self.service_pid_path)}); "
-                'if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then echo "$PID"; '
-                "else exit 2; fi; "
-                "else exit 3; fi"
+        return is_service_running_exec(
+            exec_fn=lambda current_container, command: self._exec(
+                current_container,
+                command,
             ),
+            container=container,
+            service_pid_path=self.service_pid_path,
         )
-        if code == 0:
-            return True, output.strip() or None
-        return False, None
 
     def _start_service(
         self,
@@ -1444,132 +1336,66 @@ class DockerMiddleware(AgentMiddleware):
             framework=framework,
             port=port,
         )
-        self._report_progress(
-            reporter,
-            stage="bootstrap",
-            level="info",
-            message=f"启动服务：{run_cmd}",
-        )
-        env = {
-            "HOST": BIND_ALL_HOST,
-            "PORT": str(port),
-            "CI": "1",
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        }
-        log_dir = str(PurePosixPath(self.service_log_path).parent)
-        pid_dir = str(PurePosixPath(self.service_pid_path).parent)
-        launch_cmd = (
-            f"mkdir -p {shlex.quote(log_dir)} {shlex.quote(pid_dir)}; "
-            f"rm -f {shlex.quote(self.service_pid_path)}; "
-            f"nohup {run_cmd} > {shlex.quote(self.service_log_path)} 2>&1 & "
-            f"echo $! > {shlex.quote(self.service_pid_path)}; "
-            f"cat {shlex.quote(self.service_pid_path)}"
-        )
-        code, output = self._exec(container, launch_cmd, environment=env)
-        if code != 0:
-            return False, f"Failed to start service ({run_cmd}):\n{output[-3000:]}"
-
-        # 给进程预留最短启动窗口，随后立即校验是否秒退。
-        time.sleep(max(self.startup_wait_seconds, 0.5))
-        running, pid = self._is_service_running(container)
-        if not running:
-            _, logs = self._exec(
+        return start_service_exec(
+            exec_fn=lambda current_container, command, environment=None: self._exec(
+                current_container,
+                command,
+                environment=environment,
+            ),
+            report_progress=lambda current_reporter,
+            stage,
+            level,
+            message: self._report_progress(
+                current_reporter,
+                stage=stage,
+                level=level,
+                message=message,
+            ),
+            is_service_running_fn=lambda: self._is_service_running(container),
+            tail_service_logs_fn=lambda lines: self._tail_service_logs(
                 container,
-                f"tail -n 120 {shlex.quote(self.service_log_path)} 2>/dev/null || true",
-            )
-            for line in logs.splitlines()[-24:]:
-                cleaned = line.strip()
-                if not cleaned:
-                    continue
-                self._report_progress(
-                    reporter,
-                    stage="bootstrap",
-                    level="warning",
-                    message=f"[service] {cleaned}",
-                )
-            return False, f"Service exited immediately after start.\n{logs[-3000:]}"
-        self._report_progress(
-            reporter,
-            stage="bootstrap",
-            level="info",
-            message=f"服务已启动，pid={pid or 'unknown'}",
+                lines=lines,
+            ),
+            container=container,
+            run_cmd=run_cmd,
+            service_log_path=self.service_log_path,
+            service_pid_path=self.service_pid_path,
+            port=port,
+            startup_wait_seconds=self.startup_wait_seconds,
+            reporter=reporter,
+            path_env=_EXEC_PATH,
+            bind_all_host=BIND_ALL_HOST,
         )
-        return True, None
 
     def _collect_port_bindings(self, container: Container) -> dict[str, list[int]]:
         # 容器状态可能变化，先 reload 再读映射，降低端口信息过期概率。
         with suppress(DockerException):
             container.reload()
-
-        ports = container.attrs.get("NetworkSettings", {}).get("Ports", {})
-        bindings: dict[str, list[int]] = {}
-        if not isinstance(ports, dict):
-            return bindings
-
-        for container_port, host_mappings in ports.items():
-            if not isinstance(host_mappings, list):
-                continue
-            host_ports: list[int] = []
-            for mapping in host_mappings:
-                if not isinstance(mapping, dict):
-                    continue
-                port_raw = mapping.get("HostPort")
-                if isinstance(port_raw, str) and port_raw.isdigit():
-                    host_ports.append(int(port_raw))
-            if host_ports:
-                bindings[container_port] = host_ports
-        return bindings
+        attrs = container.attrs if isinstance(container.attrs, dict) else {}
+        return collect_port_bindings_from_attrs(attrs)
 
     def _build_preview_urls(self, bindings: dict[str, list[int]]) -> list[str]:
         # 统一使用 localhost 生成预览地址，便于本地开发和上层 UI 直接展示。
-        urls: list[str] = []
-        for host_ports in bindings.values():
-            for host_port in host_ports:
-                urls.append(f"http://127.0.0.1:{host_port}{self.healthcheck_path}")
-        return sorted(set(urls))
+        return build_preview_urls(bindings, healthcheck_path=self.healthcheck_path)
 
     def _probe_preview_urls(self, urls: list[str]) -> dict[str, str]:
         # 主动 HTTP 探测能快速判断“端口打开但服务不可用”的情况。
-        probe: dict[str, str] = {}
-        if not urls:
-            return probe
-
-        with httpx.Client(timeout=2.5, follow_redirects=True) as client:
-            for url in urls[:8]:
-                try:
-                    response = client.get(url)
-                    probe[url] = f"{response.status_code}"
-                except Exception as exc:  # noqa: BLE001
-                    probe[url] = f"error:{type(exc).__name__}"
-        return probe
+        return probe_preview_urls(urls)
 
     def _tail_service_logs(self, container: Container, lines: int = 120) -> str:
-        _, output = self._exec(
-            container,
-            f"tail -n {lines} {shlex.quote(self.service_log_path)} 2>/dev/null || true",
+        return tail_service_logs_exec(
+            exec_fn=lambda current_container, command: self._exec(
+                current_container,
+                command,
+            ),
+            container=container,
+            service_log_path=self.service_log_path,
+            lines=lines,
         )
-        return output
 
     def _extract_error_lines(self, logs: str) -> list[str]:
         # 提取关键错误行用于 prompt 注入，避免把完整日志全部塞进上下文。
-        keywords = (
-            "error",
-            "exception",
-            "traceback",
-            "failed",
-            "vite",
-            "syntaxerror",
-            "unhandled",
-            "eaddrinuse",
-        )
-        lines: list[str] = []
-        for raw in logs.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if any(word in line.lower() for word in keywords):
-                lines.append(line)
-        return lines[:12]
+        return extract_error_lines(logs)
 
     def _build_runtime_status(
         self,
@@ -1708,60 +1534,7 @@ class DockerMiddleware(AgentMiddleware):
         return status
 
     def _build_diagnostic_message(self, status: dict[str, Any]) -> str | None:
-        # 只在存在 actionable 问题时注入系统消息，避免噪音干扰正常对话。
-        if not status.get("app_detected"):
-            return None
-
-        alerts: list[str] = []
-        startup_error = status.get("startup_error")
-        if isinstance(startup_error, str) and startup_error.strip():
-            alerts.append("startup_error")
-
-        if not status.get("service_running"):
-            alerts.append("service_not_running")
-
-        probes = status.get("preview_probes")
-        probe_values = list(probes.values()) if isinstance(probes, dict) else []
-        if probe_values and all(str(v).startswith("error:") for v in probe_values):
-            alerts.append("preview_unreachable")
-
-        error_lines = status.get("error_lines")
-        if isinstance(error_lines, list) and error_lines:
-            alerts.append("runtime_errors_in_logs")
-
-        if not alerts:
-            return None
-
-        preview_lines = []
-        if isinstance(probes, dict):
-            for url, result in probes.items():
-                preview_lines.append(f"- {url} -> {result}")
-
-        log_excerpt = ""
-        if isinstance(error_lines, list) and error_lines:
-            log_excerpt = "\n".join(f"- {line}" for line in error_lines[:8])
-        elif isinstance(status.get("log_tail"), str):
-            tail = cast("str", status["log_tail"]).strip()
-            if tail:
-                log_excerpt = tail[-1200:]
-
-        return (
-            "[Runtime Diagnostics]\n"
-            "Web app sandbox runtime check found issues that require fixing in this run.\n\n"
-            f"Detected issues: {', '.join(alerts)}\n"
-            f"Framework: {status.get('framework')}\n"
-            f"Package manager: {status.get('package_manager')}\n"
-            f"Start script: {status.get('start_script')}\n"
-            f"Start command: {status.get('start_command')}\n"
-            f"Service running: {status.get('service_running')}\n"
-            f"Service PID: {status.get('service_pid')}\n"
-            "Preview probes:\n"
-            f"{chr(10).join(preview_lines) if preview_lines else '- no mapped preview URL'}\n\n"
-            "Error excerpt:\n"
-            f"{log_excerpt or '- no logs captured'}\n\n"
-            "Action required: inspect code/build/runtime config, fix the root cause, "
-            "then rerun the service and verify preview URL returns 2xx/3xx."
-        )
+        return build_diagnostic_message(status)
 
     async def ainitialize_environment(
         self,

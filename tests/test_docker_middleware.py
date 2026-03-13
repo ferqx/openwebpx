@@ -491,6 +491,140 @@ def test_configure_git_runtime_in_container_reports_missing_git_repo() -> None:
     assert err == "git repository missing at /workspace"
 
 
+def test_install_dependencies_delegates_to_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    middleware = DockerMiddleware()
+    called: dict[str, Any] = {}
+
+    def fake_ensure(
+        _container: Any,
+        _manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,  # noqa: ARG001
+        reporter: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[bool, str | None]:
+        return True, None
+
+    def fake_install_dependencies_exec(**kwargs: Any) -> tuple[bool, str | None]:
+        called.update(kwargs)
+        return True, None
+
+    middleware._ensure_package_manager_available = fake_ensure  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "middleware.docker.install_dependencies_exec",
+        fake_install_dependencies_exec,
+    )
+
+    ok, err = middleware._install_dependencies(
+        object(),
+        "pnpm",
+        package_json={"packageManager": "pnpm@9.0.0"},
+    )
+
+    assert ok is True
+    assert err is None
+    assert called["package_manager"] == "pnpm"
+    assert callable(called["exec_fn"])
+    assert callable(called["exec_stream_fn"])
+
+
+def test_start_service_delegates_to_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    middleware = DockerMiddleware()
+    called: dict[str, Any] = {}
+
+    def fake_start_service_exec(**kwargs: Any) -> tuple[bool, str | None]:
+        called.update(kwargs)
+        return True, None
+
+    monkeypatch.setattr(
+        "middleware.docker.start_service_exec",
+        fake_start_service_exec,
+    )
+
+    ok, err = middleware._start_service(
+        object(),  # type: ignore[arg-type]
+        package_manager="pnpm",
+        start_script="dev",
+        framework="vite",
+        port=3000,
+    )
+
+    assert ok is True
+    assert err is None
+    assert called["run_cmd"] == "pnpm run dev -- --host 0.0.0.0 --port 3000"
+    assert called["port"] == 3000
+    assert callable(called["exec_fn"])
+    assert callable(called["is_service_running_fn"])
+
+
+def test_build_runtime_status_returns_node_app_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    middleware = DockerMiddleware()
+    container = FakeContainer("cid-1", status="running")
+
+    monkeypatch.setattr(
+        middleware,
+        "_read_package_json",
+        lambda _container: {
+            "packageManager": "pnpm@9.0.0",
+            "scripts": {"dev": "vite"},
+            "dependencies": {"vite": "^5.0.0"},
+        },
+    )
+    monkeypatch.setattr(middleware, "_detect_framework", lambda _pkg: "vite")
+    monkeypatch.setattr(
+        middleware, "_detect_package_manager", lambda *_args, **_kwargs: "pnpm"
+    )
+    monkeypatch.setattr(
+        middleware,
+        "_resolve_runtime_package_manager",
+        lambda *_args, **_kwargs: ("pnpm", None),
+    )
+    monkeypatch.setattr(middleware, "_resolve_start_script", lambda _pkg: "dev")
+    monkeypatch.setattr(
+        middleware,
+        "_build_start_command",
+        lambda **_kwargs: "pnpm run dev -- --host 0.0.0.0 --port 3000",
+    )
+    monkeypatch.setattr(
+        middleware, "_install_dependencies", lambda *_args, **_kwargs: (True, None)
+    )
+    monkeypatch.setattr(
+        middleware, "_is_service_running", lambda _container: (True, "123")
+    )
+    monkeypatch.setattr(
+        middleware, "_collect_port_bindings", lambda _container: {"3000/tcp": [4010]}
+    )
+    monkeypatch.setattr(
+        middleware, "_build_preview_urls", lambda _bindings: ["http://127.0.0.1:4010/"]
+    )
+    monkeypatch.setattr(
+        middleware,
+        "_probe_preview_urls",
+        lambda _urls: {"http://127.0.0.1:4010/": "200"},
+    )
+    monkeypatch.setattr(middleware, "_tail_service_logs", lambda _container: "ready\n")
+    monkeypatch.setattr(middleware, "_extract_error_lines", lambda _logs: [])
+
+    status = middleware._build_runtime_status(
+        {
+            "repo_sync_signature": "sig",
+            "repo_sync_success": True,
+            "repo_sync_error": None,
+            "service_restart_count": 0,
+        },
+        container,
+    )
+
+    assert status["app_detected"] is True
+    assert status["framework"] == "vite"
+    assert status["package_manager"] == "pnpm"
+    assert status["service_running"] is True
+    assert status["preview_probes"]["http://127.0.0.1:4010/"] == "200"
+
+
 def test_docker_unavailable_message_mentions_socket_mount_when_socket_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
