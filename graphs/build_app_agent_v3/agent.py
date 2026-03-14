@@ -13,6 +13,7 @@ from deepagents.middleware.summarization import (
     _compute_summarization_defaults,
 )
 from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRetryMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain.chat_models import init_chat_model
 
@@ -59,6 +60,11 @@ SUMMARIZATION_DEFAULTS = _compute_summarization_defaults(MODEL)
 _middleware: list[AgentMiddleware[Any, Any, Any]] = []
 _middleware.extend(
     [
+        ModelRetryMiddleware(
+            max_retries=3,
+            backoff_factor=2.0,
+            initial_delay=1.0,
+        ),
         build_web_sandbox_docker_middleware(),
         SummarizationMiddleware(
             model=MODEL,

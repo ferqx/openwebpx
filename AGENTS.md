@@ -60,6 +60,7 @@ AI 代理在本仓库工作时请遵循以下协议。
 - 项目总览、启动、测试、迁移、规范：`CLAUDE.md`
 - Docker 快速启动：`README.md`（`docker compose up`）
 - 运行入口：`run_server.py`、`app/main.py`
+- 当前默认任务图：`aegra.json`、`graphs/build_app_agent_v3/agent.py`
 - 沙箱路由编排入口：`app/routers/sandbox.py`
 - 沙箱/容器服务层入口：`app/services/sandbox_*.py`、`app/services/docker_*.py`
 - 代码审查后端入口：`app/routers/code_review.py`（设置接口 + webhook 触发）
@@ -75,6 +76,10 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-14（build_app_agent_v2 退役与 build_app_agent_v3 重试增强）：
+  - `graphs/build_app_agent_v2/*` 已从仓库移除，默认任务图继续收敛到 `build_app_agent_v3`；后续新增能力与协议约束均应以 `v3` 为准，不再向 `v2` 回填。
+  - `graphs/build_app_agent_v3/agent.py` 接入 `ModelRetryMiddleware`，为模型调用增加最多 3 次指数退避重试（初始 1 秒、系数 2.0），降低瞬时模型错误导致的整次任务失败概率。
+  - 相关遗留 `v2` 测试入口已移除，避免仓库删除 `v2` 实现后测试继续引用失效模块。
 - 2026-03-13（sandbox / docker 服务化重构与编排层测试补强）：
   - `app/routers/sandbox.py` 将 git 查询、bootstrap 状态归一化、graph 解析等规则逻辑下沉到 `app/services/sandbox_git.py` 与 `app/services/sandbox_bootstrap.py`，路由层收敛为请求编排与响应组装。
   - `middleware/docker.py` 将 repo-sync 规则、runtime 规则、bootstrap 命令构造与执行 helper 逐步下沉到 `app/services/docker_repo.py`、`app/services/docker_runtime.py`、`app/services/docker_bootstrap.py`、`app/services/docker_executor.py`，中间件职责聚焦在容器生命周期、状态流转与 service 协调。
