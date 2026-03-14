@@ -169,7 +169,11 @@ async def ensure_backend_container_running(backend: DockerBackend) -> None:
         container.reload()
         current_status = str(getattr(container, "status", "")).strip().lower()
         if current_status != "running":
-            container.start()
+            # git 路径也需要兼容复用中的 paused 容器，避免把 unpause 场景误判成 start。
+            if current_status == "paused":
+                container.unpause()
+            else:
+                container.start()
             container.reload()
             current_status = str(getattr(container, "status", "")).strip().lower()
         return current_status

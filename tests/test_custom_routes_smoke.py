@@ -20,6 +20,7 @@ from app.main import app
 from app.routers import code_review as code_review_router
 from app.routers import sandbox as sandbox_router
 from app.routers import scm as scm_router
+from app.services import sandbox_git as sandbox_git_service
 
 
 async def _override_require_auth() -> Any:
@@ -958,8 +959,42 @@ async def test_ensure_backend_container_running_starts_stopped_container() -> No
             return self._container
 
     backend = FakeBackend()
-    await sandbox_router._ensure_backend_container_running(backend)  # type: ignore[arg-type]
+    await sandbox_git_service.ensure_backend_container_running(backend)  # type: ignore[arg-type]
     assert backend.container.started is True
+    assert backend.container.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_ensure_backend_container_running_unpauses_paused_container() -> None:
+    class FakeContainer:
+        def __init__(self) -> None:
+            self.status = "paused"
+            self.started = False
+            self.unpaused = False
+
+        def reload(self) -> None:
+            return None
+
+        def start(self) -> None:
+            self.started = True
+            self.status = "running"
+
+        def unpause(self) -> None:
+            self.unpaused = True
+            self.status = "running"
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self._container = FakeContainer()
+
+        @property
+        def container(self) -> Any:
+            return self._container
+
+    backend = FakeBackend()
+    await sandbox_git_service.ensure_backend_container_running(backend)  # type: ignore[arg-type]
+    assert backend.container.unpaused is True
+    assert backend.container.started is False
     assert backend.container.status == "running"
 
 
@@ -980,7 +1015,7 @@ async def test_ensure_backend_container_running_raises_when_start_fails() -> Non
             return FakeContainer()
 
     with pytest.raises(HTTPException) as exc_info:
-        await sandbox_router._ensure_backend_container_running(FakeBackend())  # type: ignore[arg-type]
+        await sandbox_git_service.ensure_backend_container_running(FakeBackend())  # type: ignore[arg-type]
     assert exc_info.value.status_code == 409
     assert "Sandbox container is unavailable" in str(exc_info.value.detail)
 
