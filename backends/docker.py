@@ -136,6 +136,13 @@ class DockerBackend(BaseSandbox):
             return thread_id.strip()
         return None
 
+    def _runtime_state(self) -> dict[str, Any]:
+        """兼容不同 ToolRuntime 实现的状态读取方式。"""
+        state = getattr(self.runtime, "state", None)
+        if isinstance(state, dict):
+            return state
+        return {}
+
     def _store_container_mapping(self, *, thread_id: str, container_id: str) -> None:
         """将 thread_id -> container_id 映射持久化到 LangGraph store。"""
         store = getattr(self.runtime, "store", None)
@@ -182,7 +189,7 @@ class DockerBackend(BaseSandbox):
         if self._container is not None:
             return self._container
 
-        state = self.runtime.state if isinstance(self.runtime.state, dict) else {}
+        state = self._runtime_state()
         container_id = state.get("container_id")
         thread_id = self._get_thread_id()
 
@@ -335,7 +342,7 @@ class DockerBackend(BaseSandbox):
         return env, token
 
     def _repo_auth_context_from_state(self) -> dict[str, str] | None:
-        state = self.runtime.state if isinstance(self.runtime.state, dict) else {}
+        state = self._runtime_state()
         raw = state.get("repo_auth_context")
         if not isinstance(raw, dict):
             return None
@@ -353,7 +360,7 @@ class DockerBackend(BaseSandbox):
         }
 
     def _repo_git_identity_from_state(self) -> dict[str, str] | None:
-        state = self.runtime.state if isinstance(self.runtime.state, dict) else {}
+        state = self._runtime_state()
         raw = state.get("repo_git_identity")
         if not isinstance(raw, dict):
             return None

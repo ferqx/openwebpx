@@ -64,8 +64,8 @@ dependencies = [
     "langchain-qdrant>=1.1.0",
     "pydantic-settings>=2.12.0",
     "docker>=7.1.0",
-    "aegra-cli==0.7.5",
-    "aegra-api==0.7.5",
+    "aegra-cli==0.8.2",
+    "aegra-api==0.8.2",
     "pytest>=9.0.2",
 ]
 

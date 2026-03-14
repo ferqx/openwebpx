@@ -72,6 +72,12 @@ class FakeRuntime:
         self.store = store
 
 
+class FakeRuntimeWithoutState:
+    def __init__(self, *, config: dict[str, Any], store: Any = None) -> None:
+        self.config = config
+        self.store = store
+
+
 class FakeStoreItem:
     def __init__(self, value: dict[str, Any]) -> None:
         self.value = value
@@ -219,6 +225,19 @@ def test_build_execution_environment_injects_git_identity_and_token() -> None:
     assert env["GIT_AUTHOR_EMAIL"] == "alice@example.com"
     assert env["GH_TOKEN"] == "token-abc"
     assert env["GITHUB_TOKEN"] == "token-abc"
+
+
+def test_build_execution_environment_tolerates_runtime_without_state_attribute() -> (
+    None
+):
+    runtime = FakeRuntimeWithoutState(config={})
+    backend = DockerBackend(runtime)  # type: ignore[arg-type]
+
+    env, token = backend._build_execution_environment()
+
+    assert token is None
+    assert env["PATH"]
+    assert "GH_TOKEN" not in env
 
 
 def test_docker_unavailable_message_mentions_socket_mount_when_socket_missing(

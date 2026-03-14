@@ -27,7 +27,6 @@ try:
         PatchFilesystemMiddleware,
     )
     from graphs.build_app_agent_v3.prompts import build_system_prompt
-    from graphs.build_app_agent_v3.repo_map_middleware import RepoMapMiddleware
 except ModuleNotFoundError:
     _module_dir = Path(__file__).resolve().parent
     _module_dir_str = str(_module_dir)
@@ -35,7 +34,6 @@ except ModuleNotFoundError:
         sys.path.insert(0, _module_dir_str)
     from patch_filesystem_middleware import PatchFilesystemMiddleware
     from prompts import build_system_prompt
-    from repo_map_middleware import RepoMapMiddleware
 
 
 def _resolve_model_max_tokens() -> int:
@@ -77,7 +75,6 @@ _middleware.extend(
         PatchFilesystemMiddleware(
             backend=DockerBackend,
         ),
-        RepoMapMiddleware(),
         PatchToolCallsMiddleware(),
     ]
 )
