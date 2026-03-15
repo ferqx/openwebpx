@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Preinstall common tooling for coding-agent terminal workflows.
 RUN apk add --no-cache \
     bash \
+    build-base \
     ca-certificates \
     coreutils \
     curl \
@@ -22,18 +23,22 @@ RUN apk add --no-cache \
     grep \
     jq \
     less \
+    libffi-dev \
     make \
     nano \
     nodejs \
     npm \
+    openssl-dev \
     openssh-client \
     patch \
     procps \
     py3-pip \
     python3 \
+    python3-dev \
     ripgrep \
     rsync \
     sed \
+    sqlite3 \
     tar \
     tree \
     tzdata \
@@ -45,7 +50,7 @@ RUN apk add --no-cache \
     zip \
     && npm install -g pm2 \
     && npm install -g pnpm yarn \
-    && python3 -m pip install --break-system-packages gitingest \
+    && npm install -g repomix \
     && update-ca-certificates
 
 WORKDIR /workspace
@@ -57,6 +62,9 @@ RUN echo "Python: $(python3 --version)" && \
     echo "Yarn: $(yarn --version)" && \
     echo "PM2: $(pm2 --version)" && \
     echo "Git: $(git --version)" && \
-    echo "rg: $(rg --version | head -1)"
+    echo "rg: $(rg --version | head -1)" && \
+    echo "GCC: $(gcc --version | head -1)" && \
+    echo "SQLite: $(sqlite3 --version)" && \
+    echo "OpenSSL: $(openssl version)"
 
 CMD ["/bin/bash"]

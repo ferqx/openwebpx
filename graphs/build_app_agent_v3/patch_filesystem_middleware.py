@@ -546,9 +546,9 @@ class PatchFilesystemMiddleware(
                     backend,
                     patch_content,
                     dry_run=dry_run,
-                    runtime_state=runtime.state
-                    if isinstance(runtime.state, dict)
-                    else None,
+                    runtime_state=(
+                        runtime.state if isinstance(runtime.state, dict) else None
+                    ),
                 )
                 return self._split_tool_payload_for_frontend(content)
             except Exception as exc:
@@ -588,9 +588,9 @@ class PatchFilesystemMiddleware(
                     backend,
                     patch_content,
                     dry_run=dry_run,
-                    runtime_state=runtime.state
-                    if isinstance(runtime.state, dict)
-                    else None,
+                    runtime_state=(
+                        runtime.state if isinstance(runtime.state, dict) else None
+                    ),
                 )
                 return self._split_tool_payload_for_frontend(content)
             except Exception as exc:

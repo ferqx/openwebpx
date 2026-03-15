@@ -7,6 +7,7 @@ from typing import Any
 import docker
 import pytest
 from docker.errors import NotFound
+from langchain_core.messages import SystemMessage
 
 from middleware.docker import (
     DockerMiddleware,
@@ -155,6 +156,54 @@ def test_before_agent_persists_thread_container_mapping_to_store() -> None:
             {"container_id": "cid-1"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_abefore_agent_appends_repository_context_message(monkeypatch) -> None:
+    manager = FakeContainerManager(existing={"cid-1": FakeContainer("cid-1")})
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+
+    monkeypatch.setattr(
+        middleware, "_repository_context_builder", lambda _runtime: "repo snapshot"
+    )
+
+    result = await middleware.abefore_agent({"container_id": "cid-1"}, runtime=None)
+
+    assert result is not None
+    messages = result.get("messages")
+    assert isinstance(messages, list)
+    assert any(
+        isinstance(message, SystemMessage) and message.content == "repo snapshot"
+        for message in messages
+    )
+    assert result.get("repository_context_fingerprint")
+
+
+@pytest.mark.asyncio
+async def test_abefore_agent_skips_duplicate_repository_context_message(
+    monkeypatch,
+) -> None:
+    manager = FakeContainerManager(existing={"cid-1": FakeContainer("cid-1")})
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+
+    monkeypatch.setattr(
+        middleware, "_repository_context_builder", lambda _runtime: "repo snapshot"
+    )
+
+    fingerprint = middleware._fingerprint("repo snapshot")
+    result = await middleware.abefore_agent(
+        {
+            "container_id": "cid-1",
+            "repository_context_fingerprint": fingerprint,
+        },
+        runtime=None,
+    )
+
+    assert result is not None
+    assert result.get("messages") is None
+    assert result.get("repository_context_fingerprint") == fingerprint
 
 
 def test_install_dependencies_auto_provisions_pnpm_via_corepack() -> None:

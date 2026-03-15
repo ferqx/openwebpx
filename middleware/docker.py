@@ -18,6 +18,7 @@ import threading
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -25,27 +26,17 @@ import docker
 from docker.errors import DockerException, NotFound
 from docker.models.containers import Container
 from langchain.agents.middleware.types import AgentMiddleware, AgentState, hook_config
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, SystemMessage
 from sqlalchemy import select
 
-from app.services.docker_bootstrap import (
-    build_corepack_prepare_command,
-)
+from app.services.docker_bootstrap import build_corepack_prepare_command
 from app.services.docker_executor import (
     install_dependencies as install_dependencies_exec,
 )
-from app.services.docker_executor import (
-    is_service_running as is_service_running_exec,
-)
-from app.services.docker_executor import (
-    probe_preview_urls,
-)
-from app.services.docker_executor import (
-    start_service as start_service_exec,
-)
-from app.services.docker_executor import (
-    tail_service_logs as tail_service_logs_exec,
-)
+from app.services.docker_executor import is_service_running as is_service_running_exec
+from app.services.docker_executor import probe_preview_urls
+from app.services.docker_executor import start_service as start_service_exec
+from app.services.docker_executor import tail_service_logs as tail_service_logs_exec
 from app.services.docker_repo import (
     build_repo_auth_context,
     build_repo_binding,
@@ -70,6 +61,9 @@ from app.services.docker_runtime import (
     resolve_package_manager_spec,
     resolve_start_script,
     strict_package_manager_reason,
+)
+from graphs.build_app_agent_v3.repository_context import (
+    RepositoryContextPromptBuilder,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +143,7 @@ class DockerState(AgentState):
     repo_sync_signature: str | None  # 最近一次仓库同步签名（容器+仓库+分支）
     repo_sync_success: bool | None  # 最近一次仓库同步是否成功
     repo_sync_error: str | None  # 最近一次仓库同步错误
+    repository_context_fingerprint: str | None  # 最近一次注入的仓库概要指纹
     repo_auth_context: (
         dict[str, str] | None
     )  # 命令执行阶段解析 SCM token 所需的最小上下文
@@ -213,6 +208,7 @@ class DockerMiddleware(AgentMiddleware):
         self.service_log_path = service_log_path or f"{_RUNTIME_DIR}/agent-web.log"
         self.service_pid_path = service_pid_path or f"{_RUNTIME_DIR}/agent-web.pid"
         self.container_kwargs = container_kwargs
+        self._repository_context_builder = RepositoryContextPromptBuilder()
         self._client: docker.DockerClient | None = None
         self._stop_timer_lock = threading.Lock()
         self._stop_timers: dict[str, threading.Timer] = {}
@@ -1923,6 +1919,9 @@ class DockerMiddleware(AgentMiddleware):
             "repo_sync_signature": state.get("repo_sync_signature"),
             "repo_sync_success": state.get("repo_sync_success"),
             "repo_sync_error": state.get("repo_sync_error"),
+            "repository_context_fingerprint": state.get(
+                "repository_context_fingerprint"
+            ),
         }
 
     @hook_config(can_jump_to=["end"])
@@ -1942,27 +1941,79 @@ class DockerMiddleware(AgentMiddleware):
         if not isinstance(container_id, str) or not container_id.strip():
             return base_update
 
+        repository_context_message, repository_context_fingerprint = (
+            self._build_repository_context_message(
+                runtime=runtime,
+                state=cast("DockerState", {**state, **base_update}),
+            )
+        )
         repo_update = await self._maybe_sync_thread_repository(
             state=state,
             runtime=runtime,
             container_id=container_id.strip(),
         )
-        if not repo_update:
-            return base_update
-
         merged = dict(base_update)
-        for key, value in repo_update.items():
-            if key == "messages" and isinstance(value, list):
-                existing_messages = (
-                    list(merged.get("messages", []))
-                    if isinstance(merged.get("messages"), list)
-                    else []
-                )
-                existing_messages.extend(value)
-                merged["messages"] = existing_messages
-            else:
-                merged[key] = value
+        if repo_update:
+            for key, value in repo_update.items():
+                if key == "messages" and isinstance(value, list):
+                    existing_messages = (
+                        list(merged.get("messages", []))
+                        if isinstance(merged.get("messages"), list)
+                        else []
+                    )
+                    existing_messages.extend(value)
+                    merged["messages"] = existing_messages
+                else:
+                    merged[key] = value
+        if (
+            repository_context_message is not None
+            and repository_context_fingerprint
+            != state.get("repository_context_fingerprint")
+        ):
+            existing_messages = (
+                list(merged.get("messages", []))
+                if isinstance(merged.get("messages"), list)
+                else []
+            )
+            existing_messages.append(repository_context_message)
+            merged["messages"] = existing_messages
+            merged["repository_context_fingerprint"] = repository_context_fingerprint
+        elif repository_context_message is not None:
+            merged["repository_context_fingerprint"] = repository_context_fingerprint
+            logger.info(
+                "Repository context prompt unchanged; skip reinjecting system message",
+                extra={
+                    "repository_context_fingerprint": repository_context_fingerprint
+                },
+            )
         return merged
+
+    def _build_repository_context_message(
+        self,
+        *,
+        runtime: Any,
+        state: DockerState,
+    ) -> tuple[SystemMessage | None, str | None]:
+        runtime_view = SimpleNamespace(
+            state=state,
+            config=getattr(runtime, "config", None),
+            store=getattr(runtime, "store", None),
+        )
+        try:
+            prompt = self._repository_context_builder(runtime_view)
+        except Exception:
+            logger.exception(
+                "Failed to build repository context prompt from Docker middleware",
+            )
+            return None, None
+        if not prompt:
+            return None, None
+        fingerprint = self._fingerprint(prompt)
+        logger.info(
+            "Repository context prompt prepared from Docker middleware",
+            extra={"repository_context_fingerprint": fingerprint},
+        )
+        return SystemMessage(content=prompt), fingerprint
 
     def after_agent(self, state: DockerState) -> dict[str, Any] | None:
         # 结束时再采样一次，确保外部 API 读取到的是最新运行结果。

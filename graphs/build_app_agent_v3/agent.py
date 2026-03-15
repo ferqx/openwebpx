@@ -8,12 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from deepagents.middleware.skills import SkillsMiddleware
 from deepagents.middleware.summarization import (
     SummarizationMiddleware,
     _compute_summarization_defaults,
 )
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelRetryMiddleware
+from langchain.agents.middleware import (
+    ClearToolUsesEdit,
+    ContextEditingMiddleware,
+    ModelRetryMiddleware,
+)
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain.chat_models import init_chat_model
 
@@ -76,6 +81,23 @@ _middleware.extend(
             backend=DockerBackend,
         ),
         PatchToolCallsMiddleware(),
+        ContextEditingMiddleware(
+            edits=[
+                ClearToolUsesEdit(
+                    trigger=100000,
+                    keep=3,
+                    placeholder="自动压缩",
+                ),
+            ],
+        ),
+        SkillsMiddleware(
+            backend=DockerBackend,
+            sources=[
+                "/workspace/.agents/skills/",
+                "/workspace/.roo/skills/",
+                "/workspace/.skills/",
+            ],
+        ),
     ]
 )
 

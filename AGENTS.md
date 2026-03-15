@@ -76,6 +76,12 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-15（build_app_agent_v3 容器仓库摘要协议与注入时序收敛）：
+  - `build_app_agent_v3` 的仓库摘要不再通过 `PatchFilesystemMiddleware.wrap_model_call` 动态拼接，而是在 `DockerMiddleware.abefore_agent` 中、容器创建与仓库同步完成后注入 `SystemMessage`，避免首次模型调用时 `runtime.state` 尚未带上 `container_id` 导致摘要为空。
+  - 摘要数据源固定为当前线程绑定容器的 `/workspace`；无容器、容器未就绪、容器扫描失败或 tree-sitter 不可用时，直接跳过摘要注入，不再回退宿主机本地目录。
+  - 若 `/workspace` 为空，或只包含 `README`、图片、文档等非源码文件，仓库摘要同样直接返回空；此场景属于正常空结果，不应报错，也不应仅凭目录树生成“伪摘要”。
+  - 摘要内容由 `graphs/build_app_agent_v3/repository_context.py` 生成，默认上限 3000 token，预算拆分为“代码签名与结构 2000 + 目录树 1000”；若与实时读取文件冲突，必须以最新读取的文件内容为准。
+  - `DockerMiddleware` 会记录 `repository_context_fingerprint`，相同摘要不会在多轮对话中重复注入，避免消息上下文膨胀。
 - 2026-03-14（build_app_agent_v2 退役与 build_app_agent_v3 重试增强）：
   - `graphs/build_app_agent_v2/*` 已从仓库移除，默认任务图继续收敛到 `build_app_agent_v3`；后续新增能力与协议约束均应以 `v3` 为准，不再向 `v2` 回填。
   - `graphs/build_app_agent_v3/agent.py` 接入 `ModelRetryMiddleware`，为模型调用增加最多 3 次指数退避重试（初始 1 秒、系数 2.0），降低瞬时模型错误导致的整次任务失败概率。
