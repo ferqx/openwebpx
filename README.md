@@ -37,6 +37,32 @@ docker compose up
 
 Open [http://localhost:8000/docs](http://localhost:8000/docs) to explore the API.
 
+For production deployment, use the non-reloading compose file:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+If you want the server to create sandbox containers from inside the `aegra` service,
+the service container must be able to reach the host Docker daemon. The provided
+compose files already mount `/var/run/docker.sock` and set
+`DOCKER_HOST=unix:///var/run/docker.sock`. For cross-platform compatibility the
+default compose files run `aegra` as `root` via `AEGRA_DOCKER_USER=0:0`, because
+Docker Desktop on macOS commonly exposes the socket as `root:root` with `660`
+permissions. On Linux, you can switch `AEGRA_DOCKER_USER=app` and set `DOCKER_GID`
+to the host socket group id after verifying the socket is group-writable. If you
+deploy with a custom manifest, preserve that configuration or Docker-backed sandbox
+initialization will fail.
+
+You can control when sandbox containers are stopped after each dialogue via
+`OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS` (default `1800`, i.e. 30 minutes).
+Set it to `0` for immediate stop behavior.
+
+For Langfuse in Docker deployments, configure `LANGFUSE_BASE_URL` rather than
+`LANGFUSE_HOST`. If Langfuse runs on the Docker host, use
+`http://host.docker.internal:3000`; if it runs in another container, use that
+container's service name instead of `localhost`.
+
 Your existing LangGraph code works without changes:
 
 ```python

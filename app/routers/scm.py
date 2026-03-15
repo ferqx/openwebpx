@@ -11,7 +11,7 @@ from hmac import compare_digest
 from hmac import new as hmac_new
 from threading import RLock
 from typing import Any, Literal
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 from aegra_api.core.orm import _get_session_maker
@@ -70,6 +70,19 @@ WHERE cache_key = :cache_key
 LIMIT 1
 """
 
+SCM_ROW_LIST_SQL = """
+SELECT
+  cache_key,
+  provider,
+  gitlab_base_url,
+  github_auth_mode,
+  token_encrypted,
+  updated_at
+FROM scm_tokens
+WHERE user_id = :user_id
+ORDER BY updated_at DESC
+"""
+
 SCM_TOKEN_REVOKED_HINTS = (
     "bad credentials",
     "invalid token",
@@ -109,6 +122,14 @@ def _normalize_github_auth_mode(auth_mode: str | None) -> ScmGithubAuthMode:
     return normalized  # type: ignore[return-value]
 
 
+def _coerce_github_auth_mode(auth_mode: str | None) -> ScmGithubAuthMode:
+    """Tolerate legacy persisted values and fall back to github_app."""
+    normalized = (auth_mode or "").strip().lower()
+    if normalized == "github_app":
+        return "github_app"
+    return "github_app"
+
+
 def _normalize_gitlab_base_url(value: str | None) -> str:
     if not value or not value.strip():
         return "https://gitlab.com"
@@ -120,6 +141,62 @@ def _normalize_gitlab_base_url(value: str | None) -> str:
 
 def _is_gitlab_enterprise(base_url: str, is_enterprise: bool) -> bool:
     return is_enterprise or base_url.rstrip("/").lower() != "https://gitlab.com"
+
+
+def _normalize_origin(value: str | None) -> str | None:
+    if not value or not value.strip():
+        return None
+    parsed = urlparse(value.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def _normalize_redirect_uri(value: str | None) -> str | None:
+    if not value or not value.strip():
+        return None
+    parsed = urlparse(value.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    path = parsed.path or "/"
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+    return None
+
+
+def _compute_expires_at(expires_in: Any) -> float | None:
+    expires = _coerce_float(expires_in)
+    if expires is None or expires <= 0:
+        return None
+    return time.time() + expires
+
+
+def _is_token_payload_expired(payload: dict[str, Any]) -> bool:
+    expires_at = _coerce_float(payload.get("expires_at"))
+    if expires_at is None:
+        return False
+    return expires_at <= time.time() + 30
+
+
+def _resolve_scm_connection_key(*, provider: str, gitlab_base_url: str | None) -> str:
+    if provider == "github":
+        return "github"
+    resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
+    if _is_gitlab_enterprise(resolved_base_url, False):
+        return f"gitlab_enterprise:{resolved_base_url.lower()}"
+    return "gitlab"
 
 
 def _cleanup_expired_scm_oauth_states() -> None:
@@ -252,9 +329,11 @@ async def _set_scm_token_payload(
         github_auth_mode = (
             payload.get("github_auth_mode")
             if isinstance(payload.get("github_auth_mode"), str)
-            else provider_scope.split(":", 1)[1]
-            if ":" in provider_scope
-            else "github_app"
+            else (
+                provider_scope.split(":", 1)[1]
+                if ":" in provider_scope
+                else "github_app"
+            )
         )
         github_auth_mode = _normalize_github_auth_mode(github_auth_mode)
     else:
@@ -323,6 +402,104 @@ async def _delete_scm_token_payload(cache_key: str) -> None:
             raise HTTPException(500, f"删除 SCM token 失败: {exc}") from exc
 
 
+async def _list_scm_token_rows_for_user(user_id: str) -> list[dict[str, Any]]:
+    session_maker = _get_session_maker()
+    async with session_maker() as session:
+        try:
+            result = await session.execute(
+                text(SCM_ROW_LIST_SQL),
+                {"user_id": user_id},
+            )
+        except SQLAlchemyError as exc:
+            raise HTTPException(500, f"查询 SCM 授权列表失败: {exc}") from exc
+    return [dict(row) for row in result.mappings().all()]
+
+
+async def _dedupe_scm_connections(
+    connections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Deduplicate by connection_key and keep the newest record."""
+    deduped: dict[str, dict[str, Any]] = {}
+    stale_cache_keys: list[str] = []
+
+    for connection in connections:
+        connection_key = connection.get("connection_key")
+        cache_key = connection.get("cache_key")
+        if not isinstance(connection_key, str) or not connection_key.strip():
+            continue
+        if not isinstance(cache_key, str) or not cache_key.strip():
+            continue
+
+        existing = deduped.get(connection_key)
+        if existing is None:
+            deduped[connection_key] = connection
+            continue
+
+        current_updated_at = _coerce_float(connection.get("updated_at")) or 0.0
+        existing_updated_at = _coerce_float(existing.get("updated_at")) or 0.0
+        if current_updated_at >= existing_updated_at:
+            stale_cache_keys.append(str(existing["cache_key"]))
+            deduped[connection_key] = connection
+        else:
+            stale_cache_keys.append(cache_key)
+
+    for cache_key in stale_cache_keys:
+        await _delete_scm_token_payload(cache_key)
+
+    return sorted(
+        deduped.values(),
+        key=lambda item: _coerce_float(item.get("updated_at")) or 0.0,
+        reverse=True,
+    )
+
+
+def _build_scm_connection_item(row: dict[str, Any]) -> dict[str, Any] | None:
+    provider_raw = str(row.get("provider") or "").strip().lower()
+    if provider_raw not in {"github", "gitlab"}:
+        return None
+
+    gitlab_base_url = (
+        _normalize_gitlab_base_url(str(row.get("gitlab_base_url") or "").strip())
+        if provider_raw == "gitlab"
+        else None
+    )
+    github_auth_mode = (
+        _coerce_github_auth_mode(str(row.get("github_auth_mode") or "github_app"))
+        if provider_raw == "github"
+        else None
+    )
+
+    token_encrypted = row.get("token_encrypted")
+    token_payload: dict[str, Any] | None = None
+    if isinstance(token_encrypted, str) and token_encrypted.strip():
+        token_payload = _decrypt_scm_token_payload(token_encrypted.strip())
+
+    expires_at = (
+        _coerce_float(token_payload.get("expires_at")) if token_payload else None
+    )
+    return {
+        "cache_key": str(row.get("cache_key") or "").strip(),
+        "provider": provider_raw,
+        "github_auth_mode": github_auth_mode,
+        "gitlab_base_url": gitlab_base_url,
+        "is_enterprise": bool(
+            gitlab_base_url and _is_gitlab_enterprise(gitlab_base_url, False)
+        ),
+        "connection_key": _resolve_scm_connection_key(
+            provider=provider_raw,
+            gitlab_base_url=gitlab_base_url,
+        ),
+        "updated_at": _coerce_float(row.get("updated_at")),
+        "expires_at": expires_at,
+        "expired": bool(expires_at is not None and expires_at <= time.time() + 30),
+        "has_refresh_token": bool(
+            token_payload
+            and isinstance(token_payload.get("refresh_token"), str)
+            and token_payload.get("refresh_token", "").strip()
+        ),
+    }
+
+
 async def _resolve_scm_token_payload(
     *,
     user_id: str,
@@ -377,12 +554,33 @@ async def _resolve_scm_access_token(
     gitlab_base_url: str | None,
     github_auth_mode: str | None = None,
 ) -> str:
+    cache_key = _scm_token_cache_key(
+        user_id=user_id,
+        provider=provider,
+        gitlab_base_url=gitlab_base_url,
+        github_auth_mode=github_auth_mode,
+    )
     token_payload = await _resolve_scm_token_payload(
         user_id=user_id,
         provider=provider,
         gitlab_base_url=gitlab_base_url,
         github_auth_mode=github_auth_mode,
     )
+
+    if _is_token_payload_expired(token_payload):
+        try:
+            token_payload = await _refresh_scm_token_payload_if_needed(
+                user_id=user_id,
+                provider=provider,
+                gitlab_base_url=gitlab_base_url,
+                github_auth_mode=github_auth_mode,
+                token_payload=token_payload,
+            )
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                await _delete_scm_token_payload(cache_key)
+            raise
+
     token = token_payload.get("access_token")
     if not isinstance(token, str) or not token.strip():
         raise HTTPException(401, "授权令牌不存在，请重新授权")
@@ -496,14 +694,7 @@ def _resolve_request_user_identity(request: Request | None) -> str:
     return "local-dev"
 
 
-async def _exchange_github_oauth_token(
-    *,
-    code: str,
-    redirect_uri: str,
-    github_auth_mode: str | None = None,
-) -> dict[str, Any]:
-    normalized_mode = _normalize_github_auth_mode(github_auth_mode)
-
+def _resolve_github_oauth_client_credentials() -> tuple[str, str]:
     client_id = _env_first(
         "GITHUB_APP_CLIENT_ID",
         "GITHUB_OAUTH_CLIENT_ID",
@@ -514,21 +705,64 @@ async def _exchange_github_oauth_token(
         "GITHUB_OAUTH_CLIENT_SECRET",
         "GITHUB_CLIENT_SECRET",
     )
-
     if not client_id or not client_secret:
         raise HTTPException(500, "缺少 GitHub App Client ID/Secret 环境变量")
+    return client_id, client_secret
+
+
+def _resolve_gitlab_oauth_client_credentials(*, is_enterprise: bool) -> tuple[str, str]:
+    if is_enterprise:
+        client_id = _env_first(
+            "GITLAB_ENTERPRISE_OAUTH_CLIENT_ID",
+            "GITLAB_OAUTH_CLIENT_ID",
+            "GITLAB_CLIENT_ID",
+        )
+        client_secret = _env_first(
+            "GITLAB_ENTERPRISE_OAUTH_CLIENT_SECRET",
+            "GITLAB_OAUTH_CLIENT_SECRET",
+            "GITLAB_CLIENT_SECRET",
+        )
+    else:
+        client_id = _env_first("GITLAB_OAUTH_CLIENT_ID", "GITLAB_CLIENT_ID")
+        client_secret = _env_first("GITLAB_OAUTH_CLIENT_SECRET", "GITLAB_CLIENT_SECRET")
+
+    if not client_id or not client_secret:
+        raise HTTPException(500, "缺少 GitLab OAuth Client ID/Secret 环境变量")
+    return client_id, client_secret
+
+
+def _raise_upstream_connect_error(service: str, exc: httpx.HTTPError) -> None:
+    detail = str(exc).strip()
+    suffix = f": {detail}" if detail else ""
+    raise HTTPException(
+        502,
+        f"{service} 网络连接失败，请检查服务容器的外网访问和 TLS 配置{suffix}",
+    ) from exc
+
+
+async def _exchange_github_oauth_token(
+    *,
+    code: str,
+    redirect_uri: str,
+    github_auth_mode: str | None = None,
+) -> dict[str, Any]:
+    normalized_mode = _normalize_github_auth_mode(github_auth_mode)
+    client_id, client_secret = _resolve_github_oauth_client_credentials()
 
     async with httpx.AsyncClient(timeout=20) as http_client:
-        response = await http_client.post(
-            "https://github.com/login/oauth/access_token",
-            data={
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "code": code,
-                "redirect_uri": redirect_uri,
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            response = await http_client.post(
+                "https://github.com/login/oauth/access_token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitHub token 交换", exc)
 
     if response.status_code >= 400:
         raise HTTPException(
@@ -546,22 +780,115 @@ async def _exchange_github_oauth_token(
         raise HTTPException(502, "GitHub 未返回 access_token")
 
     source_kind = "github_app"
-
-    if not isinstance(payload, dict):
-        return {
-            "access_token": token.strip(),
-            "github_token_source": source_kind,
-            "github_auth_mode": normalized_mode,
-        }
-    return {
+    result: dict[str, Any] = {
         "access_token": token.strip(),
-        "refresh_token": payload.get("refresh_token"),
-        "expires_in": payload.get("expires_in"),
-        "refresh_token_expires_in": payload.get("refresh_token_expires_in"),
-        "scope": payload.get("scope"),
-        "token_type": payload.get("token_type"),
         "github_token_source": source_kind,
         "github_auth_mode": normalized_mode,
+    }
+    if isinstance(payload, dict):
+        result.update(
+            {
+                "refresh_token": payload.get("refresh_token"),
+                "expires_in": payload.get("expires_in"),
+                "refresh_token_expires_in": payload.get("refresh_token_expires_in"),
+                "scope": payload.get("scope"),
+                "token_type": payload.get("token_type"),
+            }
+        )
+    expires_at = _compute_expires_at(result.get("expires_in"))
+    if expires_at is not None:
+        result["expires_at"] = expires_at
+    return result
+
+
+async def _refresh_github_oauth_token(
+    *,
+    refresh_token: str,
+    github_auth_mode: str | None = None,
+) -> dict[str, Any]:
+    normalized_mode = _normalize_github_auth_mode(github_auth_mode)
+    client_id, client_secret = _resolve_github_oauth_client_credentials()
+
+    async with httpx.AsyncClient(timeout=20) as http_client:
+        try:
+            response = await http_client.post(
+                "https://github.com/login/oauth/access_token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitHub token 刷新", exc)
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            401,
+            f"GitHub token 刷新失败: {response.text[:200]}",
+        )
+
+    payload = response.json() if response.content else {}
+    if isinstance(payload, dict) and payload.get("error"):
+        message = payload.get("error_description") or payload.get("error")
+        raise HTTPException(401, f"GitHub token 刷新失败: {message}")
+
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(401, "GitHub token 刷新未返回 access_token")
+
+    source_kind = normalized_mode
+    result: dict[str, Any] = {
+        "access_token": token.strip(),
+        "github_token_source": source_kind,
+        "github_auth_mode": normalized_mode,
+    }
+    if isinstance(payload, dict):
+        result.update(
+            {
+                "refresh_token": payload.get("refresh_token") or refresh_token,
+                "expires_in": payload.get("expires_in"),
+                "refresh_token_expires_in": payload.get("refresh_token_expires_in"),
+                "scope": payload.get("scope"),
+                "token_type": payload.get("token_type"),
+            }
+        )
+    expires_at = _compute_expires_at(result.get("expires_in"))
+    if expires_at is not None:
+        result["expires_at"] = expires_at
+    return result
+
+
+async def _fetch_github_authenticated_user_profile(
+    *,
+    access_token: str,
+) -> dict[str, str]:
+    async with httpx.AsyncClient(timeout=20) as http_client:
+        try:
+            response = await http_client.get(
+                "https://api.github.com/user",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {access_token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        except httpx.HTTPError:
+            return {}
+    if response.status_code >= 400:
+        return {}
+    payload = response.json() if response.content else {}
+    if not isinstance(payload, dict):
+        return {}
+    login = payload.get("login")
+    name = payload.get("name")
+    email = payload.get("email")
+    return {
+        "scm_user_login": login.strip() if isinstance(login, str) else "",
+        "scm_user_name": name.strip() if isinstance(name, str) else "",
+        "scm_user_email": email.strip().lower() if isinstance(email, str) else "",
     }
 
 
@@ -575,11 +902,14 @@ async def _fetch_github_installation_repositories(
         "Authorization": f"Bearer {access_token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    installations_response = await http_client.get(
-        "https://api.github.com/user/installations",
-        params={"per_page": 100},
-        headers=headers,
-    )
+    try:
+        installations_response = await http_client.get(
+            "https://api.github.com/user/installations",
+            params={"per_page": 100},
+            headers=headers,
+        )
+    except httpx.HTTPError as exc:
+        _raise_upstream_connect_error("GitHub 安装列表查询", exc)
     if installations_response.status_code in {403, 404}:
         return []
     if installations_response.status_code >= 400:
@@ -606,11 +936,14 @@ async def _fetch_github_installation_repositories(
         installation_id = installation.get("id")
         if not isinstance(installation_id, int):
             continue
-        repos_response = await http_client.get(
-            f"https://api.github.com/user/installations/{installation_id}/repositories",
-            params={"per_page": 100},
-            headers=headers,
-        )
+        try:
+            repos_response = await http_client.get(
+                f"https://api.github.com/user/installations/{installation_id}/repositories",
+                params={"per_page": 100},
+                headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitHub 安装仓库查询", exc)
         if repos_response.status_code in {403, 404}:
             continue
         if repos_response.status_code >= 400:
@@ -643,15 +976,18 @@ async def _fetch_github_user_repositories(
     http_client: httpx.AsyncClient,
     access_token: str,
 ) -> list[dict[str, Any]]:
-    response = await http_client.get(
-        "https://api.github.com/user/repos",
-        params={"sort": "updated", "per_page": 100},
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {access_token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+    try:
+        response = await http_client.get(
+            "https://api.github.com/user/repos",
+            params={"sort": "updated", "per_page": 100},
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {access_token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+    except httpx.HTTPError as exc:
+        _raise_upstream_connect_error("GitHub 仓库查询", exc)
     if response.status_code >= 400:
         raise HTTPException(
             response.status_code,
@@ -678,37 +1014,26 @@ async def _exchange_gitlab_oauth_token(
     redirect_uri: str,
     gitlab_base_url: str,
     is_enterprise: bool,
-) -> str:
-    if is_enterprise:
-        client_id = _env_first(
-            "GITLAB_ENTERPRISE_OAUTH_CLIENT_ID",
-            "GITLAB_OAUTH_CLIENT_ID",
-            "GITLAB_CLIENT_ID",
-        )
-        client_secret = _env_first(
-            "GITLAB_ENTERPRISE_OAUTH_CLIENT_SECRET",
-            "GITLAB_OAUTH_CLIENT_SECRET",
-            "GITLAB_CLIENT_SECRET",
-        )
-    else:
-        client_id = _env_first("GITLAB_OAUTH_CLIENT_ID", "GITLAB_CLIENT_ID")
-        client_secret = _env_first("GITLAB_OAUTH_CLIENT_SECRET", "GITLAB_CLIENT_SECRET")
-
-    if not client_id or not client_secret:
-        raise HTTPException(500, "缺少 GitLab OAuth Client ID/Secret 环境变量")
+) -> dict[str, Any]:
+    client_id, client_secret = _resolve_gitlab_oauth_client_credentials(
+        is_enterprise=is_enterprise
+    )
 
     async with httpx.AsyncClient(timeout=20) as http_client:
-        response = await http_client.post(
-            f"{gitlab_base_url}/oauth/token",
-            data={
-                "grant_type": "authorization_code",
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "code": code,
-                "redirect_uri": redirect_uri,
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            response = await http_client.post(
+                f"{gitlab_base_url}/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitLab token 交换", exc)
 
     if response.status_code >= 400:
         raise HTTPException(
@@ -718,12 +1043,159 @@ async def _exchange_gitlab_oauth_token(
 
     payload = response.json() if response.content else {}
     if isinstance(payload, dict) and payload.get("error"):
-        raise HTTPException(400, f"GitLab 授权失败: {payload.get('error')}")
+        message = payload.get("error_description") or payload.get("error")
+        raise HTTPException(400, f"GitLab 授权失败: {message}")
 
     token = payload.get("access_token") if isinstance(payload, dict) else None
     if not isinstance(token, str) or not token.strip():
         raise HTTPException(502, "GitLab 未返回 access_token")
-    return token.strip()
+
+    result: dict[str, Any] = {"access_token": token.strip()}
+    if isinstance(payload, dict):
+        result.update(
+            {
+                "refresh_token": payload.get("refresh_token"),
+                "expires_in": payload.get("expires_in"),
+                "scope": payload.get("scope"),
+                "token_type": payload.get("token_type"),
+            }
+        )
+    expires_at = _compute_expires_at(result.get("expires_in"))
+    if expires_at is not None:
+        result["expires_at"] = expires_at
+    return result
+
+
+async def _refresh_gitlab_oauth_token(
+    *,
+    refresh_token: str,
+    gitlab_base_url: str,
+    is_enterprise: bool,
+) -> dict[str, Any]:
+    client_id, client_secret = _resolve_gitlab_oauth_client_credentials(
+        is_enterprise=is_enterprise
+    )
+
+    async with httpx.AsyncClient(timeout=20) as http_client:
+        try:
+            response = await http_client.post(
+                f"{gitlab_base_url}/oauth/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            _raise_upstream_connect_error("GitLab token 刷新", exc)
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            401,
+            f"GitLab token 刷新失败: {response.text[:200]}",
+        )
+
+    payload = response.json() if response.content else {}
+    if isinstance(payload, dict) and payload.get("error"):
+        message = payload.get("error_description") or payload.get("error")
+        raise HTTPException(401, f"GitLab token 刷新失败: {message}")
+
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(401, "GitLab token 刷新未返回 access_token")
+
+    result: dict[str, Any] = {"access_token": token.strip()}
+    if isinstance(payload, dict):
+        result.update(
+            {
+                "refresh_token": payload.get("refresh_token") or refresh_token,
+                "expires_in": payload.get("expires_in"),
+                "scope": payload.get("scope"),
+                "token_type": payload.get("token_type"),
+            }
+        )
+    expires_at = _compute_expires_at(result.get("expires_in"))
+    if expires_at is not None:
+        result["expires_at"] = expires_at
+    return result
+
+
+async def _fetch_gitlab_authenticated_user_profile(
+    *,
+    access_token: str,
+    gitlab_base_url: str,
+) -> dict[str, str]:
+    async with httpx.AsyncClient(timeout=20) as http_client:
+        response = await http_client.get(
+            f"{gitlab_base_url}/api/v4/user",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if response.status_code >= 400:
+        return {}
+    payload = response.json() if response.content else {}
+    if not isinstance(payload, dict):
+        return {}
+    username = payload.get("username")
+    name = payload.get("name")
+    email = payload.get("email")
+    return {
+        "scm_user_login": username.strip() if isinstance(username, str) else "",
+        "scm_user_name": name.strip() if isinstance(name, str) else "",
+        "scm_user_email": email.strip().lower() if isinstance(email, str) else "",
+    }
+
+
+async def _refresh_scm_token_payload_if_needed(
+    *,
+    user_id: str,
+    provider: str,
+    gitlab_base_url: str | None,
+    github_auth_mode: str | None,
+    token_payload: dict[str, Any],
+) -> dict[str, Any]:
+    if not _is_token_payload_expired(token_payload):
+        return token_payload
+
+    refresh_token = token_payload.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        raise HTTPException(401, "SCM 授权已过期，请重新授权")
+
+    refreshed_payload: dict[str, Any]
+    if provider == "github":
+        refreshed_payload = await _refresh_github_oauth_token(
+            refresh_token=refresh_token.strip(),
+            github_auth_mode=github_auth_mode,
+        )
+    else:
+        resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
+        enterprise = _is_gitlab_enterprise(resolved_base_url, False)
+        refreshed_payload = await _refresh_gitlab_oauth_token(
+            refresh_token=refresh_token.strip(),
+            gitlab_base_url=resolved_base_url,
+            is_enterprise=enterprise,
+        )
+        refreshed_payload["provider"] = "gitlab"
+        refreshed_payload["gitlab_base_url"] = resolved_base_url
+
+    next_payload = {**token_payload, **refreshed_payload, "updated_at": time.time()}
+    if provider == "github":
+        next_payload["provider"] = "github"
+        if github_auth_mode:
+            next_payload["github_auth_mode"] = github_auth_mode
+    expires_at = _compute_expires_at(next_payload.get("expires_in"))
+    if expires_at is not None:
+        next_payload["expires_at"] = expires_at
+
+    cache_key = _scm_token_cache_key(
+        user_id=user_id,
+        provider=provider,
+        gitlab_base_url=gitlab_base_url,
+        github_auth_mode=github_auth_mode,
+    )
+    await _set_scm_token_payload(cache_key, next_payload)
+    return next_payload
 
 
 @router.get("/integrations/scm/oauth/authorize")
@@ -738,7 +1210,8 @@ async def scm_oauth_authorize(
     request: Request = None,
 ) -> Any:
     normalized_provider = _normalize_scm_provider(provider)
-    if not redirect_uri.strip():
+    normalized_redirect_uri = _normalize_redirect_uri(redirect_uri)
+    if not normalized_redirect_uri:
         raise HTTPException(400, "redirect_uri 不能为空")
 
     normalized_response_mode = response_mode.strip().lower()
@@ -758,13 +1231,17 @@ async def scm_oauth_authorize(
     )
 
     user_id = _resolve_request_user_identity(request)
+    normalized_origin = _normalize_origin(origin) or _normalize_origin(
+        normalized_redirect_uri
+    )
     state_payload = {
         "provider": normalized_provider,
         "user_id": user_id,
         "created_at": time.time(),
         "gitlab_base_url": resolved_base_url,
         "is_enterprise": bool(is_enterprise),
-        "origin": origin,
+        "origin": normalized_origin,
+        "redirect_uri": normalized_redirect_uri,
         "github_auth_mode": github_auth_mode,
         "nonce": uuid.uuid4().hex,
     }
@@ -773,7 +1250,7 @@ async def scm_oauth_authorize(
     authorize_url = _build_scm_authorize_url(
         provider=normalized_provider,
         state=state,
-        redirect_uri=redirect_uri,
+        redirect_uri=normalized_redirect_uri,
         gitlab_base_url=resolved_base_url,
         is_enterprise=is_enterprise,
         github_auth_mode=github_auth_mode,
@@ -823,13 +1300,33 @@ async def scm_oauth_callback(
         return {"ok": False, "error": "OAuth state 与当前用户不匹配"}
 
     provider = str(state_payload.get("provider", "")).strip().lower()
-    redirect_uri = (
+    redirect_uri_raw = (
         params.get("redirect_uri")
         or payload_dict.get("redirect_uri")
         or state_payload.get("redirect_uri")
     )
-    if not isinstance(redirect_uri, str) or not redirect_uri.strip():
+    redirect_uri = _normalize_redirect_uri(
+        redirect_uri_raw if isinstance(redirect_uri_raw, str) else None
+    )
+    if not redirect_uri:
         return {"ok": False, "error": "缺少 redirect_uri"}
+
+    expected_redirect_uri = _normalize_redirect_uri(
+        state_payload.get("redirect_uri")
+        if isinstance(state_payload.get("redirect_uri"), str)
+        else None
+    )
+    if expected_redirect_uri and redirect_uri != expected_redirect_uri:
+        return {"ok": False, "error": "OAuth redirect_uri 与授权请求不匹配"}
+
+    expected_origin = _normalize_origin(
+        state_payload.get("origin")
+        if isinstance(state_payload.get("origin"), str)
+        else None
+    )
+    actual_origin = _normalize_origin(redirect_uri)
+    if expected_origin and actual_origin and expected_origin != actual_origin:
+        return {"ok": False, "error": "OAuth origin 与授权请求不匹配"}
 
     try:
         if provider == "github":
@@ -862,11 +1359,17 @@ async def scm_oauth_callback(
                     "github_auth_mode": github_auth_mode,
                     "refresh_token": github_token_payload.get("refresh_token"),
                     "expires_in": github_token_payload.get("expires_in"),
+                    "expires_at": github_token_payload.get("expires_at"),
                     "refresh_token_expires_in": github_token_payload.get(
                         "refresh_token_expires_in"
                     ),
                     "scope": github_token_payload.get("scope"),
                     "token_type": github_token_payload.get("token_type"),
+                    **(
+                        await _fetch_github_authenticated_user_profile(
+                            access_token=access_token
+                        )
+                    ),
                 },
             )
         elif provider == "gitlab":
@@ -877,12 +1380,13 @@ async def scm_oauth_callback(
             enterprise = _is_gitlab_enterprise(
                 resolved_base_url, bool(state_payload.get("is_enterprise"))
             )
-            access_token = await _exchange_gitlab_oauth_token(
+            gitlab_token_payload = await _exchange_gitlab_oauth_token(
                 code=code,
                 redirect_uri=redirect_uri,
                 gitlab_base_url=resolved_base_url,
                 is_enterprise=enterprise,
             )
+            access_token = gitlab_token_payload["access_token"]
             cache_key = _scm_token_cache_key(
                 user_id=user_id,
                 provider="gitlab",
@@ -894,7 +1398,18 @@ async def scm_oauth_callback(
                     "provider": "gitlab",
                     "gitlab_base_url": resolved_base_url,
                     "access_token": access_token,
+                    "refresh_token": gitlab_token_payload.get("refresh_token"),
+                    "expires_in": gitlab_token_payload.get("expires_in"),
+                    "expires_at": gitlab_token_payload.get("expires_at"),
+                    "scope": gitlab_token_payload.get("scope"),
+                    "token_type": gitlab_token_payload.get("token_type"),
                     "updated_at": time.time(),
+                    **(
+                        await _fetch_gitlab_authenticated_user_profile(
+                            access_token=access_token,
+                            gitlab_base_url=resolved_base_url,
+                        )
+                    ),
                 },
             )
         else:
@@ -905,6 +1420,158 @@ async def scm_oauth_callback(
         return {"ok": False, "error": f"OAuth 回调处理失败: {exc}"}
 
     return {"ok": True}
+
+
+@router.get("/integrations/scm/connections")
+async def list_scm_connections(request: Request = None) -> dict[str, Any]:
+    user_id = _resolve_request_user_identity(request)
+    rows = await _list_scm_token_rows_for_user(user_id)
+
+    raw_connections: list[dict[str, Any]] = []
+    for row in rows:
+        connection = _build_scm_connection_item(row)
+        if connection is None:
+            continue
+        cache_key = connection.get("cache_key")
+        if not isinstance(cache_key, str) or not cache_key:
+            continue
+        if isinstance(row.get("token_encrypted"), str) and not connection.get(
+            "expired"
+        ):
+            raw_connections.append(connection)
+            continue
+
+        # token missing/corrupted/expired: keep entry but mark as expired.
+        raw_connections.append(connection)
+
+    connections = await _dedupe_scm_connections(raw_connections)
+
+    return {
+        "connections": [
+            {
+                "provider": item.get("provider"),
+                "github_auth_mode": item.get("github_auth_mode"),
+                "gitlab_base_url": item.get("gitlab_base_url"),
+                "is_enterprise": item.get("is_enterprise"),
+                "connection_key": item.get("connection_key"),
+                "updated_at": item.get("updated_at"),
+                "expires_at": item.get("expires_at"),
+                "expired": item.get("expired"),
+                "has_refresh_token": item.get("has_refresh_token"),
+            }
+            for item in connections
+        ]
+    }
+
+
+@router.delete("/integrations/scm/connections")
+async def revoke_scm_connection(
+    provider: str = Query(..., description="github or gitlab"),
+    gitlab_base_url: str | None = Query(None),
+    auth_mode: str | None = Query(None, description="github_app"),
+    request: Request = None,
+) -> dict[str, Any]:
+    normalized_provider = _normalize_scm_provider(provider)
+    github_auth_mode = (
+        _normalize_github_auth_mode(auth_mode)
+        if normalized_provider == "github"
+        else None
+    )
+    user_id = _resolve_request_user_identity(request)
+    cache_key = _scm_token_cache_key(
+        user_id=user_id,
+        provider=normalized_provider,
+        gitlab_base_url=gitlab_base_url,
+        github_auth_mode=github_auth_mode,
+    )
+    await _delete_scm_token_payload(cache_key)
+    return {
+        "ok": True,
+        "connection_key": _resolve_scm_connection_key(
+            provider=normalized_provider,
+            gitlab_base_url=gitlab_base_url,
+        ),
+    }
+
+
+@router.get("/integrations/scm/connections/validate")
+async def validate_scm_connection(
+    provider: str = Query(..., description="github or gitlab"),
+    gitlab_base_url: str | None = Query(None),
+    auth_mode: str | None = Query(None, description="github_app"),
+    request: Request = None,
+) -> dict[str, Any]:
+    normalized_provider = _normalize_scm_provider(provider)
+    github_auth_mode = (
+        _normalize_github_auth_mode(auth_mode)
+        if normalized_provider == "github"
+        else None
+    )
+    user_id = _resolve_request_user_identity(request)
+    cache_key = _scm_token_cache_key(
+        user_id=user_id,
+        provider=normalized_provider,
+        gitlab_base_url=gitlab_base_url,
+        github_auth_mode=github_auth_mode,
+    )
+
+    try:
+        token = await _resolve_scm_access_token(
+            user_id=user_id,
+            provider=normalized_provider,
+            gitlab_base_url=gitlab_base_url,
+            github_auth_mode=github_auth_mode,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            await _delete_scm_token_payload(cache_key)
+            return {
+                "ok": True,
+                "valid": False,
+                "revoked": True,
+                "error": str(exc.detail),
+            }
+        raise
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as http_client:
+            if normalized_provider == "github":
+                response = await http_client.get(
+                    "https://api.github.com/user",
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": f"Bearer {token}",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                if response.status_code >= 400:
+                    raise HTTPException(
+                        response.status_code,
+                        f"GitHub 授权验证失败: {response.text[:200]}",
+                    )
+            else:
+                resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
+                response = await http_client.get(
+                    f"{resolved_base_url}/api/v4/user",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if response.status_code >= 400:
+                    raise HTTPException(
+                        response.status_code,
+                        f"GitLab 授权验证失败: {response.text[:200]}",
+                    )
+    except HTTPException as exc:
+        revoked = _should_revoke_scm_token(normalized_provider, exc)
+        if revoked:
+            await _delete_scm_token_payload(cache_key)
+        return {
+            "ok": True,
+            "valid": False,
+            "revoked": revoked,
+            "error": str(exc.detail),
+        }
+
+    return {"ok": True, "valid": True, "revoked": False}
 
 
 @router.get("/integrations/scm/repositories")
@@ -927,13 +1594,13 @@ async def list_scm_repositories(
         gitlab_base_url=gitlab_base_url,
         github_auth_mode=github_auth_mode,
     )
-    token_payload = await _resolve_scm_token_payload(
+    token = await _resolve_scm_access_token(
         user_id=user_id,
         provider=normalized_provider,
         gitlab_base_url=gitlab_base_url,
         github_auth_mode=github_auth_mode,
     )
-    token = await _resolve_scm_access_token(
+    token_payload = await _resolve_scm_token_payload(
         user_id=user_id,
         provider=normalized_provider,
         gitlab_base_url=gitlab_base_url,
@@ -957,17 +1624,20 @@ async def list_scm_repositories(
                 return {"repositories": repositories}
 
             resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
-            response = await http_client.get(
-                f"{resolved_base_url}/api/v4/projects",
-                params={
-                    "membership": True,
-                    "simple": True,
-                    "per_page": 100,
-                    "order_by": "last_activity_at",
-                    "sort": "desc",
-                },
-                headers={"Authorization": f"Bearer {token}"},
-            )
+            try:
+                response = await http_client.get(
+                    f"{resolved_base_url}/api/v4/projects",
+                    params={
+                        "membership": True,
+                        "simple": True,
+                        "per_page": 100,
+                        "order_by": "last_activity_at",
+                        "sort": "desc",
+                    },
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab 仓库查询", exc)
             if response.status_code >= 400:
                 raise HTTPException(
                     response.status_code,
@@ -992,6 +1662,8 @@ async def list_scm_repositories(
             await _delete_scm_token_payload(cache_key)
             raise HTTPException(401, "SCM 授权已失效或已被撤销，请重新授权") from exc
         raise
+    except httpx.HTTPError as exc:
+        _raise_upstream_connect_error("SCM 仓库查询", exc)
 
 
 @router.get("/integrations/scm/branches")
@@ -1028,15 +1700,18 @@ async def list_scm_branches(
     try:
         async with httpx.AsyncClient(timeout=20) as http_client:
             if normalized_provider == "github":
-                response = await http_client.get(
-                    f"https://api.github.com/repos/{repo_full_name}/branches",
-                    params={"per_page": 100},
-                    headers={
-                        "Accept": "application/vnd.github+json",
-                        "Authorization": f"Bearer {token}",
-                        "X-GitHub-Api-Version": "2022-11-28",
-                    },
-                )
+                try:
+                    response = await http_client.get(
+                        f"https://api.github.com/repos/{repo_full_name}/branches",
+                        params={"per_page": 100},
+                        headers={
+                            "Accept": "application/vnd.github+json",
+                            "Authorization": f"Bearer {token}",
+                            "X-GitHub-Api-Version": "2022-11-28",
+                        },
+                    )
+                except httpx.HTTPError as exc:
+                    _raise_upstream_connect_error("GitHub 分支查询", exc)
                 if response.status_code >= 400:
                     raise HTTPException(
                         response.status_code,
@@ -1054,11 +1729,14 @@ async def list_scm_branches(
 
             resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
             encoded_repo = quote(repo_full_name, safe="")
-            response = await http_client.get(
-                f"{resolved_base_url}/api/v4/projects/{encoded_repo}/repository/branches",
-                params={"per_page": 100},
-                headers={"Authorization": f"Bearer {token}"},
-            )
+            try:
+                response = await http_client.get(
+                    f"{resolved_base_url}/api/v4/projects/{encoded_repo}/repository/branches",
+                    params={"per_page": 100},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab 分支查询", exc)
             if response.status_code >= 400:
                 raise HTTPException(
                     response.status_code,
@@ -1078,3 +1756,5 @@ async def list_scm_branches(
             await _delete_scm_token_payload(cache_key)
             raise HTTPException(401, "SCM 授权已失效或已被撤销，请重新授权") from exc
         raise
+    except httpx.HTTPError as exc:
+        _raise_upstream_connect_error("SCM 分支查询", exc)

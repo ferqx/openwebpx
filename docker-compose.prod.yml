@@ -1,5 +1,4 @@
 services:
-  # PostgreSQL database for LangGraph and metadata
   postgres:
     image: postgres:18
     env_file:
@@ -14,7 +13,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # Aegra Server
   aegra:
     build:
       context: .
@@ -37,22 +35,15 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./aegra.json:/app/aegra.json:ro
-      - ./app:/app/app:ro
-      - ./backends:/app/backends:ro
-      - ./middleware:/app/middleware:ro
-      - ./graphs:/app/graphs:ro
-      - ./src:/app/src:ro # for hot reload support of server
       - ./.env:/app/.env:ro
-      - ./alembic:/app/alembic:ro # for migrations
     command: >
       sh -c "
         echo 'Running database migrations...' &&
         /app/.venv/bin/alembic -c /app/alembic.ini upgrade head &&
         echo 'Starting Aegra server...' &&
-        /app/.venv/bin/uvicorn aegra_api.main:app --host 0.0.0.0 --port $${PORT:-8000} --reload
+        /app/.venv/bin/uvicorn aegra_api.main:app --host 0.0.0.0 --port $${PORT:-8000}
       "
 
-  # Redis (optional - for advanced queuing in future phases)
   redis:
     image: redis:7-alpine
     ports:

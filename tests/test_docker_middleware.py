@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 
+import docker
+import pytest
 from docker.errors import NotFound
+from langchain_core.messages import SystemMessage
 
-from middleware.docker import DockerMiddleware
+from middleware.docker import (
+    DockerMiddleware,
+    _docker_unavailable_message,
+    build_web_sandbox_docker_middleware,
+)
 
 
 class FakeContainer:
@@ -13,6 +22,8 @@ class FakeContainer:
         self.status = status
         self.started = False
         self.unpaused = False
+        self.stopped = False
+        self.exec_calls: list[dict[str, Any]] = []
 
     def reload(self) -> None:
         return None
@@ -24,6 +35,25 @@ class FakeContainer:
     def unpause(self) -> None:
         self.unpaused = True
         self.status = "running"
+
+    def stop(self, timeout: int = 5) -> None:  # noqa: ARG002
+        self.stopped = True
+        self.status = "exited"
+
+    def exec_run(
+        self,
+        cmd: list[str],
+        workdir: str,
+        environment: dict[str, str] | None = None,
+    ) -> SimpleNamespace:
+        self.exec_calls.append(
+            {
+                "cmd": cmd,
+                "workdir": workdir,
+                "environment": environment or {},
+            }
+        )
+        return SimpleNamespace(exit_code=0, output=b"")
 
 
 class FakeContainerManager:
@@ -126,3 +156,549 @@ def test_before_agent_persists_thread_container_mapping_to_store() -> None:
             {"container_id": "cid-1"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_abefore_agent_appends_repository_context_message(monkeypatch) -> None:
+    manager = FakeContainerManager(existing={"cid-1": FakeContainer("cid-1")})
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+
+    monkeypatch.setattr(
+        middleware, "_repository_context_builder", lambda _runtime: "repo snapshot"
+    )
+
+    result = await middleware.abefore_agent({"container_id": "cid-1"}, runtime=None)
+
+    assert result is not None
+    messages = result.get("messages")
+    assert isinstance(messages, list)
+    assert any(
+        isinstance(message, SystemMessage) and message.content == "repo snapshot"
+        for message in messages
+    )
+    assert result.get("repository_context_fingerprint")
+
+
+@pytest.mark.asyncio
+async def test_abefore_agent_skips_duplicate_repository_context_message(
+    monkeypatch,
+) -> None:
+    manager = FakeContainerManager(existing={"cid-1": FakeContainer("cid-1")})
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+
+    monkeypatch.setattr(
+        middleware, "_repository_context_builder", lambda _runtime: "repo snapshot"
+    )
+
+    fingerprint = middleware._fingerprint("repo snapshot")
+    result = await middleware.abefore_agent(
+        {
+            "container_id": "cid-1",
+            "repository_context_fingerprint": fingerprint,
+        },
+        runtime=None,
+    )
+
+    assert result is not None
+    assert result.get("messages") is None
+    assert result.get("repository_context_fingerprint") == fingerprint
+
+
+def test_install_dependencies_auto_provisions_pnpm_via_corepack() -> None:
+    middleware = DockerMiddleware()
+    state = {"pnpm_ready": False}
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command.startswith("command -v pnpm"):
+            return (0, "") if state["pnpm_ready"] else (1, "")
+        if command == "[ -d node_modules ]":
+            return 1, ""
+        return 0, ""
+
+    def fake_exec_stream(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+        on_output_line: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[int, str]:
+        if "corepack prepare" in command:
+            state["pnpm_ready"] = True
+            return 0, "prepared"
+        if command == "pnpm install":
+            return 0, "installed"
+        return 1, "unexpected command"
+
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+    middleware._exec_stream = fake_exec_stream  # type: ignore[method-assign]
+
+    ok, err = middleware._install_dependencies(
+        object(),
+        "pnpm",
+        package_json={"packageManager": "pnpm@9.0.0"},
+    )
+
+    assert ok is True
+    assert err is None
+
+
+def test_install_dependencies_reports_error_when_corepack_provision_fails() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command.startswith("command -v pnpm"):
+            return 1, ""
+        return 0, ""
+
+    def fake_exec_stream(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+        on_output_line: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[int, str]:
+        if "corepack prepare" in command:
+            return 127, "corepack: command not found"
+        return 1, "unexpected command"
+
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+    middleware._exec_stream = fake_exec_stream  # type: ignore[method-assign]
+
+    ok, err = middleware._install_dependencies(
+        object(),
+        "pnpm",
+        package_json={"packageManager": "pnpm@9.0.0"},
+    )
+
+    assert ok is False
+    assert isinstance(err, str)
+    assert "auto-provision via corepack failed" in err
+
+
+def test_resolve_runtime_package_manager_falls_back_to_npm() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_ensure(
+        _container: Any,
+        _manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,  # noqa: ARG001
+        reporter: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[bool, str | None]:
+        return False, "pnpm unavailable"
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command == "command -v npm >/dev/null 2>&1":
+            return 0, ""
+        return 1, ""
+
+    middleware._ensure_package_manager_available = fake_ensure  # type: ignore[method-assign]
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+
+    manager, err = middleware._resolve_runtime_package_manager(
+        object(),
+        detected_manager="pnpm",
+    )
+
+    assert manager == "npm"
+    assert err is None
+
+
+def test_resolve_runtime_package_manager_returns_error_without_fallback() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_ensure(
+        _container: Any,
+        _manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,  # noqa: ARG001
+        reporter: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[bool, str | None]:
+        return False, "pm unavailable"
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command == "command -v npm >/dev/null 2>&1":
+            return 1, ""
+        return 1, ""
+
+    middleware._ensure_package_manager_available = fake_ensure  # type: ignore[method-assign]
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+
+    manager, err = middleware._resolve_runtime_package_manager(
+        object(),
+        detected_manager="pnpm",
+    )
+
+    assert manager is None
+    assert err == "pm unavailable"
+
+
+def test_resolve_runtime_package_manager_does_not_fallback_when_workspace_protocol_present() -> (
+    None
+):
+    middleware = DockerMiddleware()
+
+    def fake_ensure(
+        _container: Any,
+        _manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,  # noqa: ARG001
+        reporter: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[bool, str | None]:
+        return False, "pnpm unavailable"
+
+    middleware._ensure_package_manager_available = fake_ensure  # type: ignore[method-assign]
+
+    manager, err = middleware._resolve_runtime_package_manager(
+        object(),
+        detected_manager="pnpm",
+        package_json={"dependencies": {"ui": "workspace:*"}},
+    )
+
+    assert manager is None
+    assert isinstance(err, str)
+    assert "refusing fallback to npm" in err
+
+
+def test_detect_package_manager_prefers_package_manager_field() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        if command == "command -v pnpm >/dev/null 2>&1":
+            return 0, ""
+        return 1, ""
+
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+
+    detected = middleware._detect_package_manager(
+        object(),
+        package_json={"packageManager": "pnpm@9.1.0"},
+    )
+
+    assert detected == "pnpm"
+
+
+def test_after_agent_schedules_delayed_stop_when_dialog_finishes() -> None:
+    running = FakeContainer("cid-1", status="running")
+    manager = FakeContainerManager(existing={"cid-1": running})
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+    scheduled: list[str] = []
+    middleware._schedule_container_stop = scheduled.append  # type: ignore[method-assign]
+    middleware._build_runtime_status = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "service_running": True,
+        "service_pid": "123",
+    }
+
+    result = middleware.after_agent({"container_id": "cid-1"})
+
+    assert result is not None
+    assert running.stopped is False
+    assert scheduled == ["cid-1"]
+    assert result["container_id"] == "cid-1"
+    assert result["service_status"]["service_running"] is True
+    assert result["service_status"]["service_pid"] == "123"
+    assert result["service_status"]["stop_scheduled_in_seconds"] == 1800.0
+
+
+def test_before_agent_cancels_scheduled_stop_for_reused_container() -> None:
+    running = FakeContainer("cid-1", status="running")
+    manager = FakeContainerManager(existing={"cid-1": running})
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+    cancelled: list[str] = []
+    middleware._cancel_scheduled_container_stop = cancelled.append  # type: ignore[method-assign]
+
+    result = middleware.before_agent({"container_id": "cid-1"}, runtime=None)
+
+    assert result is not None
+    assert cancelled == ["cid-1"]
+    assert result.get("container_id") == "cid-1"
+
+
+def test_maybe_sync_thread_repository_refreshes_runtime_env_for_reused_repo() -> None:
+    container = FakeContainer("cid-1", status="running")
+    manager = FakeContainerManager(existing={"cid-1": container})
+    runtime = FakeRuntime(thread_id="thread-1")
+    middleware = DockerMiddleware()
+    middleware._client = FakeDockerClient(manager)
+
+    binding = {
+        "user_id": "u-1",
+        "provider": "github",
+        "repo": "owner/repo",
+        "branch": "main",
+        "git_name": "Alice",
+        "git_email": "alice@example.com",
+        "gitlab_base_url": "",
+        "github_auth_mode": "github_app",
+    }
+    calls: list[tuple[str, str]] = []
+
+    async def fake_aload_thread_repo_binding(_runtime: Any) -> dict[str, str]:
+        return binding
+
+    async def fake_resolve_token(**_kwargs: Any) -> str:
+        return "token-abc"
+
+    async def fake_refresh_runtime_environment(
+        **kwargs: Any,
+    ) -> tuple[bool, str | None]:
+        calls.append((kwargs["container_id"], kwargs["token"]))
+        assert kwargs["binding"] is binding
+        return True, None
+
+    middleware._aload_thread_repo_binding = fake_aload_thread_repo_binding  # type: ignore[method-assign]
+    middleware._resolve_thread_repo_access_token = fake_resolve_token  # type: ignore[method-assign]
+    middleware._refresh_repo_runtime_environment = fake_refresh_runtime_environment  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        middleware._maybe_sync_thread_repository(
+            state={
+                "repo_sync_signature": "cid-1|github|owner/repo|main||github_app",
+                "repo_sync_success": True,
+            },
+            runtime=runtime,
+            container_id="cid-1",
+        )
+    )
+
+    assert result is not None
+    assert calls == [("cid-1", "token-abc")]
+    assert result["repo_auth_context"]["provider"] == "github"
+    assert result["repo_git_identity"]["email"] == "alice@example.com"
+
+
+def test_configure_git_runtime_in_container_reports_missing_git_repo() -> None:
+    middleware = DockerMiddleware()
+
+    def fake_exec(
+        _container: Any,
+        command: str,
+        *,
+        workdir: str | None = None,  # noqa: ARG001
+        environment: dict[str, str] | None = None,  # noqa: ARG001
+        user: str | None = None,  # noqa: ARG001
+    ) -> tuple[int, str]:
+        assert 'if [ ! -d "$WORKDIR/.git" ]' in command
+        return 1, "git repository missing at /workspace"
+
+    middleware._exec = fake_exec  # type: ignore[method-assign]
+
+    ok, err = middleware._configure_git_runtime_in_container(
+        container=object(),  # type: ignore[arg-type]
+        binding={
+            "provider": "github",
+            "git_name": "Alice",
+            "git_email": "alice@example.com",
+        },
+        token="token-abc",
+    )
+
+    assert ok is False
+    assert err == "git repository missing at /workspace"
+
+
+def test_install_dependencies_delegates_to_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    middleware = DockerMiddleware()
+    called: dict[str, Any] = {}
+
+    def fake_ensure(
+        _container: Any,
+        _manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,  # noqa: ARG001
+        reporter: Any = None,  # noqa: ANN401, ARG001
+    ) -> tuple[bool, str | None]:
+        return True, None
+
+    def fake_install_dependencies_exec(**kwargs: Any) -> tuple[bool, str | None]:
+        called.update(kwargs)
+        return True, None
+
+    middleware._ensure_package_manager_available = fake_ensure  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "middleware.docker.install_dependencies_exec",
+        fake_install_dependencies_exec,
+    )
+
+    ok, err = middleware._install_dependencies(
+        object(),
+        "pnpm",
+        package_json={"packageManager": "pnpm@9.0.0"},
+    )
+
+    assert ok is True
+    assert err is None
+    assert called["package_manager"] == "pnpm"
+    assert callable(called["exec_fn"])
+    assert callable(called["exec_stream_fn"])
+
+
+def test_start_service_delegates_to_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    middleware = DockerMiddleware()
+    called: dict[str, Any] = {}
+
+    def fake_start_service_exec(**kwargs: Any) -> tuple[bool, str | None]:
+        called.update(kwargs)
+        return True, None
+
+    monkeypatch.setattr(
+        "middleware.docker.start_service_exec",
+        fake_start_service_exec,
+    )
+
+    ok, err = middleware._start_service(
+        object(),  # type: ignore[arg-type]
+        package_manager="pnpm",
+        start_script="dev",
+        framework="vite",
+        port=3000,
+    )
+
+    assert ok is True
+    assert err is None
+    assert called["run_cmd"] == "pnpm run dev -- --host 0.0.0.0 --port 3000"
+    assert called["port"] == 3000
+    assert callable(called["exec_fn"])
+    assert callable(called["is_service_running_fn"])
+
+
+def test_build_runtime_status_returns_node_app_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    middleware = DockerMiddleware()
+    container = FakeContainer("cid-1", status="running")
+
+    monkeypatch.setattr(
+        middleware,
+        "_read_package_json",
+        lambda _container: {
+            "packageManager": "pnpm@9.0.0",
+            "scripts": {"dev": "vite"},
+            "dependencies": {"vite": "^5.0.0"},
+        },
+    )
+    monkeypatch.setattr(middleware, "_detect_framework", lambda _pkg: "vite")
+    monkeypatch.setattr(
+        middleware, "_detect_package_manager", lambda *_args, **_kwargs: "pnpm"
+    )
+    monkeypatch.setattr(
+        middleware,
+        "_resolve_runtime_package_manager",
+        lambda *_args, **_kwargs: ("pnpm", None),
+    )
+    monkeypatch.setattr(middleware, "_resolve_start_script", lambda _pkg: "dev")
+    monkeypatch.setattr(
+        middleware,
+        "_build_start_command",
+        lambda **_kwargs: "pnpm run dev -- --host 0.0.0.0 --port 3000",
+    )
+    monkeypatch.setattr(
+        middleware, "_install_dependencies", lambda *_args, **_kwargs: (True, None)
+    )
+    monkeypatch.setattr(
+        middleware, "_is_service_running", lambda _container: (True, "123")
+    )
+    monkeypatch.setattr(
+        middleware, "_collect_port_bindings", lambda _container: {"3000/tcp": [4010]}
+    )
+    monkeypatch.setattr(
+        middleware, "_build_preview_urls", lambda _bindings: ["http://127.0.0.1:4010/"]
+    )
+    monkeypatch.setattr(
+        middleware,
+        "_probe_preview_urls",
+        lambda _urls: {"http://127.0.0.1:4010/": "200"},
+    )
+    monkeypatch.setattr(middleware, "_tail_service_logs", lambda _container: "ready\n")
+    monkeypatch.setattr(middleware, "_extract_error_lines", lambda _logs: [])
+
+    status = middleware._build_runtime_status(
+        {
+            "repo_sync_signature": "sig",
+            "repo_sync_success": True,
+            "repo_sync_error": None,
+            "service_restart_count": 0,
+        },
+        container,
+    )
+
+    assert status["app_detected"] is True
+    assert status["framework"] == "vite"
+    assert status["package_manager"] == "pnpm"
+    assert status["service_running"] is True
+    assert status["preview_probes"]["http://127.0.0.1:4010/"] == "200"
+
+
+def test_docker_unavailable_message_mentions_socket_mount_when_socket_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("middleware.docker.Path.exists", lambda _self: False)
+
+    message = _docker_unavailable_message(docker.errors.DockerException("boom"))
+
+    assert "/var/run/docker.sock" in message
+    assert "DOCKER_HOST=unix:///var/run/docker.sock" in message
+
+
+def test_docker_unavailable_message_mentions_group_add_on_permission_denied() -> None:
+    message = _docker_unavailable_message(
+        docker.errors.DockerException("PermissionError(13, 'Permission denied')")
+    )
+
+    assert "group_add" in message
+    assert "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" in message
+
+
+def test_build_web_sandbox_middleware_uses_stop_delay_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS", "600")
+
+    middleware = build_web_sandbox_docker_middleware()
+
+    assert middleware.stop_delay_seconds == 600

@@ -11,29 +11,125 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
+import os
 import shlex
-import time
+import threading
 from collections.abc import Callable
 from contextlib import suppress
-from pathlib import PurePosixPath
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import docker
-import httpx
 from docker.errors import DockerException, NotFound
 from docker.models.containers import Container
 from langchain.agents.middleware.types import AgentMiddleware, AgentState, hook_config
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, SystemMessage
 from sqlalchemy import select
+
+from app.services.docker_bootstrap import build_corepack_prepare_command
+from app.services.docker_executor import (
+    install_dependencies as install_dependencies_exec,
+)
+from app.services.docker_executor import is_service_running as is_service_running_exec
+from app.services.docker_executor import probe_preview_urls
+from app.services.docker_executor import start_service as start_service_exec
+from app.services.docker_executor import tail_service_logs as tail_service_logs_exec
+from app.services.docker_repo import (
+    build_repo_auth_context,
+    build_repo_binding,
+    build_repo_git_identity,
+    build_repo_remote_urls,
+    build_repo_sync_signature,
+    extract_error_message,
+    normalize_repo_auth_mode,
+    normalize_repo_provider,
+    sanitize_repo_sync_error,
+)
+from app.services.docker_runtime import (
+    build_diagnostic_message,
+    build_preview_urls,
+    build_start_command,
+    collect_port_bindings_from_attrs,
+    detect_framework,
+    detect_package_manager_from_package_json,
+    extract_error_lines,
+    lockfile_checks,
+    parse_package_json,
+    resolve_package_manager_spec,
+    resolve_start_script,
+    strict_package_manager_reason,
+)
+from graphs.build_app_agent_v3.repository_context import (
+    RepositoryContextPromptBuilder,
+)
 
 logger = logging.getLogger(__name__)
 # 沙盒内服务必须监听全接口，才能通过 Docker 端口映射被宿主机预览访问。
 BIND_ALL_HOST = "0.0.0.0"  # nosec B104
-DEFAULT_WEB_SANDBOX_IMAGE = "node:20-bookworm"
+DEFAULT_WEB_SANDBOX_IMAGE = "sandbox-agent:latest"
 DEFAULT_WEB_SANDBOX_CONTAINER_PORT = 3000
+DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS = 30 * 60
+_EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SCM_BASH_ENV = "/etc/profile.d/openwebpx-scm.sh"
+_RUNTIME_DIR = "/root/.agent-runtime"
+
+
+def _resolve_stop_delay_seconds_from_env() -> float:
+    raw_value = os.getenv("OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS", "").strip()
+    if not raw_value:
+        return float(DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS)
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS=%r, fallback to %s",
+            raw_value,
+            DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS,
+        )
+        return float(DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS)
+    if parsed < 0:
+        logger.warning(
+            "Negative OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS=%r, fallback to %s",
+            raw_value,
+            DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS,
+        )
+        return float(DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS)
+    return parsed
+
+
+def _docker_unavailable_message(exc: DockerException) -> str:
+    """返回更可操作的 Docker 不可用诊断信息。"""
+    base = "Docker is not available."
+    details = str(exc).strip()
+    socket_exists = Path("/var/run/docker.sock").exists()
+    permission_denied = (
+        "PermissionError(13" in details or "Permission denied" in details
+    )
+    if permission_denied:
+        guidance = (
+            " The Docker socket is present but this process cannot access it. If "
+            "OpenWebPX is running inside Docker, add the service container to the "
+            "host Docker socket group, for example via group_add with "
+            "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock), and keep "
+            "DOCKER_HOST=unix:///var/run/docker.sock."
+        )
+    elif not socket_exists:
+        guidance = (
+            " If OpenWebPX is running inside Docker, mount /var/run/docker.sock into "
+            "the service container and set DOCKER_HOST=unix:///var/run/docker.sock. "
+            "Otherwise ensure Docker is installed and the daemon is running on the host."
+        )
+    else:
+        guidance = (
+            " Ensure the Docker daemon is running and that this process can access "
+            "/var/run/docker.sock."
+        )
+    if details:
+        return f"{base}{guidance} Original error: {details}"
+    return f"{base}{guidance}"
 
 
 class DockerState(AgentState):
@@ -47,6 +143,11 @@ class DockerState(AgentState):
     repo_sync_signature: str | None  # 最近一次仓库同步签名（容器+仓库+分支）
     repo_sync_success: bool | None  # 最近一次仓库同步是否成功
     repo_sync_error: str | None  # 最近一次仓库同步错误
+    repository_context_fingerprint: str | None  # 最近一次注入的仓库概要指纹
+    repo_auth_context: (
+        dict[str, str] | None
+    )  # 命令执行阶段解析 SCM token 所需的最小上下文
+    repo_git_identity: dict[str, str] | None  # 由授权 SCM 账户推导的 git 身份
 
 
 class ContainerDestroyedError(RuntimeError):
@@ -76,6 +177,7 @@ class DockerMiddleware(AgentMiddleware):
         max_restart_attempts: int = 2,
         service_log_path: str | None = None,
         service_pid_path: str | None = None,
+        stop_delay_seconds: float = DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS,
         **container_kwargs: Any,
     ) -> None:
         """初始化DockerMiddleware。
@@ -89,8 +191,9 @@ class DockerMiddleware(AgentMiddleware):
             startup_wait_seconds: 服务启动后等待时间（秒）（默认：2.0）。
             healthcheck_path: 健康检查路径（默认："/"）。
             max_restart_attempts: 最大重启尝试次数（默认：2）。
-            service_log_path: 服务日志文件路径（默认：<workdir>/.agent-runtime/agent-web.log）。
-            service_pid_path: 服务PID文件路径（默认：<workdir>/.agent-runtime/agent-web.pid）。
+            service_log_path: 服务日志文件路径（默认：/root/.agent-runtime/agent-web.log）。
+            service_pid_path: 服务PID文件路径（默认：/root/.agent-runtime/agent-web.pid）。
+            stop_delay_seconds: 对话结束后延迟停止容器的秒数（默认：1800）。
             **container_kwargs: 传递给docker容器创建的其他参数。
         """
         self.image = image
@@ -101,11 +204,14 @@ class DockerMiddleware(AgentMiddleware):
         self.startup_wait_seconds = startup_wait_seconds
         self.healthcheck_path = healthcheck_path
         self.max_restart_attempts = max_restart_attempts
-        runtime_dir = f"{self.workdir.rstrip('/')}/.agent-runtime"
-        self.service_log_path = service_log_path or f"{runtime_dir}/agent-web.log"
-        self.service_pid_path = service_pid_path or f"{runtime_dir}/agent-web.pid"
+        self.stop_delay_seconds = max(0.0, float(stop_delay_seconds))
+        self.service_log_path = service_log_path or f"{_RUNTIME_DIR}/agent-web.log"
+        self.service_pid_path = service_pid_path or f"{_RUNTIME_DIR}/agent-web.pid"
         self.container_kwargs = container_kwargs
+        self._repository_context_builder = RepositoryContextPromptBuilder()
         self._client: docker.DockerClient | None = None
+        self._stop_timer_lock = threading.Lock()
+        self._stop_timers: dict[str, threading.Timer] = {}
 
     @property
     def client(self) -> docker.DockerClient:
@@ -116,9 +222,7 @@ class DockerMiddleware(AgentMiddleware):
                 self._client = docker.from_env()
             except DockerException as exc:
                 logger.error("Failed to initialize Docker client: %s", exc)
-                raise RuntimeError(
-                    "Docker is not available. Please ensure Docker is installed and running."
-                ) from exc
+                raise RuntimeError(_docker_unavailable_message(exc)) from exc
         return self._client
 
     def _restore_container_if_needed(
@@ -163,6 +267,7 @@ class DockerMiddleware(AgentMiddleware):
             try:
                 container = self.client.containers.get(container_id)
                 self._restore_container_if_needed(container, container_id=container_id)
+                self._bootstrap_global_scm_env_in_container(container)
                 return cast("str", container_id)
             except NotFound:
                 raise ContainerDestroyedError(
@@ -170,14 +275,25 @@ class DockerMiddleware(AgentMiddleware):
                 ) from None
 
         # 仅在容器不存在时创建新容器，并保持常驻进程防止容器自动退出。
+        container_kwargs = dict(self.container_kwargs)
+        merged_environment = {
+            "SHELL": "/bin/bash",
+            "BASH_ENV": _SCM_BASH_ENV,
+        }
+        extra_environment = container_kwargs.pop("environment", None)
+        if isinstance(extra_environment, dict):
+            merged_environment.update(
+                {str(key): str(value) for key, value in extra_environment.items()}
+            )
         try:
             container = self.client.containers.run(
                 self.image,
                 command=["tail", "-f", "/dev/null"],
                 detach=True,
                 working_dir=self.workdir,
+                environment=merged_environment,
                 ports=self.ports,
-                **self.container_kwargs,
+                **container_kwargs,
             )
         except DockerException as exc:
             raise RuntimeError(f"Failed to create Docker container: {exc}") from exc
@@ -185,7 +301,49 @@ class DockerMiddleware(AgentMiddleware):
         if not container.id:
             raise RuntimeError("Failed to create Docker container: No ID returned")
         logger.info("Created container %s", container.id)
+        self._bootstrap_global_scm_env_in_container(container)
         return container.id
+
+    def _bootstrap_global_scm_env_in_container(self, container: Container) -> None:
+        """在容器初始化阶段创建全局持久 SCM 环境脚本。"""
+        cmd = (
+            "set -e; "
+            f'ENV_FILE="{_SCM_BASH_ENV}"; '
+            f"WORKDIR={shlex.quote(self.workdir)}; "
+            f'WORKSPACE_ENV_FILE="{_RUNTIME_DIR}/openwebpx-scm.sh"; '
+            'BASHRC_FILE="/root/.bashrc"; '
+            'BASH_PROFILE_FILE="/root/.bash_profile"; '
+            f'mkdir -p /etc/profile.d "{_RUNTIME_DIR}"; '
+            "cat > \"$ENV_FILE\" <<'EOF'\n"
+            "# OpenWebPX SCM runtime env\n"
+            'export SCM_TOKEN="${SCM_TOKEN-}"\n'
+            'export GITLAB_TOKEN="${GITLAB_TOKEN-}"\n'
+            'export GLAB_TOKEN="${GLAB_TOKEN-}"\n'
+            'export GITLAB_ACCESS_TOKEN="${GITLAB_ACCESS_TOKEN-}"\n'
+            'export GLAB_HOST="${GLAB_HOST-}"\n'
+            'export GITLAB_HOST="${GITLAB_HOST-}"\n'
+            'export GH_TOKEN="${GH_TOKEN-}"\n'
+            'export GITHUB_TOKEN="${GITHUB_TOKEN-}"\n'
+            "EOF\n"
+            'chmod 600 "$ENV_FILE"; '
+            'cp "$ENV_FILE" "$WORKSPACE_ENV_FILE"; '
+            'chmod 600 "$WORKSPACE_ENV_FILE"; '
+            'grep -q "openwebpx-scm.sh" "$BASHRC_FILE" 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> "$BASHRC_FILE"; '
+            'chmod 600 "$BASHRC_FILE"; '
+            'grep -q ".bashrc" "$BASH_PROFILE_FILE" 2>/dev/null || echo "[ -f /root/.bashrc ] && . /root/.bashrc" >> "$BASH_PROFILE_FILE"; '
+            'chmod 600 "$BASH_PROFILE_FILE"; '
+            'grep -q "openwebpx-scm.sh" /root/.profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /root/.profile; '
+            'grep -q "openwebpx-scm.sh" /etc/profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /etc/profile'
+        )
+        code, output = self._exec(
+            container,
+            cmd,
+            environment={"PATH": _EXEC_PATH},
+        )
+        if code != 0:
+            raise RuntimeError(
+                f"Failed to initialize SCM shell env in container: {output.strip() or 'unknown error'}"
+            )
 
     def _destroy_container(self, container_id: str) -> tuple[bool, str | None]:
         """销毁线程绑定容器。"""
@@ -197,6 +355,63 @@ class DockerMiddleware(AgentMiddleware):
             return True, None
         except DockerException as exc:
             return False, str(exc)
+
+    def _stop_container(self, container_id: str) -> tuple[bool, str | None]:
+        """停止线程绑定容器，但保留容器供后续会话复用。"""
+        try:
+            container = self.client.containers.get(container_id)
+            with suppress(DockerException):
+                container.reload()
+            status = str(getattr(container, "status", "") or "").lower()
+            if status in {"created", "exited", "dead"}:
+                return True, None
+            container.stop(timeout=5)
+            return True, None
+        except NotFound:
+            # 容器已不存在时视为已停止，避免收尾流程报错。
+            return True, None
+        except DockerException as exc:
+            return False, str(exc)
+
+    def _cancel_scheduled_container_stop(self, container_id: str) -> None:
+        with self._stop_timer_lock:
+            timer = self._stop_timers.pop(container_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_container_stop(self, container_id: str) -> None:
+        if self.stop_delay_seconds <= 0:
+            stopped, stop_error = self._stop_container(container_id)
+            if not stopped and stop_error:
+                logger.warning(
+                    "Failed to stop container %s: %s",
+                    container_id,
+                    stop_error,
+                )
+            return
+
+        self._cancel_scheduled_container_stop(container_id)
+
+        def _stop_later() -> None:
+            with self._stop_timer_lock:
+                timer = self._stop_timers.get(container_id)
+                if timer is None:
+                    return
+                self._stop_timers.pop(container_id, None)
+
+            stopped, stop_error = self._stop_container(container_id)
+            if not stopped and stop_error:
+                logger.warning(
+                    "Failed to stop container %s: %s",
+                    container_id,
+                    stop_error,
+                )
+
+        timer = threading.Timer(self.stop_delay_seconds, _stop_later)
+        timer.daemon = True
+        with self._stop_timer_lock:
+            self._stop_timers[container_id] = timer
+        timer.start()
 
     def _persist_thread_container_mapping(
         self,
@@ -272,31 +487,44 @@ class DockerMiddleware(AgentMiddleware):
         metadata = (
             thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
         )
-        repo = str(metadata.get("repo") or "").strip()
-        if not repo or repo in {"未绑定仓库", "none", "null"}:
+        provider = normalize_repo_provider(str(metadata.get("provider") or ""))
+        if provider is None:
             return None
-
-        provider_raw = str(metadata.get("provider") or "").strip().lower()
-        if provider_raw == "github":
-            provider = "github"
-        elif provider_raw in {"gitlab", "gitlab_enterprise"}:
-            provider = "gitlab"
-        else:
-            return None
-
-        branch = str(metadata.get("branch") or "main").strip() or "main"
         gitlab_base_url = str(metadata.get("gitlab_base_url") or "").strip()
         github_auth_mode = str(metadata.get("github_auth_mode") or "").strip().lower()
 
-        return {
-            "thread_id": thread_id,
-            "user_id": str(thread.user_id),
-            "provider": provider,
-            "repo": repo,
-            "branch": branch,
-            "gitlab_base_url": gitlab_base_url,
-            "github_auth_mode": github_auth_mode,
-        }
+        scm_user_login = ""
+        scm_user_name = ""
+        scm_user_email = ""
+        try:
+            from app.routers.scm import _resolve_scm_token_payload
+
+            payload = await _resolve_scm_token_payload(
+                user_id=str(thread.user_id),
+                provider=provider,
+                gitlab_base_url=gitlab_base_url or None,
+                github_auth_mode=github_auth_mode or None,
+            )
+            if isinstance(payload, dict):
+                scm_user_login = str(payload.get("scm_user_login") or "").strip()
+                scm_user_name = str(payload.get("scm_user_name") or "").strip()
+                scm_user_email = (
+                    str(payload.get("scm_user_email") or "").strip().lower()
+                )
+        except Exception:  # pragma: no cover - 非关键链路
+            logger.debug(
+                "Failed to resolve SCM token payload for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+        return build_repo_binding(
+            thread_id=thread_id,
+            user_id=str(thread.user_id),
+            metadata=metadata,
+            scm_user_login=scm_user_login,
+            scm_user_name=scm_user_name,
+            scm_user_email=scm_user_email,
+        )
 
     def _build_repo_remote_urls(
         self,
@@ -307,33 +535,16 @@ class DockerMiddleware(AgentMiddleware):
         gitlab_base_url: str | None,
     ) -> tuple[str, str]:
         """构建公开 remote URL 与临时鉴权 URL。"""
-        if provider == "github":
-            public_url = f"https://github.com/{repo}.git"
-            username = "x-access-token"
-        else:
-            from app.routers.scm import _normalize_gitlab_base_url
-
-            normalized_base = _normalize_gitlab_base_url(gitlab_base_url)
-            public_url = f"{normalized_base.rstrip('/')}/{repo}.git"
-            username = "oauth2"
-
-        parsed = urlparse(public_url)
-        token_escaped = quote(token, safe="")
-        auth_netloc = f"{username}:{token_escaped}@{parsed.netloc}"
-        auth_url = f"{parsed.scheme}://{auth_netloc}{parsed.path}"
-        if parsed.query:
-            auth_url = f"{auth_url}?{parsed.query}"
-        return public_url, auth_url
+        return build_repo_remote_urls(
+            provider=provider,
+            repo=repo,
+            token=token,
+            gitlab_base_url=gitlab_base_url,
+        )
 
     def _sanitize_repo_sync_error(self, output: str, token: str) -> str:
         """清理错误输出里的敏感 token。"""
-        cleaned = output or ""
-        if token:
-            cleaned = cleaned.replace(token, "***")
-            escaped = quote(token, safe="")
-            if escaped:
-                cleaned = cleaned.replace(escaped, "***")
-        return cleaned[-4000:]
+        return sanitize_repo_sync_error(output, token)
 
     def _report_progress(
         self,
@@ -412,15 +623,17 @@ class DockerMiddleware(AgentMiddleware):
             container,
             sync_cmd,
             on_output_line=(
-                lambda line: self._report_progress(
-                    reporter,
-                    stage="repo",
-                    level="info",
-                    message=self._sanitize_repo_sync_error(line, token),
+                (
+                    lambda line: self._report_progress(
+                        reporter,
+                        stage="repo",
+                        level="info",
+                        message=self._sanitize_repo_sync_error(line, token),
+                    )
                 )
-            )
-            if reporter is not None
-            else None,
+                if reporter is not None
+                else None
+            ),
         )
         if code == 0:
             self._report_progress(
@@ -440,6 +653,132 @@ class DockerMiddleware(AgentMiddleware):
         )
         return False, error_message
 
+    def _configure_git_runtime_in_container(
+        self,
+        *,
+        container: Container,
+        binding: dict[str, str],
+        token: str,
+    ) -> tuple[bool, str | None]:
+        """在仓库同步后初始化 git 身份与凭据，供后续原生 git 命令直接使用。"""
+        provider = str(binding.get("provider") or "").strip().lower()
+        git_name = str(binding.get("git_name") or "").strip() or "OpenWebPX Agent"
+        git_email = str(binding.get("git_email") or "").strip().lower()
+        if not git_email:
+            git_email = "openwebpx-agent@users.noreply.local"
+
+        if provider == "gitlab":
+            from app.routers.scm import _normalize_gitlab_base_url
+
+            scm_host = urlparse(
+                _normalize_gitlab_base_url(binding.get("gitlab_base_url") or None)
+            ).netloc
+            scm_user = "oauth2"
+        else:
+            scm_host = "github.com"
+            scm_user = "x-access-token"
+
+        workdir_q = shlex.quote(self.workdir)
+        configure_cmd = (
+            "set -e; "
+            f"WORKDIR={workdir_q}; "
+            f'CRED_FILE="{_RUNTIME_DIR}/.git-credentials"; '
+            f'ENV_FILE="{_SCM_BASH_ENV}"; '
+            f'WORKSPACE_ENV_FILE="{_RUNTIME_DIR}/openwebpx-scm.sh"; '
+            'BASHRC_FILE="/root/.bashrc"; '
+            'BASH_PROFILE_FILE="/root/.bash_profile"; '
+            f'mkdir -p "{_RUNTIME_DIR}"; '
+            'if [ ! -d "$WORKDIR/.git" ]; then echo "git repository missing at $WORKDIR"; exit 1; fi; '
+            'git -C "$WORKDIR" config user.name "$GIT_NAME"; '
+            'git -C "$WORKDIR" config user.email "$GIT_EMAIL"; '
+            'git -C "$WORKDIR" config credential.helper "store --file=$CRED_FILE"; '
+            'printf "https://%s:%s@%s\\n" "$SCM_USER" "$SCM_TOKEN" "$SCM_HOST" > "$CRED_FILE"; '
+            'chmod 600 "$CRED_FILE"; '
+            'printf "export SCM_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" > "$ENV_FILE"; '
+            'if [ "$SCM_PROVIDER" = "gitlab" ]; then '
+            'printf "export GITLAB_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            'printf "export GLAB_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            'printf "export GITLAB_ACCESS_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            'printf "export GLAB_HOST=\\"%s\\"\\n" "$SCM_HOST" >> "$ENV_FILE"; '
+            'printf "export GITLAB_HOST=\\"%s\\"\\n" "$SCM_HOST" >> "$ENV_FILE"; '
+            "else "
+            'printf "export GH_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            'printf "export GITHUB_TOKEN=\\"%s\\"\\n" "$SCM_TOKEN" >> "$ENV_FILE"; '
+            "fi; "
+            'chmod 600 "$ENV_FILE"; '
+            'cp "$ENV_FILE" "$WORKSPACE_ENV_FILE"; '
+            'chmod 600 "$WORKSPACE_ENV_FILE"; '
+            'grep -q "openwebpx-scm.sh" "$BASHRC_FILE" 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> "$BASHRC_FILE"; '
+            'chmod 600 "$BASHRC_FILE"; '
+            'grep -q ".bashrc" "$BASH_PROFILE_FILE" 2>/dev/null || echo "[ -f /root/.bashrc ] && . /root/.bashrc" >> "$BASH_PROFILE_FILE"; '
+            'chmod 600 "$BASH_PROFILE_FILE"; '
+            'grep -q "openwebpx-scm.sh" /root/.profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /root/.profile; '
+        )
+        code, output = self._exec(
+            container,
+            configure_cmd,
+            environment={
+                "PATH": _EXEC_PATH,
+                "SCM_TOKEN": token,
+                "SCM_USER": scm_user,
+                "SCM_HOST": scm_host,
+                "SCM_PROVIDER": provider,
+                "GIT_NAME": git_name,
+                "GIT_EMAIL": git_email,
+            },
+        )
+        if code == 0:
+            return True, None
+        return False, self._sanitize_repo_sync_error(output, token)
+
+    async def _resolve_thread_repo_access_token(
+        self,
+        *,
+        user_id: str,
+        provider: str,
+        gitlab_base_url: str | None,
+        github_auth_mode: str | None,
+    ) -> str:
+        from app.routers.scm import _resolve_scm_access_token
+
+        return await _resolve_scm_access_token(
+            user_id=user_id,
+            provider=provider,
+            gitlab_base_url=gitlab_base_url,
+            github_auth_mode=github_auth_mode,
+        )
+
+    async def _refresh_repo_runtime_environment(
+        self,
+        *,
+        container_id: str,
+        binding: dict[str, str],
+        token: str,
+    ) -> tuple[bool, str | None]:
+        try:
+            container = await asyncio.to_thread(
+                self.client.containers.get, container_id
+            )
+            await asyncio.to_thread(
+                lambda: self._restore_container_if_needed(
+                    container,
+                    container_id=container_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"容器不可用，无法刷新 git 运行时环境：{exc}"
+
+        configured, configure_error = await asyncio.to_thread(
+            lambda: self._configure_git_runtime_in_container(
+                container=container,
+                binding=binding,
+                token=token,
+            )
+        )
+        if configured:
+            return True, None
+        return False, configure_error or "unknown error"
+
     async def _maybe_sync_thread_repository(
         self,
         state: DockerState,
@@ -453,47 +792,81 @@ class DockerMiddleware(AgentMiddleware):
         if not binding:
             return None
 
-        signature = "|".join(
-            [
-                container_id,
-                binding["provider"],
-                binding["repo"],
-                binding["branch"],
-                binding.get("gitlab_base_url", ""),
-                binding.get("github_auth_mode", ""),
-            ]
+        signature = build_repo_sync_signature(
+            container_id=container_id,
+            binding=binding,
         )
+        provider = binding["provider"]
+        user_id = binding["user_id"]
+        gitlab_base_url, github_auth_mode = normalize_repo_auth_mode(binding)
+
         if (
             state.get("repo_sync_signature") == signature
             and state.get("repo_sync_success") is True
         ):
-            return None
-
-        provider = binding["provider"]
-        user_id = binding["user_id"]
-        gitlab_base_url = binding.get("gitlab_base_url") or None
-        github_auth_mode = (
-            binding.get("github_auth_mode") if provider == "github" else None
-        )
-        if github_auth_mode == "":
-            github_auth_mode = None
+            try:
+                token = await self._resolve_thread_repo_access_token(
+                    user_id=user_id,
+                    provider=provider,
+                    gitlab_base_url=gitlab_base_url,
+                    github_auth_mode=github_auth_mode,
+                )
+            except Exception as exc:  # noqa: BLE001
+                message = extract_error_message(exc)
+                self._report_progress(
+                    reporter,
+                    stage="repo",
+                    level="warning",
+                    message=f"git 凭据刷新失败：{message}",
+                )
+                logger.warning(
+                    "Failed to refresh repo credentials for thread repo %s@%s: %s",
+                    binding["repo"],
+                    binding["branch"],
+                    message,
+                )
+            else:
+                refreshed, refresh_error = await self._refresh_repo_runtime_environment(
+                    container_id=container_id,
+                    binding=binding,
+                    token=token,
+                )
+                if not refreshed:
+                    self._report_progress(
+                        reporter,
+                        stage="repo",
+                        level="warning",
+                        message=(
+                            f"git 身份/凭据刷新失败：{refresh_error or 'unknown error'}"
+                        ),
+                    )
+                    logger.warning(
+                        "Failed to refresh repo runtime environment for %s@%s in container %s: %s",
+                        binding["repo"],
+                        binding["branch"],
+                        container_id,
+                        refresh_error or "unknown error",
+                    )
+            return {
+                "repo_auth_context": build_repo_auth_context(binding),
+                "repo_git_identity": build_repo_git_identity(binding),
+            }
 
         try:
-            from app.routers.scm import _resolve_scm_access_token
-
-            token = await _resolve_scm_access_token(
+            token = await self._resolve_thread_repo_access_token(
                 user_id=user_id,
                 provider=provider,
                 gitlab_base_url=gitlab_base_url,
                 github_auth_mode=github_auth_mode,
             )
         except Exception as exc:  # noqa: BLE001
-            detail = getattr(exc, "detail", None)
-            message = (
-                str(detail).strip()
-                if isinstance(detail, str) and detail.strip()
-                else str(exc).strip() or "unknown error"
+            logger.warning(
+                "Failed to resolve repo access token for %s@%s: %s",
+                binding["repo"],
+                binding["branch"],
+                exc,
             )
+            message = extract_error_message(exc)
             return {
                 "repo_sync_signature": signature,
                 "repo_sync_success": False,
@@ -508,6 +881,12 @@ class DockerMiddleware(AgentMiddleware):
                 gitlab_base_url=gitlab_base_url,
             )
         except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to build repo remote URLs for %s@%s: %s",
+                binding["repo"],
+                binding["branch"],
+                exc,
+            )
             return {
                 "repo_sync_signature": signature,
                 "repo_sync_success": False,
@@ -525,6 +904,13 @@ class DockerMiddleware(AgentMiddleware):
                 )
             )
         except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to access container %s for repo sync %s@%s: %s",
+                container_id,
+                binding["repo"],
+                binding["branch"],
+                exc,
+            )
             return {
                 "repo_sync_signature": signature,
                 "repo_sync_success": False,
@@ -542,10 +928,26 @@ class DockerMiddleware(AgentMiddleware):
             )
         )
         if ok:
+            configured, configure_error = await asyncio.to_thread(
+                lambda: self._configure_git_runtime_in_container(
+                    container=container,
+                    binding=binding,
+                    token=token,
+                )
+            )
+            if not configured:
+                self._report_progress(
+                    reporter,
+                    stage="repo",
+                    level="warning",
+                    message=f"git 身份/凭据初始化失败：{configure_error or 'unknown error'}",
+                )
             return {
                 "repo_sync_signature": signature,
                 "repo_sync_success": True,
                 "repo_sync_error": None,
+                "repo_auth_context": build_repo_auth_context(binding),
+                "repo_git_identity": build_repo_git_identity(binding),
             }
 
         return {
@@ -555,6 +957,8 @@ class DockerMiddleware(AgentMiddleware):
                 f"自动同步仓库失败（{binding['repo']}#{binding['branch']}）："
                 f"{sync_error or 'unknown error'}"
             ),
+            "repo_auth_context": None,
+            "repo_git_identity": None,
             "messages": [
                 AIMessage(
                     content=(
@@ -575,9 +979,9 @@ class DockerMiddleware(AgentMiddleware):
         workdir: str | None = None,
         environment: dict[str, str] | None = None,
     ) -> tuple[int, str]:
-        # 所有容器内命令统一走 sh -lc，确保 shell 语义一致（变量、重定向、&& 等）。
+        # 所有容器内命令统一走 bash -lc，确保 shell 语义与交互终端一致。
         result = container.exec_run(
-            cmd=["sh", "-lc", command],
+            cmd=["bash", "-lc", command],
             workdir=workdir or self.workdir,
             environment=environment,
         )
@@ -594,10 +998,13 @@ class DockerMiddleware(AgentMiddleware):
         on_output_line: Callable[[str], None] | None = None,
     ) -> tuple[int, str]:
         """以流式方式执行容器命令，并按行回调输出。"""
-        api = container.client.api
+        container_client = container.client
+        if container_client is None:
+            raise RuntimeError("Docker container client is unavailable")
+        api = container_client.api
         exec_create_resp = api.exec_create(
             container.id,
-            cmd=["sh", "-lc", command],
+            cmd=["bash", "-lc", command],
             workdir=workdir or self.workdir,
             environment=environment,
         )
@@ -652,26 +1059,21 @@ class DockerMiddleware(AgentMiddleware):
             return None
         if code != 0:
             return None
-        try:
-            payload = json.loads(output)
-        except json.JSONDecodeError:
-            return None
-        return payload if isinstance(payload, dict) else None
+        return parse_package_json(output)
 
-    def _detect_package_manager(self, container: Container) -> str:
+    def _detect_package_manager(
+        self,
+        container: Container,
+        *,
+        package_json: dict[str, Any] | None = None,
+    ) -> str:
+        # package.json#packageManager 优先级最高，显式声明即视为强约束。
+        package_manager = detect_package_manager_from_package_json(package_json)
+        if package_manager is not None:
+            return package_manager
+
         # 锁文件强约束：存在锁文件时必须使用对应包管理器，避免误用导致依赖树漂移。
-        lockfile_checks: list[tuple[str, str]] = [
-            (
-                "pnpm",
-                "[ -f pnpm.lock ] || [ -f pnpm-lock.yaml ] || [ -f pnpm-lock.yml ]",
-            ),
-            ("yarn", "[ -f yarn.lock ]"),
-            (
-                "npm",
-                "[ -f npm.lock ] || [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]",
-            ),
-        ]
-        for manager, cond in lockfile_checks:
+        for manager, cond in lockfile_checks():
             code, _ = self._exec(container, cond)
             if code == 0:
                 return manager
@@ -683,35 +1085,18 @@ class DockerMiddleware(AgentMiddleware):
                 return manager
         return "npm"
 
+    def _has_workspace_protocol(self, package_json: dict[str, Any] | None) -> bool:
+        from app.services.docker_runtime import has_workspace_protocol
+
+        return has_workspace_protocol(package_json)
+
     def _resolve_start_script(self, package_json: dict[str, Any]) -> str | None:
         # 优先 dev，其次 start/preview，兼容大多数前端项目脚本约定。
-        scripts = package_json.get("scripts")
-        if not isinstance(scripts, dict):
-            return None
-        for name in ("dev", "start", "preview"):
-            if isinstance(scripts.get(name), str):
-                return name
-        return None
+        return resolve_start_script(package_json)
 
     def _detect_framework(self, package_json: dict[str, Any]) -> str:
         # 仅做轻量依赖检测：不追求 100% 准确，但用于拼接启动参数足够稳定。
-        dependencies: dict[str, Any] = {}
-        for key in ("dependencies", "devDependencies"):
-            section = package_json.get(key)
-            if isinstance(section, dict):
-                dependencies.update(section)
-
-        if "next" in dependencies:
-            return "next"
-        if "nuxt" in dependencies:
-            return "nuxt"
-        if "react-scripts" in dependencies:
-            return "cra"
-        if "vite" in dependencies:
-            return "vite"
-        if "astro" in dependencies:
-            return "astro"
-        return "unknown"
+        return detect_framework(package_json)
 
     def _build_start_command(
         self,
@@ -722,25 +1107,80 @@ class DockerMiddleware(AgentMiddleware):
         port: int,
     ) -> str:
         # 不同框架对 host/port 参数名称不同，这里做统一策略，保证容器外可访问。
-        base = f"{package_manager} run {start_script}"
-        if framework == "next":
-            return f"{base} -- --hostname {BIND_ALL_HOST} --port {port}"
-        if framework in {"vite", "nuxt", "astro"}:
-            return f"{base} -- --host {BIND_ALL_HOST} --port {port}"
-        return base
+        return build_start_command(
+            package_manager=package_manager,
+            start_script=start_script,
+            framework=framework,
+            port=port,
+        )
 
-    def _install_dependencies(
+    def _resolve_package_manager_spec(
+        self,
+        *,
+        package_manager: str,
+        package_json: dict[str, Any] | None,
+    ) -> str:
+        """解析包管理器版本规格，优先读取 package.json#packageManager。"""
+        return resolve_package_manager_spec(
+            package_manager=package_manager,
+            package_json=package_json,
+        )
+
+    def _ensure_package_manager_available(
         self,
         container: Container,
         package_manager: str,
         *,
+        package_json: dict[str, Any] | None = None,
         reporter: Callable[[str, str, str], None] | None = None,
     ) -> tuple[bool, str | None]:
+        """确保包管理器可用；缺失时尝试通过 corepack 自动激活。"""
         has_pm, _ = self._exec(
             container, f"command -v {package_manager} >/dev/null 2>&1"
         )
-        if has_pm != 0:
-            message = f"Package manager '{package_manager}' is required but not available in container."
+        if has_pm == 0:
+            return True, None
+
+        if package_manager not in {"pnpm", "yarn"}:
+            return (
+                False,
+                f"Package manager '{package_manager}' is required but not available in container.",
+            )
+
+        pm_spec = self._resolve_package_manager_spec(
+            package_manager=package_manager,
+            package_json=package_json,
+        )
+        self._report_progress(
+            reporter,
+            stage="bootstrap",
+            level="info",
+            message=f"检测到缺少 {package_manager}，尝试通过 corepack 激活：{pm_spec}",
+        )
+        setup_cmd = build_corepack_prepare_command(pm_spec)
+        code, output = self._exec_stream(
+            container,
+            setup_cmd,
+            on_output_line=(
+                (
+                    lambda line: self._report_progress(
+                        reporter,
+                        stage="bootstrap",
+                        level="info",
+                        message=f"[corepack] {line}",
+                    )
+                )
+                if reporter is not None
+                else None
+            ),
+        )
+        if code != 0:
+            message = (
+                f"Package manager '{package_manager}' is required but not available in container "
+                f"(auto-provision via corepack failed)."
+            )
+            if output.strip():
+                message = f"{message}\n{output[-2000:]}"
             self._report_progress(
                 reporter,
                 stage="bootstrap",
@@ -749,71 +1189,131 @@ class DockerMiddleware(AgentMiddleware):
             )
             return False, message
 
-        # 若 node_modules 已存在则跳过安装，加速增量修复场景。
-        has_node_modules, _ = self._exec(container, "[ -d node_modules ]")
-        if has_node_modules == 0:
+        has_pm_after, _ = self._exec(
+            container, f"command -v {package_manager} >/dev/null 2>&1"
+        )
+        if has_pm_after != 0:
+            message = (
+                f"Package manager '{package_manager}' is required but not available in container "
+                "(corepack activation did not expose command)."
+            )
             self._report_progress(
                 reporter,
                 stage="bootstrap",
-                level="info",
-                message="检测到 node_modules，跳过依赖安装。",
+                level="error",
+                message=message,
             )
-            return True, None
+            return False, message
 
-        install_cmd_by_manager = {
-            "pnpm": "pnpm install",
-            "yarn": "yarn install",
-            "npm": "npm install",
-        }
-        install_cmd = install_cmd_by_manager.get(package_manager, "npm install")
         self._report_progress(
             reporter,
             stage="bootstrap",
             level="info",
-            message=f"开始安装依赖：{install_cmd}",
-        )
-        code, output = self._exec_stream(
-            container,
-            install_cmd,
-            on_output_line=(
-                lambda line: self._report_progress(
-                    reporter,
-                    stage="bootstrap",
-                    level="info",
-                    message=f"[deps] {line}",
-                )
-            )
-            if reporter is not None
-            else None,
-        )
-        if code != 0:
-            return (
-                False,
-                f"Dependency install failed ({install_cmd}):\n{output[-3000:]}",
-            )
-        self._report_progress(
-            reporter,
-            stage="bootstrap",
-            level="info",
-            message="依赖安装完成。",
+            message=f"{package_manager} 已就绪。",
         )
         return True, None
 
+    def _resolve_runtime_package_manager(
+        self,
+        container: Container,
+        *,
+        detected_manager: str,
+        package_json: dict[str, Any] | None = None,
+        reporter: Callable[[str, str, str], None] | None = None,
+    ) -> tuple[str | None, str | None]:
+        """解析运行时可用包管理器；必要时从 pnpm/yarn 受控降级到 npm。"""
+        pm_ready, pm_error = self._ensure_package_manager_available(
+            container,
+            detected_manager,
+            package_json=package_json,
+            reporter=reporter,
+        )
+        if pm_ready:
+            return detected_manager, None
+
+        if detected_manager in {"pnpm", "yarn"}:
+            strict_reason = strict_package_manager_reason(
+                detected_manager=detected_manager,
+                package_json=package_json,
+            )
+            if strict_reason is not None:
+                message = (
+                    f"Package manager '{detected_manager}' is required by {strict_reason}; "
+                    "refusing fallback to npm."
+                )
+                self._report_progress(
+                    reporter,
+                    stage="bootstrap",
+                    level="error",
+                    message=message,
+                )
+                return None, message
+
+            npm_ready, _ = self._exec(container, "command -v npm >/dev/null 2>&1")
+            if npm_ready == 0:
+                warn_message = f"Package manager '{detected_manager}' unavailable; fallback to npm for bootstrap."
+                self._report_progress(
+                    reporter,
+                    stage="bootstrap",
+                    level="warning",
+                    message=warn_message,
+                )
+                return "npm", None
+
+        return None, pm_error
+
+    def _install_dependencies(
+        self,
+        container: Container,
+        package_manager: str,
+        *,
+        package_json: dict[str, Any] | None = None,
+        reporter: Callable[[str, str, str], None] | None = None,
+    ) -> tuple[bool, str | None]:
+        pm_ready, pm_error = self._ensure_package_manager_available(
+            container,
+            package_manager,
+            package_json=package_json,
+            reporter=reporter,
+        )
+        if not pm_ready:
+            return False, pm_error
+        return install_dependencies_exec(
+            exec_fn=lambda current_container, command: self._exec(
+                current_container,
+                command,
+            ),
+            exec_stream_fn=lambda current_container,
+            command,
+            on_output_line: self._exec_stream(
+                current_container,
+                command,
+                on_output_line=on_output_line,
+            ),
+            report_progress=lambda current_reporter,
+            stage,
+            level,
+            message: self._report_progress(
+                current_reporter,
+                stage=stage,
+                level=level,
+                message=message,
+            ),
+            container=container,
+            package_manager=package_manager,
+            reporter=reporter,
+        )
+
     def _is_service_running(self, container: Container) -> tuple[bool, str | None]:
         # 通过 PID 文件 + kill -0 判断存活，避免仅靠日志判断“假启动”。
-        code, output = self._exec(
-            container,
-            (
-                f"if [ -f {shlex.quote(self.service_pid_path)} ]; then "
-                f"PID=$(cat {shlex.quote(self.service_pid_path)}); "
-                'if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then echo "$PID"; '
-                "else exit 2; fi; "
-                "else exit 3; fi"
+        return is_service_running_exec(
+            exec_fn=lambda current_container, command: self._exec(
+                current_container,
+                command,
             ),
+            container=container,
+            service_pid_path=self.service_pid_path,
         )
-        if code == 0:
-            return True, output.strip() or None
-        return False, None
 
     def _start_service(
         self,
@@ -832,132 +1332,66 @@ class DockerMiddleware(AgentMiddleware):
             framework=framework,
             port=port,
         )
-        self._report_progress(
-            reporter,
-            stage="bootstrap",
-            level="info",
-            message=f"启动服务：{run_cmd}",
-        )
-        env = {
-            "HOST": BIND_ALL_HOST,
-            "PORT": str(port),
-            "CI": "1",
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        }
-        log_dir = str(PurePosixPath(self.service_log_path).parent)
-        pid_dir = str(PurePosixPath(self.service_pid_path).parent)
-        launch_cmd = (
-            f"mkdir -p {shlex.quote(log_dir)} {shlex.quote(pid_dir)}; "
-            f"rm -f {shlex.quote(self.service_pid_path)}; "
-            f"nohup {run_cmd} > {shlex.quote(self.service_log_path)} 2>&1 & "
-            f"echo $! > {shlex.quote(self.service_pid_path)}; "
-            f"cat {shlex.quote(self.service_pid_path)}"
-        )
-        code, output = self._exec(container, launch_cmd, environment=env)
-        if code != 0:
-            return False, f"Failed to start service ({run_cmd}):\n{output[-3000:]}"
-
-        # 给进程预留最短启动窗口，随后立即校验是否秒退。
-        time.sleep(max(self.startup_wait_seconds, 0.5))
-        running, pid = self._is_service_running(container)
-        if not running:
-            _, logs = self._exec(
+        return start_service_exec(
+            exec_fn=lambda current_container, command, environment=None: self._exec(
+                current_container,
+                command,
+                environment=environment,
+            ),
+            report_progress=lambda current_reporter,
+            stage,
+            level,
+            message: self._report_progress(
+                current_reporter,
+                stage=stage,
+                level=level,
+                message=message,
+            ),
+            is_service_running_fn=lambda: self._is_service_running(container),
+            tail_service_logs_fn=lambda lines: self._tail_service_logs(
                 container,
-                f"tail -n 120 {shlex.quote(self.service_log_path)} 2>/dev/null || true",
-            )
-            for line in logs.splitlines()[-24:]:
-                cleaned = line.strip()
-                if not cleaned:
-                    continue
-                self._report_progress(
-                    reporter,
-                    stage="bootstrap",
-                    level="warning",
-                    message=f"[service] {cleaned}",
-                )
-            return False, f"Service exited immediately after start.\n{logs[-3000:]}"
-        self._report_progress(
-            reporter,
-            stage="bootstrap",
-            level="info",
-            message=f"服务已启动，pid={pid or 'unknown'}",
+                lines=lines,
+            ),
+            container=container,
+            run_cmd=run_cmd,
+            service_log_path=self.service_log_path,
+            service_pid_path=self.service_pid_path,
+            port=port,
+            startup_wait_seconds=self.startup_wait_seconds,
+            reporter=reporter,
+            path_env=_EXEC_PATH,
+            bind_all_host=BIND_ALL_HOST,
         )
-        return True, None
 
     def _collect_port_bindings(self, container: Container) -> dict[str, list[int]]:
         # 容器状态可能变化，先 reload 再读映射，降低端口信息过期概率。
         with suppress(DockerException):
             container.reload()
-
-        ports = container.attrs.get("NetworkSettings", {}).get("Ports", {})
-        bindings: dict[str, list[int]] = {}
-        if not isinstance(ports, dict):
-            return bindings
-
-        for container_port, host_mappings in ports.items():
-            if not isinstance(host_mappings, list):
-                continue
-            host_ports: list[int] = []
-            for mapping in host_mappings:
-                if not isinstance(mapping, dict):
-                    continue
-                port_raw = mapping.get("HostPort")
-                if isinstance(port_raw, str) and port_raw.isdigit():
-                    host_ports.append(int(port_raw))
-            if host_ports:
-                bindings[container_port] = host_ports
-        return bindings
+        attrs = container.attrs if isinstance(container.attrs, dict) else {}
+        return collect_port_bindings_from_attrs(attrs)
 
     def _build_preview_urls(self, bindings: dict[str, list[int]]) -> list[str]:
         # 统一使用 localhost 生成预览地址，便于本地开发和上层 UI 直接展示。
-        urls: list[str] = []
-        for host_ports in bindings.values():
-            for host_port in host_ports:
-                urls.append(f"http://127.0.0.1:{host_port}{self.healthcheck_path}")
-        return sorted(set(urls))
+        return build_preview_urls(bindings, healthcheck_path=self.healthcheck_path)
 
     def _probe_preview_urls(self, urls: list[str]) -> dict[str, str]:
         # 主动 HTTP 探测能快速判断“端口打开但服务不可用”的情况。
-        probe: dict[str, str] = {}
-        if not urls:
-            return probe
-
-        with httpx.Client(timeout=2.5, follow_redirects=True) as client:
-            for url in urls[:8]:
-                try:
-                    response = client.get(url)
-                    probe[url] = f"{response.status_code}"
-                except Exception as exc:  # noqa: BLE001
-                    probe[url] = f"error:{type(exc).__name__}"
-        return probe
+        return probe_preview_urls(urls)
 
     def _tail_service_logs(self, container: Container, lines: int = 120) -> str:
-        _, output = self._exec(
-            container,
-            f"tail -n {lines} {shlex.quote(self.service_log_path)} 2>/dev/null || true",
+        return tail_service_logs_exec(
+            exec_fn=lambda current_container, command: self._exec(
+                current_container,
+                command,
+            ),
+            container=container,
+            service_log_path=self.service_log_path,
+            lines=lines,
         )
-        return output
 
     def _extract_error_lines(self, logs: str) -> list[str]:
         # 提取关键错误行用于 prompt 注入，避免把完整日志全部塞进上下文。
-        keywords = (
-            "error",
-            "exception",
-            "traceback",
-            "failed",
-            "vite",
-            "syntaxerror",
-            "unhandled",
-            "eaddrinuse",
-        )
-        lines: list[str] = []
-        for raw in logs.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if any(word in line.lower() for word in keywords):
-                lines.append(line)
-        return lines[:12]
+        return extract_error_lines(logs)
 
     def _build_runtime_status(
         self,
@@ -1005,11 +1439,21 @@ class DockerMiddleware(AgentMiddleware):
 
         status["app_detected"] = True
         framework = self._detect_framework(package_json)
-        package_manager = self._detect_package_manager(container)
+        detected_package_manager = self._detect_package_manager(
+            container,
+            package_json=package_json,
+        )
+        package_manager, manager_error = self._resolve_runtime_package_manager(
+            container,
+            detected_manager=detected_package_manager,
+            package_json=package_json,
+            reporter=reporter,
+        )
+        runtime_package_manager: str = package_manager or detected_package_manager
         start_script = self._resolve_start_script(package_json)
         start_command = (
             self._build_start_command(
-                package_manager=package_manager,
+                package_manager=runtime_package_manager,
                 start_script=start_script,
                 framework=framework,
                 port=self.default_container_port,
@@ -1018,15 +1462,19 @@ class DockerMiddleware(AgentMiddleware):
             else None
         )
         status["framework"] = framework
-        status["package_manager"] = package_manager
+        status["package_manager"] = runtime_package_manager
         status["start_script"] = start_script
         status["start_command"] = start_command
 
-        installed, install_error = self._install_dependencies(
-            container,
-            package_manager,
-            reporter=reporter,
-        )
+        if package_manager is None:
+            installed, install_error = False, manager_error
+        else:
+            installed, install_error = self._install_dependencies(
+                container,
+                package_manager,
+                package_json=package_json,
+                reporter=reporter,
+            )
         status["dependencies_installed"] = installed
         if not installed:
             status["startup_error"] = install_error
@@ -1056,7 +1504,7 @@ class DockerMiddleware(AgentMiddleware):
                 status["startup_attempted"] = True
                 started, start_error = self._start_service(
                     container,
-                    package_manager=package_manager,
+                    package_manager=runtime_package_manager,
                     start_script=start_script,
                     framework=framework,
                     port=self.default_container_port,
@@ -1082,60 +1530,7 @@ class DockerMiddleware(AgentMiddleware):
         return status
 
     def _build_diagnostic_message(self, status: dict[str, Any]) -> str | None:
-        # 只在存在 actionable 问题时注入系统消息，避免噪音干扰正常对话。
-        if not status.get("app_detected"):
-            return None
-
-        alerts: list[str] = []
-        startup_error = status.get("startup_error")
-        if isinstance(startup_error, str) and startup_error.strip():
-            alerts.append("startup_error")
-
-        if not status.get("service_running"):
-            alerts.append("service_not_running")
-
-        probes = status.get("preview_probes")
-        probe_values = list(probes.values()) if isinstance(probes, dict) else []
-        if probe_values and all(str(v).startswith("error:") for v in probe_values):
-            alerts.append("preview_unreachable")
-
-        error_lines = status.get("error_lines")
-        if isinstance(error_lines, list) and error_lines:
-            alerts.append("runtime_errors_in_logs")
-
-        if not alerts:
-            return None
-
-        preview_lines = []
-        if isinstance(probes, dict):
-            for url, result in probes.items():
-                preview_lines.append(f"- {url} -> {result}")
-
-        log_excerpt = ""
-        if isinstance(error_lines, list) and error_lines:
-            log_excerpt = "\n".join(f"- {line}" for line in error_lines[:8])
-        elif isinstance(status.get("log_tail"), str):
-            tail = cast("str", status["log_tail"]).strip()
-            if tail:
-                log_excerpt = tail[-1200:]
-
-        return (
-            "[Runtime Diagnostics]\n"
-            "Web app sandbox runtime check found issues that require fixing in this run.\n\n"
-            f"Detected issues: {', '.join(alerts)}\n"
-            f"Framework: {status.get('framework')}\n"
-            f"Package manager: {status.get('package_manager')}\n"
-            f"Start script: {status.get('start_script')}\n"
-            f"Start command: {status.get('start_command')}\n"
-            f"Service running: {status.get('service_running')}\n"
-            f"Service PID: {status.get('service_pid')}\n"
-            "Preview probes:\n"
-            f"{chr(10).join(preview_lines) if preview_lines else '- no mapped preview URL'}\n\n"
-            "Error excerpt:\n"
-            f"{log_excerpt or '- no logs captured'}\n\n"
-            "Action required: inspect code/build/runtime config, fix the root cause, "
-            "then rerun the service and verify preview URL returns 2xx/3xx."
-        )
+        return build_diagnostic_message(status)
 
     async def ainitialize_environment(
         self,
@@ -1478,6 +1873,8 @@ class DockerMiddleware(AgentMiddleware):
             "repo_sync_signature": None,
             "repo_sync_success": None,
             "repo_sync_error": None,
+            "repo_auth_context": None,
+            "repo_git_identity": None,
         }
 
         return {
@@ -1511,6 +1908,7 @@ class DockerMiddleware(AgentMiddleware):
                     )
                 ],
             }
+        self._cancel_scheduled_container_stop(container_id)
         self._persist_thread_container_mapping(
             runtime=runtime, container_id=container_id
         )
@@ -1521,6 +1919,9 @@ class DockerMiddleware(AgentMiddleware):
             "repo_sync_signature": state.get("repo_sync_signature"),
             "repo_sync_success": state.get("repo_sync_success"),
             "repo_sync_error": state.get("repo_sync_error"),
+            "repository_context_fingerprint": state.get(
+                "repository_context_fingerprint"
+            ),
         }
 
     @hook_config(can_jump_to=["end"])
@@ -1540,27 +1941,79 @@ class DockerMiddleware(AgentMiddleware):
         if not isinstance(container_id, str) or not container_id.strip():
             return base_update
 
+        repository_context_message, repository_context_fingerprint = (
+            self._build_repository_context_message(
+                runtime=runtime,
+                state=cast("DockerState", {**state, **base_update}),
+            )
+        )
         repo_update = await self._maybe_sync_thread_repository(
             state=state,
             runtime=runtime,
             container_id=container_id.strip(),
         )
-        if not repo_update:
-            return base_update
-
         merged = dict(base_update)
-        for key, value in repo_update.items():
-            if key == "messages" and isinstance(value, list):
-                existing_messages = (
-                    list(merged.get("messages", []))
-                    if isinstance(merged.get("messages"), list)
-                    else []
-                )
-                existing_messages.extend(value)
-                merged["messages"] = existing_messages
-            else:
-                merged[key] = value
+        if repo_update:
+            for key, value in repo_update.items():
+                if key == "messages" and isinstance(value, list):
+                    existing_messages = (
+                        list(merged.get("messages", []))
+                        if isinstance(merged.get("messages"), list)
+                        else []
+                    )
+                    existing_messages.extend(value)
+                    merged["messages"] = existing_messages
+                else:
+                    merged[key] = value
+        if (
+            repository_context_message is not None
+            and repository_context_fingerprint
+            != state.get("repository_context_fingerprint")
+        ):
+            existing_messages = (
+                list(merged.get("messages", []))
+                if isinstance(merged.get("messages"), list)
+                else []
+            )
+            existing_messages.append(repository_context_message)
+            merged["messages"] = existing_messages
+            merged["repository_context_fingerprint"] = repository_context_fingerprint
+        elif repository_context_message is not None:
+            merged["repository_context_fingerprint"] = repository_context_fingerprint
+            logger.info(
+                "Repository context prompt unchanged; skip reinjecting system message",
+                extra={
+                    "repository_context_fingerprint": repository_context_fingerprint
+                },
+            )
         return merged
+
+    def _build_repository_context_message(
+        self,
+        *,
+        runtime: Any,
+        state: DockerState,
+    ) -> tuple[SystemMessage | None, str | None]:
+        runtime_view = SimpleNamespace(
+            state=state,
+            config=getattr(runtime, "config", None),
+            store=getattr(runtime, "store", None),
+        )
+        try:
+            prompt = self._repository_context_builder(runtime_view)
+        except Exception:
+            logger.exception(
+                "Failed to build repository context prompt from Docker middleware",
+            )
+            return None, None
+        if not prompt:
+            return None, None
+        fingerprint = self._fingerprint(prompt)
+        logger.info(
+            "Repository context prompt prepared from Docker middleware",
+            extra={"repository_context_fingerprint": fingerprint},
+        )
+        return SystemMessage(content=prompt), fingerprint
 
     def after_agent(self, state: DockerState) -> dict[str, Any] | None:
         # 结束时再采样一次，确保外部 API 读取到的是最新运行结果。
@@ -1574,6 +2027,9 @@ class DockerMiddleware(AgentMiddleware):
             return None
 
         status = self._build_runtime_status(state, container)
+        # 对话结束后延迟停止容器，给后续短时间继续对话预留缓冲窗口。
+        self._schedule_container_stop(container_id)
+        status["stop_scheduled_in_seconds"] = self.stop_delay_seconds
         return {
             "container_id": container_id,
             "service_status": status,
@@ -1590,6 +2046,7 @@ def build_web_sandbox_docker_middleware(**overrides: Any) -> DockerMiddleware:
         "auto_start_service": True,
         "default_container_port": DEFAULT_WEB_SANDBOX_CONTAINER_PORT,
         "healthcheck_path": "/",
+        "stop_delay_seconds": _resolve_stop_delay_seconds_from_env(),
     }
     params.update(overrides)
     return DockerMiddleware(**params)
