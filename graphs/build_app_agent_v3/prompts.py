@@ -388,7 +388,21 @@ def old_function():
 ```
 """
 
+THINK_TOOL_PROMPT = """
+## `think`（可选）
 
-def build_system_prompt() -> str:
+当工具链复杂或需要快速校验时，你可以调用 `think` 来记录简短摘要或风险提示。
+
+规则：
+*  仅 1-3 行
+*  不要输出思维链或长解释
+*  不要包含代码块
+"""
+
+
+def build_system_prompt(*, think_tool_enabled: bool = False) -> str:
     """Compose the shared system prompt."""
-    return BASE_SYSTEM_PROMPT.strip()
+    prompt = BASE_SYSTEM_PROMPT.strip()
+    if think_tool_enabled:
+        prompt = f"{prompt}\n\n{THINK_TOOL_PROMPT.strip()}"
+    return prompt

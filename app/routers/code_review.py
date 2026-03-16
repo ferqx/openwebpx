@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -13,12 +15,13 @@ from urllib.parse import quote, urlparse
 
 import httpx
 from aegra_api.api.runs import create_run
+from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.models.auth import User as AuthUser
 from aegra_api.models.runs import RunCreate
 from fastapi import APIRouter, HTTPException, Query, Request
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.routers.scm import (
@@ -163,14 +166,42 @@ WHERE provider = :provider
   AND gitlab_base_url IS NOT DISTINCT FROM :gitlab_base_url
 """
 
+DELIVERY_CLAIM_INSERT_SQL = """
+INSERT INTO code_review_webhook_deliveries
+(
+  delivery_key,
+  user_id,
+  provider,
+  delivery_id,
+  repository,
+  trigger,
+  event_name,
+  created_at
+)
+VALUES
+(
+  :delivery_key,
+  :user_id,
+  :provider,
+  :delivery_id,
+  :repository,
+  :trigger,
+  :event_name,
+  :created_at
+)
+ON CONFLICT (delivery_key) DO NOTHING
+"""
+
 
 @dataclass
 class WebhookEventContext:
     provider: Literal["github", "gitlab"]
     trigger: ReviewTrigger
     repository: str
+    checkout_repository: str
     branch: str
     gitlab_base_url: str | None
+    checkout_gitlab_base_url: str | None
     title: str
     event_name: str
     payload: dict[str, Any]
@@ -185,6 +216,13 @@ class WebhookSyncResult:
     mode: Literal["auto", "manual"]
     message: str
     webhook_url: str | None = None
+
+
+@dataclass
+class ReviewInlineComment:
+    path: str
+    line: int
+    body: str
 
 
 def _normalize_review_trigger(value: str | None) -> ReviewTrigger:
@@ -922,6 +960,589 @@ def _verify_custom_webhook_secret(request: Request) -> bool:
     return compare_digest(provided, secret)
 
 
+def _resolve_webhook_delivery_id(
+    request: Request, provider: Literal["github", "gitlab"]
+) -> str | None:
+    header_names = (
+        ("x-github-delivery",)
+        if provider == "github"
+        else ("x-gitlab-event-uuid", "x-gitlab-delivery")
+    )
+    for header_name in header_names:
+        value = request.headers.get(header_name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _build_review_locator(event: WebhookEventContext) -> dict[str, Any] | None:
+    if event.trigger != "pr_open":
+        return None
+
+    if event.provider == "github":
+        pr = (
+            event.payload.get("pull_request")
+            if isinstance(event.payload.get("pull_request"), dict)
+            else {}
+        )
+        number = pr.get("number")
+        head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+        commit_id = str(head.get("sha") or "").strip()
+        if not isinstance(number, int) or not commit_id:
+            return None
+        return {
+            "provider": "github",
+            "pull_number": number,
+            "commit_id": commit_id,
+        }
+
+    attrs = (
+        event.payload.get("object_attributes")
+        if isinstance(event.payload.get("object_attributes"), dict)
+        else {}
+    )
+    project = (
+        event.payload.get("project")
+        if isinstance(event.payload.get("project"), dict)
+        else {}
+    )
+    iid = attrs.get("iid")
+    project_id = project.get("id")
+    if not isinstance(iid, int) or not isinstance(project_id, int):
+        return None
+    return {
+        "provider": "gitlab",
+        "project_id": project_id,
+        "merge_request_iid": iid,
+    }
+
+
+async def _claim_code_review_delivery(
+    *,
+    user_id: str,
+    event: WebhookEventContext,
+    delivery_id: str | None,
+) -> bool:
+    normalized_user_id = user_id.strip()
+    normalized_delivery_id = (delivery_id or "").strip()
+    if not normalized_user_id or not normalized_delivery_id:
+        return True
+
+    delivery_key = (
+        f"{normalized_user_id}:{event.provider}:{normalized_delivery_id}".lower()
+    )
+    session_maker = _get_session_maker()
+    async with session_maker() as session:
+        try:
+            result = await session.execute(
+                text(DELIVERY_CLAIM_INSERT_SQL),
+                {
+                    "delivery_key": delivery_key,
+                    "user_id": normalized_user_id,
+                    "provider": event.provider,
+                    "delivery_id": normalized_delivery_id,
+                    "repository": event.repository,
+                    "trigger": event.trigger,
+                    "event_name": event.event_name,
+                    "created_at": time.time(),
+                },
+            )
+            await session.commit()
+        except SQLAlchemyError as exc:
+            await session.rollback()
+            raise HTTPException(500, f"记录代码审查 webhook 投递失败: {exc}") from exc
+    return bool(result.rowcount)
+
+
+def _extract_latest_text_content(output: dict[str, Any] | None) -> str:
+    if not isinstance(output, dict):
+        return ""
+
+    messages = output.get("messages")
+    if not isinstance(messages, list):
+        return ""
+
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        message_type = (
+            str(message.get("type") or message.get("role") or "").strip().lower()
+        )
+        if message_type not in {"ai", "assistant"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    text_value = item.get("text")
+                    if isinstance(text_value, str) and text_value.strip():
+                        parts.append(text_value)
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
+def _extract_review_comments_from_text(
+    text: str,
+) -> tuple[str, list[ReviewInlineComment]]:
+    if not text.strip():
+        return "", []
+
+    match = re.search(
+        r"```review-comments-json\s*(\{.*?\})\s*```",
+        text,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return "", []
+
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return "", []
+    if not isinstance(payload, dict):
+        return "", []
+
+    summary = str(payload.get("summary") or "").strip()
+    comments_raw = payload.get("comments")
+    if not isinstance(comments_raw, list):
+        return summary, []
+
+    comments: list[ReviewInlineComment] = []
+    for item in comments_raw[:8]:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        body = str(item.get("body") or "").strip()
+        line_raw = item.get("line")
+        if isinstance(line_raw, bool):
+            continue
+        try:
+            line = int(line_raw)
+        except (TypeError, ValueError):
+            continue
+        if not path or not body or line <= 0:
+            continue
+        comments.append(ReviewInlineComment(path=path, line=line, body=body))
+    return summary, comments
+
+
+async def _wait_for_run_terminal_state(
+    *,
+    run_id: str,
+    thread_id: str,
+    user_id: str,
+    timeout_seconds: float = 300.0,
+) -> RunORM | None:
+    deadline = time.time() + timeout_seconds
+    session_maker = _get_session_maker()
+    while time.time() < deadline:
+        async with session_maker() as session:
+            run_orm = await session.scalar(
+                select(RunORM).where(
+                    RunORM.run_id == run_id,
+                    RunORM.thread_id == thread_id,
+                    RunORM.user_id == user_id,
+                )
+            )
+            if run_orm is None:
+                return None
+            if str(run_orm.status) in {"success", "error", "interrupted"}:
+                return run_orm
+        await asyncio.sleep(1.0)
+    return None
+
+
+async def _update_thread_review_publish_status(
+    *,
+    thread_id: str,
+    user_id: str,
+    status: dict[str, Any],
+) -> None:
+    session_maker = _get_session_maker()
+    async with session_maker() as session:
+        try:
+            thread = await session.scalar(
+                select(ThreadORM).where(
+                    ThreadORM.thread_id == thread_id,
+                    ThreadORM.user_id == user_id,
+                )
+            )
+            if thread is None:
+                return
+            metadata = (
+                thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
+            )
+            metadata = dict(metadata)
+            metadata["review_comment_publish"] = status
+            thread.metadata_json = metadata
+            await session.commit()
+        except SQLAlchemyError:
+            await session.rollback()
+            return
+
+
+async def _publish_github_pr_review_comments(
+    *,
+    user_id: str,
+    repository: str,
+    pull_number: int,
+    commit_id: str,
+    summary: str,
+    comments: list[ReviewInlineComment],
+) -> int:
+    if not comments:
+        return 0
+    token = await _resolve_scm_access_token(
+        user_id=user_id,
+        provider="github",
+        gitlab_base_url=None,
+        github_auth_mode="github_app",
+    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "body": summary or "自动代码审查已生成行级评论。",
+        "event": "COMMENT",
+        "commit_id": commit_id,
+        "comments": [
+            {
+                "path": comment.path,
+                "line": comment.line,
+                "side": "RIGHT",
+                "body": comment.body,
+            }
+            for comment in comments
+        ],
+    }
+    async with httpx.AsyncClient(timeout=20) as http_client:
+        response = await http_client.post(
+            f"https://api.github.com/repos/{repository}/pulls/{pull_number}/reviews",
+            json=payload,
+            headers=headers,
+        )
+        if response.status_code >= 400:
+            raise HTTPException(
+                response.status_code,
+                f"GitHub 行级审查评论发布失败: {response.text[:200]}",
+            )
+    return len(comments)
+
+
+async def _fetch_gitlab_mr_diff_refs(
+    *,
+    http_client: httpx.AsyncClient,
+    base_url: str,
+    project_id: int,
+    merge_request_iid: int,
+    headers: dict[str, str],
+) -> dict[str, str] | None:
+    response = await http_client.get(
+        f"{base_url}/api/v4/projects/{project_id}/merge_requests/{merge_request_iid}/versions",
+        headers=headers,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(
+            response.status_code,
+            f"GitLab MR versions 查询失败: {response.text[:200]}",
+        )
+    payload = response.json() if response.content else []
+    if not isinstance(payload, list) or not payload:
+        return None
+    version = payload[0] if isinstance(payload[0], dict) else {}
+    base_sha = str(version.get("base_commit_sha") or "").strip()
+    start_sha = str(version.get("start_commit_sha") or "").strip()
+    head_sha = str(version.get("head_commit_sha") or "").strip()
+    if not base_sha or not start_sha or not head_sha:
+        return None
+    return {
+        "base_sha": base_sha,
+        "start_sha": start_sha,
+        "head_sha": head_sha,
+    }
+
+
+async def _publish_gitlab_mr_line_comments(
+    *,
+    user_id: str,
+    gitlab_base_url: str,
+    project_id: int,
+    merge_request_iid: int,
+    summary: str,
+    comments: list[ReviewInlineComment],
+) -> int:
+    if not comments:
+        return 0
+    token = await _resolve_scm_access_token(
+        user_id=user_id,
+        provider="gitlab",
+        gitlab_base_url=gitlab_base_url,
+        github_auth_mode=None,
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async with httpx.AsyncClient(timeout=20) as http_client:
+        diff_refs = await _fetch_gitlab_mr_diff_refs(
+            http_client=http_client,
+            base_url=gitlab_base_url,
+            project_id=project_id,
+            merge_request_iid=merge_request_iid,
+            headers=headers,
+        )
+        if diff_refs is None:
+            raise HTTPException(502, "GitLab MR versions 未返回有效 diff refs")
+
+        for index, comment in enumerate(comments):
+            body = comment.body
+            if index == 0 and summary:
+                body = f"{summary}\n\n{body}"
+            response = await http_client.post(
+                f"{gitlab_base_url}/api/v4/projects/{project_id}/merge_requests/{merge_request_iid}/discussions",
+                data={
+                    "body": body,
+                    "position[position_type]": "text",
+                    "position[base_sha]": diff_refs["base_sha"],
+                    "position[start_sha]": diff_refs["start_sha"],
+                    "position[head_sha]": diff_refs["head_sha"],
+                    "position[new_path]": comment.path,
+                    "position[new_line]": str(comment.line),
+                },
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                raise HTTPException(
+                    response.status_code,
+                    f"GitLab 行级审查评论发布失败: {response.text[:200]}",
+                )
+    return len(comments)
+
+
+async def _publish_review_comments_after_run(
+    *,
+    run_id: str,
+    thread_id: str,
+    user_id: str,
+) -> None:
+    try:
+        run_orm = await _wait_for_run_terminal_state(
+            run_id=run_id,
+            thread_id=thread_id,
+            user_id=user_id,
+        )
+        if run_orm is None:
+            await _update_thread_review_publish_status(
+                thread_id=thread_id,
+                user_id=user_id,
+                status={
+                    "status": "skipped",
+                    "reason": "run_not_found",
+                    "updated_at": time.time(),
+                },
+            )
+            return
+        if str(run_orm.status) != "success":
+            await _update_thread_review_publish_status(
+                thread_id=thread_id,
+                user_id=user_id,
+                status={
+                    "status": "skipped",
+                    "reason": f"run_{run_orm.status}",
+                    "updated_at": time.time(),
+                },
+            )
+            return
+
+        session_maker = _get_session_maker()
+        async with session_maker() as session:
+            thread = await session.scalar(
+                select(ThreadORM).where(
+                    ThreadORM.thread_id == thread_id,
+                    ThreadORM.user_id == user_id,
+                )
+            )
+        if thread is None:
+            return
+
+        metadata = (
+            thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
+        )
+        review_locator = metadata.get("review_locator")
+        if not isinstance(review_locator, dict):
+            await _update_thread_review_publish_status(
+                thread_id=thread_id,
+                user_id=user_id,
+                status={
+                    "status": "skipped",
+                    "reason": "missing_review_locator",
+                    "updated_at": time.time(),
+                },
+            )
+            return
+        raw_commentable = metadata.get("review_commentable_lines")
+        commentable_lines = (
+            {
+                str(path): [int(line) for line in lines if isinstance(line, int)]
+                for path, lines in raw_commentable.items()
+                if isinstance(path, str) and isinstance(lines, list)
+            }
+            if isinstance(raw_commentable, dict)
+            else {}
+        )
+
+        output = run_orm.output if isinstance(run_orm.output, dict) else {}
+        final_text = _extract_latest_text_content(output)
+        summary, comments = _extract_review_comments_from_text(final_text)
+        extracted_count = len(comments)
+        comments = _filter_review_comments(comments, commentable_lines)
+        filtered_count = len(comments)
+        if not comments:
+            await _update_thread_review_publish_status(
+                thread_id=thread_id,
+                user_id=user_id,
+                status={
+                    "status": "skipped",
+                    "reason": (
+                        "no_valid_comments"
+                        if extracted_count > 0
+                        else "no_structured_comments"
+                    ),
+                    "summary": summary,
+                    "extracted_count": extracted_count,
+                    "filtered_count": filtered_count,
+                    "updated_at": time.time(),
+                },
+            )
+            return
+
+        provider = str(review_locator.get("provider") or "").strip().lower()
+        if provider == "github":
+            pull_number = review_locator.get("pull_number")
+            commit_id = str(review_locator.get("commit_id") or "").strip()
+            review_repository = str(
+                metadata.get("review_repository") or metadata.get("repo") or ""
+            ).strip()
+            if isinstance(pull_number, int) and commit_id and review_repository:
+                published_count = await _publish_github_pr_review_comments(
+                    user_id=user_id,
+                    repository=review_repository,
+                    pull_number=pull_number,
+                    commit_id=commit_id,
+                    summary=summary,
+                    comments=comments,
+                )
+                await _update_thread_review_publish_status(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    status={
+                        "status": "published",
+                        "provider": "github",
+                        "summary": summary,
+                        "extracted_count": extracted_count,
+                        "filtered_count": filtered_count,
+                        "published_count": published_count,
+                        "updated_at": time.time(),
+                    },
+                )
+            else:
+                await _update_thread_review_publish_status(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    status={
+                        "status": "skipped",
+                        "reason": "invalid_github_locator",
+                        "summary": summary,
+                        "extracted_count": extracted_count,
+                        "filtered_count": filtered_count,
+                        "updated_at": time.time(),
+                    },
+                )
+            return
+
+        if provider == "gitlab":
+            project_id = review_locator.get("project_id")
+            merge_request_iid = review_locator.get("merge_request_iid")
+            review_repository = str(
+                metadata.get("review_repository") or metadata.get("repo") or ""
+            ).strip()
+            gitlab_base_url = _normalize_gitlab_base_url(
+                str(metadata.get("gitlab_base_url") or "").strip()
+            )
+            if (
+                isinstance(project_id, int)
+                and isinstance(merge_request_iid, int)
+                and review_repository
+            ):
+                published_count = await _publish_gitlab_mr_line_comments(
+                    user_id=user_id,
+                    gitlab_base_url=gitlab_base_url,
+                    project_id=project_id,
+                    merge_request_iid=merge_request_iid,
+                    summary=summary,
+                    comments=comments,
+                )
+                await _update_thread_review_publish_status(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    status={
+                        "status": "published",
+                        "provider": "gitlab",
+                        "summary": summary,
+                        "extracted_count": extracted_count,
+                        "filtered_count": filtered_count,
+                        "published_count": published_count,
+                        "updated_at": time.time(),
+                    },
+                )
+            else:
+                await _update_thread_review_publish_status(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    status={
+                        "status": "skipped",
+                        "reason": "invalid_gitlab_locator",
+                        "summary": summary,
+                        "extracted_count": extracted_count,
+                        "filtered_count": filtered_count,
+                        "updated_at": time.time(),
+                    },
+                )
+            return
+
+        await _update_thread_review_publish_status(
+            thread_id=thread_id,
+            user_id=user_id,
+            status={
+                "status": "skipped",
+                "reason": "unsupported_provider",
+                "summary": summary,
+                "extracted_count": extracted_count,
+                "filtered_count": filtered_count,
+                "updated_at": time.time(),
+            },
+        )
+    except Exception:
+        await _update_thread_review_publish_status(
+            thread_id=thread_id,
+            user_id=user_id,
+            status={
+                "status": "error",
+                "reason": "publish_failed",
+                "updated_at": time.time(),
+            },
+        )
+        # Publishing review comments is best-effort and must not affect the run outcome.
+        return
+
+
 def _resolve_webhook_event_context(
     *,
     request: Request,
@@ -950,8 +1571,16 @@ def _resolve_webhook_event_context(
                 provider="github",
                 trigger="pr_open",
                 repository=repository,
+                checkout_repository=str(
+                    (
+                        head.get("repo") if isinstance(head.get("repo"), dict) else {}
+                    ).get("full_name")
+                    or repository
+                ).strip()
+                or repository,
                 branch=branch,
                 gitlab_base_url=None,
+                checkout_gitlab_base_url=None,
                 title=title,
                 event_name=github_event,
                 payload=payload,
@@ -970,8 +1599,10 @@ def _resolve_webhook_event_context(
                 provider="github",
                 trigger="push",
                 repository=repository,
+                checkout_repository=repository,
                 branch=branch,
                 gitlab_base_url=None,
+                checkout_gitlab_base_url=None,
                 title=title,
                 event_name=github_event,
                 payload=payload,
@@ -1005,8 +1636,30 @@ def _resolve_webhook_event_context(
                 provider="gitlab",
                 trigger="pr_open",
                 repository=repository,
+                checkout_repository=str(
+                    (
+                        payload.get("source")
+                        if isinstance(payload.get("source"), dict)
+                        else {}
+                    ).get("path_with_namespace")
+                    or repository
+                ).strip()
+                or repository,
                 branch=branch,
                 gitlab_base_url=gitlab_base_url,
+                checkout_gitlab_base_url=(
+                    _normalize_gitlab_base_url_from_web_url(
+                        str(
+                            (
+                                payload.get("source")
+                                if isinstance(payload.get("source"), dict)
+                                else {}
+                            ).get("web_url")
+                            or ""
+                        ).strip()
+                    )
+                    or gitlab_base_url
+                ),
                 title=title,
                 event_name=gitlab_event,
                 payload=payload,
@@ -1020,8 +1673,10 @@ def _resolve_webhook_event_context(
                 provider="gitlab",
                 trigger="push",
                 repository=repository,
+                checkout_repository=repository,
                 branch=branch,
                 gitlab_base_url=gitlab_base_url,
+                checkout_gitlab_base_url=gitlab_base_url,
                 title=title,
                 event_name=gitlab_event,
                 payload=payload,
@@ -1240,11 +1895,87 @@ def _build_diff_excerpt(files: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks) if blocks else "未能解析到具体 diff 内容。"
 
 
+def _extract_commentable_lines(files: list[dict[str, Any]]) -> dict[str, list[int]]:
+    commentable: dict[str, list[int]] = {}
+    hunk_pattern = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+    for item in files:
+        path = str(item.get("path") or "").strip()
+        patch = item.get("patch")
+        if not path or not isinstance(patch, str) or not patch.strip():
+            continue
+
+        lines: list[int] = []
+        current_new_line = 0
+        in_hunk = False
+        for raw_line in patch.splitlines():
+            header_match = hunk_pattern.match(raw_line)
+            if header_match:
+                current_new_line = int(header_match.group(1))
+                in_hunk = True
+                continue
+            if not in_hunk:
+                continue
+            if raw_line.startswith("+") and not raw_line.startswith("+++"):
+                lines.append(current_new_line)
+                current_new_line += 1
+                continue
+            if raw_line.startswith("-") and not raw_line.startswith("---"):
+                continue
+            current_new_line += 1
+
+        if lines:
+            commentable[path] = sorted(set(lines))
+    return commentable
+
+
+def _format_commentable_line_hints(files: list[dict[str, Any]]) -> str:
+    commentable = _extract_commentable_lines(files)
+    if not commentable:
+        return "未能从 diff 中解析出可评论的新代码行；若必须输出评论，请留空 comments。"
+
+    blocks: list[str] = []
+    for path, lines in sorted(commentable.items()):
+        preview = ", ".join(str(line) for line in lines[:20])
+        if len(lines) > 20:
+            preview = f"{preview}, ..."
+        blocks.append(f"- {path}: {preview}")
+    return "\n".join(blocks)
+
+
+def _filter_review_comments(
+    comments: list[ReviewInlineComment],
+    commentable: dict[str, list[int]] | None,
+) -> list[ReviewInlineComment]:
+    if not commentable:
+        return []
+
+    allowed: dict[str, set[int]] = {
+        path: set(lines)
+        for path, lines in commentable.items()
+        if path and isinstance(lines, list)
+    }
+    filtered: list[ReviewInlineComment] = []
+    seen: set[tuple[str, int, str]] = set()
+    for comment in comments:
+        if comment.path not in allowed:
+            continue
+        if comment.line not in allowed[comment.path]:
+            continue
+        dedupe_key = (comment.path, comment.line, comment.body.strip())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        filtered.append(comment)
+    return filtered
+
+
 def _build_review_prompt(
     event: WebhookEventContext, files: list[dict[str, Any]]
 ) -> str:
     event_label = "PR 事件" if event.trigger == "pr_open" else "Push 事件"
     diff_excerpt = _build_diff_excerpt(files)
+    line_hints = _format_commentable_line_hints(files)
 
     return (
         "请你扮演资深代码审查工程师，对以下变更做一次高质量审查。\n\n"
@@ -1253,10 +1984,18 @@ def _build_review_prompt(
         "2. 明确指出高风险文件与具体风险原因。\n"
         "3. 给出可执行修复建议（必要时给补丁思路）。\n"
         "4. 如果信息不足，请先说明缺失信息再给结论。\n\n"
+        "【输出要求】\n"
+        "1. 先给一小段中文总结。\n"
+        "2. 紧接着输出一个 ```review-comments-json 代码块。\n"
+        '3. JSON 结构固定为 {"summary": string, "comments": [{"path": string, "line": number, "body": string}] }。\n'
+        "4. comments 只保留最重要的问题，最多 8 条；没有合格的行级问题时返回空数组。\n"
+        "5. line 必须填写 diff 中新增侧的代码行号，path 必须与变更文件路径完全一致。\n\n"
         f"【仓库】{event.repository}\n"
         f"【分支】{event.branch}\n"
         f"【事件】{event_label}\n"
         f"【标题】{event.title}\n\n"
+        "【可评论的新代码行】\n"
+        f"{line_hints}\n\n"
         "【变更摘要 / Diff】\n"
         f"{diff_excerpt}\n"
     )
@@ -1313,27 +2052,41 @@ async def _resolve_webhook_targets(event: WebhookEventContext) -> list[dict[str,
         if str(row.get("user_id") or "").strip()
     }
 
-    repo_override_users: set[str] = set()
+    profile_cache: dict[str, dict[str, Any]] = {
+        str(row.get("user_id") or "").strip(): {
+            "user_id": str(row.get("user_id") or "").strip(),
+            "auto_review_enabled": bool(row.get("auto_review_enabled")),
+            "default_trigger": _normalize_review_trigger(
+                str(row.get("default_trigger") or DEFAULT_REVIEW_TRIGGER)
+            ),
+        }
+        for row in global_profiles
+        if str(row.get("user_id") or "").strip()
+    }
     for row in matched_repo_rows:
         user_id = str(row.get("user_id") or "").strip()
         if not user_id:
             continue
-        repo_override_users.add(user_id)
+        profile = profile_cache.get(user_id)
+        if profile is None:
+            profile = await _select_profile(user_id)
+            profile_cache[user_id] = profile
 
         auto_review = _normalize_auto_review_mode(str(row.get("auto_review") or ""))
         trigger_raw = str(row.get("trigger") or "follow_global").strip().lower()
         if trigger_raw == "follow_global":
-            effective_trigger: ReviewTrigger = event.trigger
-            has_matching_global = user_id in enabled_users
+            effective_trigger = _normalize_review_trigger(
+                str(profile.get("default_trigger") or DEFAULT_REVIEW_TRIGGER)
+            )
         else:
             effective_trigger = _normalize_review_trigger(trigger_raw)
-            has_matching_global = True
+        global_enabled = bool(profile.get("auto_review_enabled"))
 
         if auto_review == "disabled":
             enabled_users.discard(user_id)
             continue
 
-        if auto_review == "follow_global" and not has_matching_global:
+        if auto_review == "follow_global" and not global_enabled:
             enabled_users.discard(user_id)
             continue
 
@@ -1367,10 +2120,18 @@ async def _dispatch_code_review_run(
 
     provider = str(target.get("provider") or event.provider).strip().lower()
     repository = str(target.get("repository") or event.repository).strip()
+    checkout_repository = (
+        str(event.checkout_repository or repository).strip() or repository
+    )
     branch = str(target.get("branch") or event.branch).strip() or "main"
     gitlab_base_url = (
         _normalize_gitlab_base_url(
-            str(target.get("gitlab_base_url") or event.gitlab_base_url or "")
+            str(
+                target.get("gitlab_base_url")
+                or event.checkout_gitlab_base_url
+                or event.gitlab_base_url
+                or ""
+            )
         )
         if provider == "gitlab"
         else None
@@ -1399,20 +2160,26 @@ async def _dispatch_code_review_run(
             )
 
     prompt = _build_review_prompt(event, files)
+    commentable_lines = _extract_commentable_lines(files)
+    review_locator = _build_review_locator(event)
 
     metadata = {
         "name": f"Code Review: {repository} ({event.trigger})",
         "source": "code_review_webhook",
-        "repo": repository,
+        # The checkout repository may differ from the matched repository on fork PR/MR events.
+        "repo": checkout_repository,
         "branch": branch,
         "provider": provider,
         "graph_id": DEFAULT_REVIEW_GRAPH_ID,
         "github_auth_mode": "github_app" if provider == "github" else None,
         "gitlab_base_url": gitlab_base_url,
+        "review_repository": repository,
         "review_trigger": event.trigger,
         "review_event": event.event_name,
         "review_title": event.title,
         "review_file_count": len(files),
+        "review_commentable_lines": commentable_lines,
+        "review_locator": review_locator,
         "review_webhook_at": time.time(),
     }
 
@@ -1457,6 +2224,15 @@ async def _dispatch_code_review_run(
             session=session,
         )
         await session.commit()
+
+    if review_locator is not None:
+        asyncio.create_task(
+            _publish_review_comments_after_run(
+                run_id=run.run_id,
+                thread_id=thread_id,
+                user_id=user_id,
+            )
+        )
 
     return {
         "ok": True,
@@ -1574,9 +2350,6 @@ async def delete_code_review_repository_setting(
 async def code_review_webhook(request: Request) -> dict[str, Any]:
     raw_body = await request.body()
 
-    if not _verify_custom_webhook_secret(request):
-        raise HTTPException(401, "invalid webhook secret")
-
     try:
         payload = json.loads(raw_body.decode("utf-8") or "{}")
     except json.JSONDecodeError as exc:
@@ -1587,6 +2360,8 @@ async def code_review_webhook(request: Request) -> dict[str, Any]:
 
     event_context = _resolve_webhook_event_context(request=request, payload=payload)
     if event_context is None:
+        if not _verify_custom_webhook_secret(request):
+            raise HTTPException(401, "invalid webhook secret")
         return {"ok": True, "accepted": False, "reason": "unsupported_event"}
 
     if event_context.provider == "github" and not _verify_github_signature(
@@ -1596,6 +2371,7 @@ async def code_review_webhook(request: Request) -> dict[str, Any]:
     if event_context.provider == "gitlab" and not _verify_gitlab_token(request):
         raise HTTPException(401, "invalid gitlab token")
 
+    delivery_id = _resolve_webhook_delivery_id(request, event_context.provider)
     targets = await _resolve_webhook_targets(event_context)
     if not targets:
         return {
@@ -1610,6 +2386,21 @@ async def code_review_webhook(request: Request) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for target in targets:
         try:
+            user_id = str(target.get("user_id") or "").strip()
+            claimed = await _claim_code_review_delivery(
+                user_id=user_id,
+                event=event_context,
+                delivery_id=delivery_id,
+            )
+            if not claimed:
+                result = {
+                    "ok": True,
+                    "user_id": user_id,
+                    "skipped": True,
+                    "reason": "duplicate_delivery",
+                }
+                results.append(result)
+                continue
             result = await _dispatch_code_review_run(target=target, event=event_context)
         except HTTPException as exc:
             result = {
@@ -1625,7 +2416,12 @@ async def code_review_webhook(request: Request) -> dict[str, Any]:
             }
         results.append(result)
 
-    success_count = sum(1 for item in results if item.get("ok") is True)
+    success_count = sum(
+        1
+        for item in results
+        if item.get("ok") is True and item.get("skipped") is not True
+    )
+    skipped_count = sum(1 for item in results if item.get("skipped") is True)
     return {
         "ok": True,
         "accepted": True,
@@ -1634,5 +2430,6 @@ async def code_review_webhook(request: Request) -> dict[str, Any]:
         "trigger": event_context.trigger,
         "target_count": len(targets),
         "success_count": success_count,
+        "skipped_count": skipped_count,
         "results": results,
     }

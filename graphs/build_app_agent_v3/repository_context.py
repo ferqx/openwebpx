@@ -68,7 +68,8 @@ _LANGUAGES: dict[str, Language] = (
     else {}
 )
 _PARSER_CACHE: dict[str, Parser] = {}
-_TOKEN_ENCODER = tiktoken.get_encoding("o200k_base")
+_TOKEN_ENCODER: tiktoken.Encoding | None = None
+_TOKEN_ENCODER_ERROR: Exception | None = None
 _VUE_MACROS = {
     "defineProps",
     "defineEmits",
@@ -123,8 +124,38 @@ def _read_section_budget_env(name: str, default: int, max_tokens: int) -> int:
     return min(value, max_tokens)
 
 
+def _should_disable_tiktoken() -> bool:
+    return os.getenv(
+        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_DISABLE_TIKTOKEN",
+        "",
+    ).strip() in {"1", "true", "TRUE", "yes", "YES"}
+
+
+def _get_token_encoder() -> tiktoken.Encoding | None:
+    global _TOKEN_ENCODER
+    global _TOKEN_ENCODER_ERROR
+    if _TOKEN_ENCODER is not None or _TOKEN_ENCODER_ERROR is not None:
+        return _TOKEN_ENCODER
+    if _should_disable_tiktoken():
+        _TOKEN_ENCODER_ERROR = RuntimeError("tiktoken disabled by env")
+        return None
+    try:
+        _TOKEN_ENCODER = tiktoken.get_encoding("o200k_base")
+    except Exception as exc:  # pragma: no cover - depends on runtime env
+        _TOKEN_ENCODER_ERROR = exc
+        logger.warning(
+            "Failed to load tiktoken encoding; using heuristic token counts.",
+            extra={"tiktoken_error": repr(exc)},
+        )
+    return _TOKEN_ENCODER
+
+
 def _count_tokens(text: str) -> int:
-    return len(_TOKEN_ENCODER.encode(text))
+    encoder = _get_token_encoder()
+    if encoder is None:
+        # Heuristic fallback (~4 chars per token) to keep budgets bounded offline.
+        return 0 if not text else max(1, len(text) // 4)
+    return len(encoder.encode(text))
 
 
 def _default_root() -> Path:

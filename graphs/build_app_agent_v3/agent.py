@@ -32,6 +32,7 @@ try:
         PatchFilesystemMiddleware,
     )
     from graphs.build_app_agent_v3.prompts import build_system_prompt
+    from graphs.build_app_agent_v3.think_tool_middleware import ThinkToolMiddleware
 except ModuleNotFoundError:
     _module_dir = Path(__file__).resolve().parent
     _module_dir_str = str(_module_dir)
@@ -39,6 +40,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, _module_dir_str)
     from patch_filesystem_middleware import PatchFilesystemMiddleware
     from prompts import build_system_prompt
+    from think_tool_middleware import ThinkToolMiddleware
 
 
 def _resolve_model_max_tokens() -> int:
@@ -52,12 +54,20 @@ def _resolve_model_max_tokens() -> int:
     return value if value > 0 else 4000
 
 
+def _think_tool_enabled() -> bool:
+    raw_value = os.getenv("OPENWEBPX_BUILD_APP_AGENT_V3_THINK_TOOL", "").strip()
+    if not raw_value:
+        return False
+    return raw_value.lower() in {"1", "true", "yes", "on"}
+
+
 MODEL = init_chat_model(
     model_provider="openai",
     model="deepseek-chat",
     max_tokens=_resolve_model_max_tokens(),
 )
-SYSTEM_PROMPT = build_system_prompt()
+THINK_TOOL_ENABLED = _think_tool_enabled()
+SYSTEM_PROMPT = build_system_prompt(think_tool_enabled=THINK_TOOL_ENABLED)
 SUMMARIZATION_DEFAULTS = _compute_summarization_defaults(MODEL)
 
 _middleware: list[AgentMiddleware[Any, Any, Any]] = []
@@ -77,6 +87,7 @@ _middleware.extend(
             trim_tokens_to_summarize=None,
             truncate_args_settings=SUMMARIZATION_DEFAULTS["truncate_args_settings"],
         ),
+        *([ThinkToolMiddleware()] if THINK_TOOL_ENABLED else []),
         PatchFilesystemMiddleware(
             backend=DockerBackend,
         ),
