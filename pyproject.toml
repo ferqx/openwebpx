@@ -36,7 +36,7 @@ dependencies = [
     "fastapi",
     "greenlet>=3.2.3",
     "langchain-openai",
-    "langgraph>=1.0.9",
+    "langgraph>=1.1.0",
     "langchain>=1.2.10",
     "langgraph-checkpoint-postgres",
     "psycopg[binary]>=3.2.9",

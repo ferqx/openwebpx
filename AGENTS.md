@@ -10,7 +10,7 @@ AI 代理在本仓库工作时请遵循以下协议。
 - **最高优先级文档：** `CLAUDE.md`
 - 本文件仅提供执行协议与最小导航，不重复维护完整技术细节。
 - 若本文件与 `CLAUDE.md` 存在冲突，以 `CLAUDE.md` 为准。
-- TODO: 当前仓库未发现 `CLAUDE.md`，新增后请同步更新本文件中的导航与命令索引。
+- `CLAUDE.md` 已创建，包含完整的技术细节、命令索引和架构说明。
 
 ## 3. 工作流程（必须执行）
 1. 先阅读与任务直接相关的代码与测试。
@@ -76,6 +76,14 @@ AI 代理在本仓库工作时请遵循以下协议。
   - 仍存在哪些风险/后续建议
 
 ## 10. 功能变更动态记录
+- 2026-03-19（build_app_agent_v3 提示词协议收敛与容器运行基线修正）：
+  - `graphs/build_app_agent_v3/prompts.py` 的基础系统提示词大幅收敛为“环境确认 → 读代码/测试 → 必要时计划 → 最小修改 → 验证 → 总结风险”的统一闭环，减少冗长重复约束，强调默认持续推进到可交付状态。
+  - 提示词新增明确的环境与仓库检查协议：把当前工作区固定视为容器内 `/workspace`，仓库摘要仅作定位辅助；若工作区为空、关键文件缺失、仓库未同步或工具不可用，必须先诊断前提，再继续执行。
+  - 提示词新增工具并发规则：多个彼此独立的只读检查应在同一轮并发发起；只有存在前后依赖时才串行。所有写操作、补丁重试和依赖工作区状态变化的动作必须保持串行。
+  - 提示词同步收紧 `apply_patch` 约束：所有项目文件写入必须通过 `apply_patch`，补丁失败后必须重新读取文件并用更小、更精确的局部 patch 重试；新增 `tests/test_build_app_agent_v3_prompts.py` 覆盖并发读取、环境检查与串行写入约束。
+  - `deployments/docker/Dockerfile.agent` 修正 Node.js 全局工具安装基线：显式配置 npm global prefix 与 PATH，预装 `pm2`、`pnpm`、`yarn`、`repomix`、`corepack` 并启用 `corepack prepare`，避免容器内已安装但命令不可见。
+  - `docker-compose.yml` 与 `docker-compose.prod.yml` 将 PostgreSQL 数据卷挂载点修正为 `/var/lib/postgresql/data`，避免容器数据目录挂载错误导致数据库初始化或持久化异常。
+  - `pyproject.toml` / `uv.lock` 将 `langgraph` 升级到 `>=1.1.0`，并同步拉升 `langchain` / `langgraph` 锁定版本，确保主智能体协议与运行时依赖保持一致。
 - 2026-03-15（build_app_agent_v3 容器仓库摘要协议与注入时序收敛）：
   - `build_app_agent_v3` 的仓库摘要不再通过 `PatchFilesystemMiddleware.wrap_model_call` 动态拼接，而是在 `DockerMiddleware.abefore_agent` 中、容器创建与仓库同步完成后注入 `SystemMessage`，避免首次模型调用时 `runtime.state` 尚未带上 `container_id` 导致摘要为空。
   - 摘要数据源固定为当前线程绑定容器的 `/workspace`；无容器、容器未就绪、容器扫描失败或 tree-sitter 不可用时，直接跳过摘要注入，不再回退宿主机本地目录。
