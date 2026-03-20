@@ -241,7 +241,9 @@ python scripts/migrate.py revision --autogenerate -m "描述"
 
 ### 常见开发任务
 
-1. **添加新路由**: 添加到 `app/routers/`, 导入并在 `app/main.py` 中包含
+1. **添加新路由**: 添加到 `app/routers/`, 导入并在 `app/main.py` 中包含。
+   - **Request 参数安全准则**：在路由函数中使用 `Request` 对象时，必须声明为 `request: Request`。**严禁**使用 `request: Request | None = None` 或 `request: Request = None`，否则会导致 FastAPI 尝试将其解析为 Pydantic 模型，触发 "Invalid args for response field" 错误。
+   - **参数顺序**：由于 `request: Request` 是无默认值的必填参数，它必须放在所有带默认值（如 `Query(...)`, `Body(...)`）的参数**之前**。
 2. **添加中间件**: 添加到 `middleware/` 或 `graphs/` 中的特定图中间件
 3. **添加服务**: 添加到 `app/services/` 用于业务逻辑
 4. **添加测试**: 创建 `tests/test_<feature>.py`, 遵循现有模式
