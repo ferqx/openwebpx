@@ -314,6 +314,7 @@ python scripts/migrate.py revision --autogenerate -m "描述"
 
 ## 参考资料
 
-- **AGENTS.md**: 本代码库的 AI 智能体工作协议（中文）
 - **README.md**: 项目概述和快速开始
-- **docs/**: 附加文档（故障排查、设置指南）
+- **docs/**: 项目功能和架构文档
+- **changelogs/**: 功能变更日志
+- **AGENTS.md**: 代理工作协议

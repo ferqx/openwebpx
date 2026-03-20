@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "openwebpx"
 version = "0.1.0"
-description = "Open source LangGraph Platform alternative - Self-hosted AI agent backend with FastAPI and PostgreSQL. Zero vendor lock-in, full control over your agent infrastructure."
+description = "A high-compatibility, self-hosted LangGraph server. Built to be a drop-in replacement for LangGraph Platform, compatible with both Aegra and langgraph-cli."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 keywords = [
@@ -17,13 +17,13 @@ keywords = [
     "postgresql",
     "langchain",
     "agent-protocol",
+    "openwebpx",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -79,8 +79,6 @@ Homepage = "https://github.com/ibbybuilds/aegra"
 Repository = "https://github.com/ibbybuilds/aegra"
 Documentation = "https://github.com/ibbybuilds/aegra#readme"
 "Bug Tracker" = "https://github.com/ibbybuilds/aegra/issues"
-"Feature Requests" = "https://github.com/ibbybuilds/aegra/issues"
-
 
 [tool.hatch.build.targets.wheel]
 packages = ["app", "backends", "middleware", "graphs"]
@@ -102,42 +100,14 @@ line-length = 88
 target-version = "py312"
 
 [tool.ruff.lint]
-select = [
-    "E",   # pycodestyle errors
-    "W",   # pycodestyle warnings
-    "F",   # pyflakes
-    "I",   # isort
-    "B",   # flake8-bugbear
-    "C4",  # flake8-comprehensions
-    "UP",  # pyupgrade
-    "ARG", # flake8-unused-arguments
-    "SIM", # flake8-simplify
-    "TCH", # flake8-type-checking
-    "PTH", # flake8-use-pathlib
-    "ERA", # eradicate (commented-out code)
-]
-ignore = [
-    "E501",  # line too long (handled by formatter)
-    "B008",  # do not perform function calls in argument defaults (FastAPI Depends)
-    "UP007", # use X | Y for type annotations (keep Optional for clarity)
-    "TC002", # type-checking imports cause issues with SQLAlchemy, Pydantic, etc.
-    "TC003", # type-checking imports cause issues with SQLAlchemy, Pydantic, etc.
-]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "ARG", "SIM", "TCH", "PTH", "ERA"]
+ignore = ["E501", "B008", "UP007", "TC002", "TC003"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = [
-    "ARG",  # unused arguments in tests are common
-    "S101", # assert statements are expected in tests
-]
-"middleware/docker.py" = [
-    "ERA", # keep archived commented-out lifecycle logic for reference
-]
-"middleware/tool_call_tracker.py" = [
-    "ARG", # middleware hooks require unused parameters for signature compatibility
-]
-"alembic/**/*.py" = [
-    "ERA", # commented code in migrations is intentional
-]
+"tests/**/*.py" = ["ARG", "S101"]
+"middleware/docker.py" = ["ERA"]
+"middleware/tool_call_tracker.py" = ["ARG"]
+"alembic/**/*.py" = ["ERA"]
 
 [tool.ruff.format]
 quote-style = "double"
