@@ -2318,10 +2318,10 @@ async def upsert_code_review_repository_setting(
 
 @router.delete("/integrations/code-review/settings/repositories")
 async def delete_code_review_repository_setting(
+    request: Request,
     provider: str = Query(..., description="github or gitlab"),
     repository: str = Query(..., description="owner/repo"),
     gitlab_base_url: str | None = Query(None),
-    request: Request = None,
 ) -> dict[str, Any]:
     user_id = _resolve_request_user_identity(request)
     normalized_provider = _normalize_scm_provider(provider)

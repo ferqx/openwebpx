@@ -91,6 +91,7 @@ async def _dedupe_scm_connections(
 
 @router.get("/integrations/scm/oauth/authorize")
 async def scm_oauth_authorize(
+    request: Request,
     provider: str = Query(..., description="github or gitlab"),
     redirect_uri: str = Query(..., description="Frontend callback URL"),
     origin: str | None = Query(None),
@@ -98,7 +99,6 @@ async def scm_oauth_authorize(
     is_enterprise: bool = Query(False),
     auth_mode: str | None = Query(None, description="github_app"),
     response_mode: str = Query("redirect", description="redirect or json"),
-    request: Request | None = None,
 ) -> Any:
     """开始 SCM OAuth 授权流程."""
     normalized_provider = _normalize_scm_provider(provider)
@@ -155,8 +155,8 @@ async def scm_oauth_authorize(
 
 @router.post("/integrations/scm/oauth/callback")
 async def scm_oauth_callback(
+    request: Request,
     payload: dict[str, Any] | None = Body(default=None),
-    request: Request | None = None,
 ) -> dict[str, Any]:
     """OAuth 回调处理器，处理授权完成后的令牌交换."""
     payload_dict = payload if isinstance(payload, dict) else {}
@@ -320,7 +320,7 @@ async def _list_scm_token_rows_for_user(user_id: str) -> list[ScmToken]:
 
 @router.get("/integrations/scm/connections")
 async def list_scm_connections(
-    request: Request | None = None,
+    request: Request,
 ) -> dict[str, Any]:
     """列出用户已配置的所有 SCM 连接."""
     user_id = _resolve_request_user_identity(request)
@@ -338,10 +338,10 @@ async def list_scm_connections(
 
 @router.delete("/integrations/scm/connections")
 async def revoke_scm_connection(
+    request: Request,
     provider: str = Query(..., description="github or gitlab"),
     gitlab_base_url: str | None = Query(None),
     auth_mode: str | None = Query(None, description="github_app"),
-    request: Request | None = None,
 ) -> dict[str, Any]:
     """撤销并删除 SCM 连接."""
     normalized_provider = _normalize_scm_provider(provider)
@@ -369,10 +369,10 @@ async def revoke_scm_connection(
 
 @router.get("/integrations/scm/connections/validate")
 async def validate_scm_connection(
+    request: Request,
     provider: str = Query(..., description="github or gitlab"),
     gitlab_base_url: str | None = Query(None),
     auth_mode: str | None = Query(None, description="github_app"),
-    request: Request | None = None,
 ) -> dict[str, Any]:
     """验证 SCM 连接是否有效."""
     normalized_provider = _normalize_scm_provider(provider)
@@ -452,10 +452,10 @@ async def validate_scm_connection(
 
 @router.get("/integrations/scm/repositories")
 async def list_scm_repositories(
+    request: Request,
     provider: str = Query(..., description="github or gitlab"),
     gitlab_base_url: str | None = Query(None),
     auth_mode: str | None = Query(None, description="github_app"),
-    request: Request | None = None,
 ) -> dict[str, Any]:
     """列出 SCM 账户中的所有仓库."""
     normalized_provider = _normalize_scm_provider(provider)
@@ -507,11 +507,11 @@ async def list_scm_repositories(
 
 @router.get("/integrations/scm/branches")
 async def list_scm_branches(
+    request: Request,
     provider: str = Query(..., description="github or gitlab"),
     repository: str = Query(..., description="owner/repo"),
     gitlab_base_url: str | None = Query(None),
     auth_mode: str | None = Query(None, description="github_app"),
-    request: Request | None = None,
 ) -> dict[str, Any]:
     """列出指定仓库的所有分支."""
     normalized_provider = _normalize_scm_provider(provider)
