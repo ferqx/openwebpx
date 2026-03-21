@@ -6,27 +6,50 @@ dist/
 wheels/
 *.egg-info
 
+# Frontend-generated files
+node_modules/
+dist/
+dist-ssr/
+test-results/
+playwright-report/
+blob-report/
+playwright-artifacts/
+.pnpm-store
+
 # Virtual environments
 .venv
 
 # env files
 .env
+*.local
 
-# Pycharm
+# Pycharm / IntelliJ
 .idea/
 
 # VSCode
 .vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
 
-# Testing
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Testing & Linting
 .coverage
 coverage.xml
 htmlcov/
 .pytest_cache/
 .mypy_cache/
-
-# Ruff
 .ruff_cache/
-
-# Pre-commit
 .pre-commit-cache/
+
+# OS files
+.DS_Store
+*.suo
+*.sw?
