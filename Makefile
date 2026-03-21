@@ -42,11 +42,10 @@ lint:
 	uv run ruff check .
 
 type-check:
-	uv run mypy src/
+	uv run mypy app/ graphs/ middleware/ backends/ tests/
 
 security:
-	uv run bandit -c pyproject.toml -r src/
-
+	uv run bandit -c pyproject.toml -r app/ graphs/ middleware/ backends/ tests/
 test:
 	uv run pytest
 
