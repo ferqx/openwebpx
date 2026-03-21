@@ -70,9 +70,14 @@ THINK_TOOL_ENABLED = _think_tool_enabled()
 SYSTEM_PROMPT = build_system_prompt(think_tool_enabled=THINK_TOOL_ENABLED)
 SUMMARIZATION_DEFAULTS = _compute_summarization_defaults(MODEL)
 
-_middleware: list[AgentMiddleware[Any, Any, Any]] = []
-_middleware.extend(
-    [
+
+def create_build_app_agent(model: Any = None) -> Any:
+    """Create the build-app agent with the specified model and middleware."""
+    actual_model = model or MODEL
+    actual_system_prompt = build_system_prompt(think_tool_enabled=THINK_TOOL_ENABLED)
+    actual_summarization_defaults = _compute_summarization_defaults(actual_model)
+
+    middleware: list[AgentMiddleware[Any, Any, Any]] = [
         ModelRetryMiddleware(
             max_retries=3,
             backoff_factor=2.0,
@@ -80,12 +85,14 @@ _middleware.extend(
         ),
         build_web_sandbox_docker_middleware(),
         SummarizationMiddleware(
-            model=MODEL,
+            model=actual_model,
             backend=DockerBackend,
-            trigger=SUMMARIZATION_DEFAULTS["trigger"],
-            keep=SUMMARIZATION_DEFAULTS["keep"],
+            trigger=actual_summarization_defaults["trigger"],
+            keep=actual_summarization_defaults["keep"],
             trim_tokens_to_summarize=None,
-            truncate_args_settings=SUMMARIZATION_DEFAULTS["truncate_args_settings"],
+            truncate_args_settings=actual_summarization_defaults[
+                "truncate_args_settings"
+            ],
         ),
         *([ThinkToolMiddleware()] if THINK_TOOL_ENABLED else []),
         PatchFilesystemMiddleware(
@@ -110,10 +117,12 @@ _middleware.extend(
             ],
         ),
     ]
-)
 
-agent = create_agent(
-    model=MODEL,
-    system_prompt=SYSTEM_PROMPT,
-    middleware=_middleware,
-).with_config({"recursion_limit": 1000})
+    return create_agent(
+        model=actual_model,
+        system_prompt=actual_system_prompt,
+        middleware=middleware,
+    ).with_config({"recursion_limit": 1000})
+
+
+agent = create_build_app_agent()

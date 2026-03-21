@@ -1239,7 +1239,8 @@ class DockerMiddleware(AgentMiddleware):
             if strict_reason is not None:
                 message = (
                     f"Package manager '{detected_manager}' is required by {strict_reason}; "
-                    "refusing fallback to npm."
+                    f"however, it is not available in the container and auto-provisioning failed. "
+                    f"Corepack error: {pm_error or 'unknown'}"
                 )
                 self._report_progress(
                     reporter,

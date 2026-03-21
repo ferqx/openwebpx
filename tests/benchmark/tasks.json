@@ -1,0 +1,45 @@
+[
+  {
+    "id": "task_001_basic_creation",
+    "name": "创建简单计算器",
+    "input": "在 /workspace 下创建一个 calculator.py 文件，包含一个 Calculator 类，实现 add(a, b) 方法。然后创建一个 test_calc.py 用 pytest 验证它。",
+    "setup_commands": [
+      "rm -rf /workspace/*"
+    ],
+    "verify_command": "pytest /workspace/test_calc.py",
+    "level": "L1"
+  },
+  {
+    "id": "task_002_fix_bug",
+    "name": "修复除零异常",
+    "input": "app.py 中的 divide 方法在除以 0 时会崩溃，请修复它，使其在除以 0 时返回 None。修复后运行 pytest 验证。",
+    "setup_commands": [
+      "echo 'def divide(a, b):\n    return a / b' > /workspace/app.py",
+      "echo 'from app import divide\ndef test_divide():\n    assert divide(10, 2) == 5\n    assert divide(10, 0) is None' > /workspace/test_app.py"
+    ],
+    "verify_command": "pytest /workspace/test_app.py",
+    "level": "L2"
+  },
+  {
+    "id": "task_003_multi_file_logic",
+    "name": "多文件逻辑重构",
+    "input": "models.py 中的 User 类需要增加一个 is_admin 属性（布尔值，默认 False）。auth.py 中的 check_permission 方法需要根据此属性判断：如果是 admin 则返回 True。最后在 test_auth.py 中编写测试用例验证：普通用户无权限，admin 有权限。",
+    "setup_commands": [
+      "echo 'class User:\n    def __init__(self, name):\n        self.name = name' > /workspace/models.py",
+      "echo 'def check_permission(user):\n    return False' > /workspace/auth.py",
+      "echo 'from models import User\nfrom auth import check_permission\ndef test_auth():\n    u1 = User(\"bob\")\n    assert check_permission(u1) is False\n    u2 = User(\"alice\")\n    u2.is_admin = True\n    assert check_permission(u2) is True' > /workspace/test_auth.py"
+    ],
+    "verify_command": "pytest /workspace/test_auth.py",
+    "level": "L3"
+  },
+  {
+    "id": "task_004_lint_fix",
+    "name": "静态代码审计与修复",
+    "input": "app.py 中存在一些代码质量问题（未使用的导入、未定义的变量）。请先运行 `ruff check app.py` 识别它们，然后全部修复。修复后再次运行 `ruff check` 确保通过。",
+    "setup_commands": [
+      "echo 'import os\nimport sys\ndef foo():\n    return x' > /workspace/app.py"
+    ],
+    "verify_command": "ruff check /workspace/app.py",
+    "level": "L3"
+  }
+]

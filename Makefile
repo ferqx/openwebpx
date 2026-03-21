@@ -1,4 +1,4 @@
-.PHONY: help install dev-install setup-hooks format lint type-check security test test-cov clean run ci-check
+.PHONY: help install dev-install setup-hooks format lint type-check security test test-cov benchmark clean run ci-check
 
 help:
 	@echo "Available commands:"
@@ -11,6 +11,7 @@ help:
 	@echo "  make security      - Run security checks with bandit"
 	@echo "  make test          - Run tests"
 	@echo "  make test-cov      - Run tests with coverage"
+	@echo "  make benchmark     - Run agent performance benchmark (L1-L3)"
 	@echo "  make ci-check      - Run all CI checks locally"
 	@echo "  make clean         - Clean cache files"
 	@echo "  make run           - Run the server"
@@ -46,11 +47,16 @@ type-check:
 
 security:
 	uv run bandit -c pyproject.toml -r app/ graphs/ middleware/ backends/ tests/
+
 test:
 	uv run pytest
 
 test-cov:
 	uv run pytest --cov=src --cov-report=html --cov-report=term
+
+benchmark:
+	@echo "🚀 Starting Agent Benchmark Evaluation..."
+	uv run python3 scripts/run_eval.py
 
 ci-check: format lint type-check security test
 	@echo ""

@@ -1,31 +1,29 @@
-# Docker 基础设施层 (Docker Infra)
+# Docker 基础设施模块 (Infrastructure)
 
 ## 简介
-Docker 基础设施层（主要实现在 `backends/docker.py` 和 `app/services/docker_executor.py`）是 OpenWebPX 与底层虚拟化资源的交互层。它封装了所有容器操作指令，为上层业务提供一致的 API，用于管理容器生命周期、资源配额及运行时状态。
+Docker 基础设施模块负责管理 Agent 执行任务所需的沙箱环境。该模块通过 `DockerMiddleware` 与 Docker Daemon 交互，确保每个 Agent 会话都在一个隔离、安全且功能完备的容器中运行。
 
 ## 功能详情
-- **容器生命周期管理**:
-  - 支持容器的 `create`, `start`, `stop`, `remove` 及 `exec`。
-  - 支持文件系统的双向传输（`upload` / `download`），实现宿主机与沙箱间的高效代码流转。
-- **资源配额控制**:
-  - 支持通过环境变量灵活控制 CPU 和内存限制。
-  - 通过 `docker-py` 的底层参数（如 `mem_limit`, `cpu_quota`）实现容器级隔离。
-- **运行期诊断**:
-  - **端口映射发现**: 自动发现容器内监听的动态端口，并将其映射为可供外部预览的 URL。
-  - **日志追踪 (Log Tailing)**: 实时提取容器内特定路径（如 `agent-web.log`）的输出。
-  - **状态探活**: 通过 `kill -0` 等原子操作探测容器内进程存活状况。
+- **沙箱隔离**: 每个线程（Thread）绑定一个独立的容器实例，实现进程级和文件系统的强隔离。
+- **镜像预装工具链**:
+  - **基础语言**: Python 3.12, Node.js 20。
+  - **包管理器**: `pnpm` (物理安装), `npm`, `yarn`。
+  - **测试与审计**: `pytest`, `pytest-asyncio`, `ruff`。
+  - **进程管理**: `pm2`。
+  - **系统工具**: `git`, `curl`, `jq`, `ripgrep` (rg), `gcc` 等。
+- **生命周期管理**: 自动创建、启动、恢复以及延迟销毁容器（默认 30 分钟不活动后停止）。
 
 ## 技术实现
-- **Backend 协议**: 定义了 `SandboxBackendProtocol`，确保上层 Agent 工具链能以统一接口与 Docker、Local 或 K8s 后端交互。
-- **执行器模式**: `app/services/docker_executor.py` 将常见的运维指令（如安装依赖、启动服务）封装为可重用的服务函数，内置了超时处理和流式输出逻辑。
-- **端口绑定解析**: 核心逻辑位于 `app/services/docker_runtime.py`，通过解析 Docker 容器的 `NetworkSettings.Ports` 自动生成本地可访问的访问地址。
+- **镜像定义**: `deployments/docker/Dockerfile.agent` 基于 Alpine 3.20 构建，采用“物理安装”策略替代 Corepack 动态拉取，以确保在无网/隔离环境下的稳定性。
+- **环境变量控制**:
+  - `NPM_CONFIG_PREFIX=/usr/local`: 确保全局安装的二进制文件直接进入系统 PATH。
+  - `PYTHONUNBUFFERED=1`: 保证日志实时输出。
+- **容器引导协议**: `middleware/docker.py` 在容器启动后自动执行 SCM 环境注入、仓库同步、依赖探测及服务拉起。
 
 ## 性能/质量指标
-- **隔离性**: 强制要求每个容器拥有独立的网络栈（可通过配置连接特定 Docker Network）。
-- **稳定性**: 使用 `backoff` 重试机制应对 Docker Daemon 在高负载下的瞬时响应延迟。
-- **透明度**: 通过结构化的 `service_status` 字典，将容器底层信息（如 `Container ID`）完全透出，便于开发期调试。
+- **启动延迟**: 在已有镜像情况下，容器就绪时间小于 2 秒。
+- **稳健性**: 修复了旧版中 `corepack` 在 Alpine 镜像下由于网络隔离导致的引导失败问题。
 
 ## 维护建议
-- **镜像版本控制**: 建议在生产部署时指定固定的 `SANDBOX_IMAGE_TAG`，防止 `latest` 标签带来的环境不确定性。
-- **磁盘清理**: 容器产生的临时文件和 `node_modules` 可能会占用大量磁盘，需配合 SCM 清理机制定期运行 `docker container prune` 和 `docker volume prune`。
-- **安全加固**: 尽量避免在容器内授予 Root 权限，建议在 Dockerfile 中通过 `USER` 指令锁定非特权账户运行 Agent 任务。
+- **镜像重建**: 修改 `Dockerfile.agent` 后，执行 `docker build --no-cache -t sandbox-agent:latest -f deployments/docker/Dockerfile.agent .`。
+- **磁盘清理**: 定期运行 `docker system prune` 或清理长期未活动的沙箱容器。

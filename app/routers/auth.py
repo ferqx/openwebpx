@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from aegra_api.core.auth_deps import require_auth
 from aegra_api.models.auth import User
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
@@ -13,6 +12,7 @@ from app.auth.core import (
     get_access_token_ttl_seconds,
     register_user,
 )
+from app.core.auth import authenticated_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 ACCESS_TOKEN_COOKIE_NAME = "aegra_access_token"  # nosec B105
@@ -100,7 +100,7 @@ async def login(payload: LoginRequest, response: Response) -> LoginResponse:
 
 
 @router.get("/me")
-async def me(user: User = Depends(require_auth)) -> dict[str, Any]:
+async def me(user: User = Depends(authenticated_user)) -> dict[str, Any]:
     return {
         "identity": user.identity,
         "display_name": user.display_name,
@@ -115,7 +115,7 @@ async def me(user: User = Depends(require_auth)) -> dict[str, Any]:
 
 @router.post("/logout")
 async def logout(
-    response: Response, _user: User = Depends(require_auth)
+    response: Response, _user: User = Depends(authenticated_user)
 ) -> dict[str, bool]:
     response.delete_cookie(ACCESS_TOKEN_COOKIE_NAME, path="/")
     return {"ok": True}

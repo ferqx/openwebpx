@@ -3,25 +3,16 @@ FROM alpine:3.20
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:/root/.local/bin:/root/.npm-global/bin"
+    NPM_CONFIG_PREFIX=/usr/local \
+    PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
-# Preinstall common tooling for coding-agent terminal workflows.
+# Pre-install base system dependencies
 RUN apk add --no-cache \
     bash \
     build-base \
     ca-certificates \
-    coreutils \
     curl \
-    diffutils \
-    fd \
-    file \
-    findutils \
-    gawk \
-    github-cli \
     git \
-    git-lfs \
-    glab \
-    grep \
     jq \
     less \
     libffi-dev \
@@ -39,7 +30,7 @@ RUN apk add --no-cache \
     ripgrep \
     rsync \
     sed \
-    sqlite3 \
+    sqlite \
     tar \
     tree \
     tzdata \
@@ -49,33 +40,34 @@ RUN apk add --no-cache \
     wget \
     xz \
     zip \
-    && update-ca-certificates
+    && python3 -m pip install --break-system-packages --no-cache-dir \
+       pytest \
+       pytest-asyncio \
+       pytest-cov \
+       ruff \
+       requests \
+       pydantic \
+       python-dotenv
 
-# Ensure npm global packages are in PATH and install Node.js package managers
-RUN npm config set prefix '/root/.npm-global' && \
-    mkdir -p /root/.npm-global/bin && \
-    mkdir -p /root/.local/bin && \
+# Fix Node.js environment: Direct physical installation instead of shims
+# We set prefix to /usr/local so binaries go directly into PATH
+RUN npm config set prefix /usr/local && \
     echo "Installing Node.js package managers..." && \
-    npm install -g pm2@latest && \
-    npm install -g pnpm@latest yarn@latest && \
-    npm install -g repomix@latest && \
-    npm install -g corepack@latest && \
-    corepack enable && \
-    corepack prepare yarn@stable --activate && \
-    corepack prepare pnpm@latest --activate
+    npm install -g --force pnpm@latest yarn@latest pm2@latest repomix@latest && \
+    # Double check and force symlinks if needed
+    [ -f /usr/local/bin/pnpm ] || ln -s $(npm config get prefix)/bin/pnpm /usr/local/bin/pnpm && \
+    pnpm --version && yarn --version
 
 WORKDIR /workspace
 
-RUN echo "Python: $(python3 --version)" && \
+# Verify all critical tools are in PATH
+RUN echo "Final PATH: $PATH" && \
+    echo "Python: $(python3 --version)" && \
     echo "Node: $(node --version)" && \
     echo "NPM: $(npm --version)" && \
     echo "PNPM: $(pnpm --version)" && \
     echo "Yarn: $(yarn --version)" && \
-    echo "PM2: $(pm2 --version)" && \
-    echo "Git: $(git --version)" && \
-    echo "rg: $(rg --version | head -1)" && \
-    echo "GCC: $(gcc --version | head -1)" && \
-    echo "SQLite: $(sqlite3 --version)" && \
-    echo "OpenSSL: $(openssl version)"
+    echo "Ruff: $(ruff --version)" && \
+    echo "Pytest: $(pytest --version)"
 
 CMD ["/bin/bash"]

@@ -29,6 +29,12 @@ from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.prebuilt.tool_node import ToolRuntime
 
 try:
+    from app.services.telemetry import record_tool_telemetry
+except ImportError:
+    # Fallback for environments where app module is not in path
+    record_tool_telemetry = None
+
+try:
     from graphs.build_app_agent_v3.sandbox_policy_guard import (
         SandboxPolicyGuard,
         resolve_sandbox_patch_path,
@@ -409,6 +415,72 @@ class PatchFilesystemMiddleware(
             return self.backend(runtime)
         return self.backend
 
+    def _record_telemetry(
+        self,
+        runtime: ToolRuntime[Any, Any],
+        tool_name: str,
+        payload_json: str,
+    ) -> None:
+        """从 JSON 结果负载中提取并记录遥测数据."""
+        try:
+            payload = json.loads(payload_json)
+            if not isinstance(payload, dict):
+                return
+        except json.JSONDecodeError:
+            return
+
+        self._record_telemetry_raw(
+            runtime=runtime,
+            tool_name=tool_name,
+            is_success=payload.get("ok", False),
+            error_code=payload.get("error_code"),
+            message=payload.get("message"),
+            details=payload.get("details"),
+        )
+
+    def _record_telemetry_raw(
+        self,
+        runtime: ToolRuntime[Any, Any],
+        tool_name: str,
+        is_success: bool,
+        error_code: str | None = None,
+        message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """直接记录遥测数据."""
+        if record_tool_telemetry is None:
+            return
+
+        # Extract thread_id from runtime config
+        thread_id = None
+        config = getattr(runtime, "config", None)
+        if isinstance(config, dict):
+            configurable = config.get("configurable")
+            if isinstance(configurable, dict):
+                thread_id = configurable.get("thread_id")
+
+        if not thread_id:
+            return
+
+        # Fire and forget the async task in the background
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                record_tool_telemetry(
+                    thread_id=str(thread_id),
+                    tool_name=tool_name,
+                    is_success=is_success,
+                    error_code=error_code,
+                    message=message,
+                    details=details,
+                )
+            )
+        except RuntimeError:
+            # Fallback if no running loop
+            pass
+
     def wrap_model_call(
         self,
         request: ModelRequest[ContextT],
@@ -473,6 +545,23 @@ class PatchFilesystemMiddleware(
                     result = backend.execute(command)
             else:
                 result = backend.execute(command)
+
+            # Record telemetry for execute tool
+            self._record_telemetry_raw(
+                runtime=runtime,
+                tool_name="execute",
+                is_success=(result.exit_code == 0),
+                error_code=None
+                if result.exit_code == 0
+                else f"EXIT_{result.exit_code}",
+                message=f"Command: {command[:100]}",
+                details={
+                    "command": command,
+                    "exit_code": result.exit_code,
+                    "truncated": result.truncated,
+                },
+            )
+
             return (
                 f"Exit code: {result.exit_code}\n"
                 f"Truncated: {result.truncated}\n"
@@ -504,6 +593,23 @@ class PatchFilesystemMiddleware(
                     result = await backend.aexecute(command)
             else:
                 result = await backend.aexecute(command)
+
+            # Record telemetry for execute tool
+            self._record_telemetry_raw(
+                runtime=runtime,
+                tool_name="execute",
+                is_success=(result.exit_code == 0),
+                error_code=None
+                if result.exit_code == 0
+                else f"EXIT_{result.exit_code}",
+                message=f"Command: {command[:100]}",
+                details={
+                    "command": command,
+                    "exit_code": result.exit_code,
+                    "truncated": result.truncated,
+                },
+            )
+
             return (
                 f"Exit code: {result.exit_code}\n"
                 f"Truncated: {result.truncated}\n"
@@ -550,6 +656,7 @@ class PatchFilesystemMiddleware(
                         runtime.state if isinstance(runtime.state, dict) else None
                     ),
                 )
+                self._record_telemetry(runtime, "apply_patch", content)
                 return self._split_tool_payload_for_frontend(content)
             except Exception as exc:
                 content = self._error_result(
@@ -592,6 +699,7 @@ class PatchFilesystemMiddleware(
                         runtime.state if isinstance(runtime.state, dict) else None
                     ),
                 )
+                self._record_telemetry(runtime, "apply_patch", content)
                 return self._split_tool_payload_for_frontend(content)
             except Exception as exc:
                 content = self._error_result(
@@ -2135,9 +2243,32 @@ def _apply_single_hunk(
         return content.replace(search_text, replace_text, 1)
 
     if matches == 0:
+        import difflib
+
+        # Try to find a fuzzy match to provide a better error message
+        lines = content.splitlines()
+        search_lines = search_text.splitlines()
+
+        # We look for a window of lines that best matches the search_text
+        best_ratio = 0.0
+        best_match = ""
+        window_size = len(search_lines)
+
+        if window_size > 0 and len(lines) >= window_size:
+            for i in range(len(lines) - window_size + 1):
+                window = "\n".join(lines[i : i + window_size])
+                ratio = difflib.SequenceMatcher(None, search_text, window).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_match = window
+
+        suggestion = ""
+        if best_ratio > 0.7:  # Only suggest if it's reasonably close
+            suggestion = f"\n\nDid you mean to match this block (ratio {best_ratio:.2f})?\n<search>\n{best_match}\n</search>"
+
         raise ValueError(
             f"PATCH_NO_MATCH: SEARCH block for '{file_path}' has no exact match. "
-            "Read the latest file and ensure SEARCH text matches source exactly."
+            f"Read the latest file and ensure SEARCH text matches source exactly.{suggestion}"
         )
 
     if matches > 1:

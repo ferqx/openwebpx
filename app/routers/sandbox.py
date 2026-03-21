@@ -20,7 +20,6 @@ from aegra_api.api.runs import (
     set_thread_status,
     update_thread_metadata,
 )
-from aegra_api.core.auth_deps import get_current_user
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import RunEvent as RunEventORM
@@ -39,6 +38,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import authenticated_user as get_current_user
 from app.services.sandbox_bootstrap import (
     append_bootstrap_log,
     build_bootstrap_response,
