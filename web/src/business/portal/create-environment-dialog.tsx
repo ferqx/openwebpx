@@ -40,8 +40,6 @@ type CreateEnvironmentDialogProps = {
   filteredEnvRepos: string[];
   selectedEnvRepo: string;
   onSelectedEnvRepoChange: (repo: string) => void;
-  autoCodeReview: boolean;
-  onAutoCodeReviewChange: (value: boolean) => void;
   networkAccess: NetworkAccess;
   onNetworkAccessChange: (value: NetworkAccess) => void;
   onCreate: () => void;
@@ -59,8 +57,6 @@ export function CreateEnvironmentDialog({
   filteredEnvRepos,
   selectedEnvRepo,
   onSelectedEnvRepoChange,
-  autoCodeReview,
-  onAutoCodeReviewChange,
   networkAccess,
   onNetworkAccessChange,
   onCreate
@@ -141,23 +137,6 @@ export function CreateEnvironmentDialog({
               </CardContent>
             </Card>
           </div>
-
-          <Card>
-            <CardContent>
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <Label>代码审查</Label>
-                  <p className="mt-1 text-sm text-muted-foreground md:text-base">
-                    针对此存储库中的新拉取请求自动执行审查。
-                  </p>
-                </div>
-                <Switch
-                  checked={autoCodeReview}
-                  onCheckedChange={onAutoCodeReviewChange}
-                />
-              </div>
-            </CardContent>
-          </Card>
 
           <div className="space-y-3">
             <Label>代理网络访问</Label>

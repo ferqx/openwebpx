@@ -1,6 +1,6 @@
 import { type ScmProvider } from '@/lib/scm';
 
-export type PortalTab = 'tasks' | 'review';
+export type PortalTab = 'tasks';
 
 export type PortalRouteState = {
   portalTab?: PortalTab;

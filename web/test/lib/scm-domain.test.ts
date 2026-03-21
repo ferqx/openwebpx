@@ -6,7 +6,6 @@ import {
   resolveScmSourceLabel,
   parseScmConnectionSources,
   resolveScmApiOptionsFromSource,
-  toCodeReviewProvider,
   toSyntheticScmConnection,
   buildRepositoryOptionKey,
   isScmConnectionsEndpointUnavailable,
@@ -174,12 +173,6 @@ test('resolveScmApiOptionsFromSource extracts API options', () => {
   const gitlabOptions = resolveScmApiOptionsFromSource(gitlabEnterpriseSource);
   assert.equal(gitlabOptions.provider, 'gitlab_enterprise');
   assert.equal(gitlabOptions.gitlabBaseUrl, 'https://gitlab.company.com');
-});
-
-test('toCodeReviewProvider converts provider correctly', () => {
-  assert.equal(toCodeReviewProvider('github'), 'github');
-  assert.equal(toCodeReviewProvider('gitlab'), 'gitlab');
-  assert.equal(toCodeReviewProvider('gitlab_enterprise'), 'gitlab');
 });
 
 test('toSyntheticScmConnection creates connection from source', () => {

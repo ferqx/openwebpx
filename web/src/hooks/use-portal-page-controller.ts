@@ -49,7 +49,7 @@ export function usePortalPageController(): PortalPageController {
 
   const routePortalTab = useMemo(() => {
     const value = (location.state as PortalRouteState | null)?.portalTab;
-    if (value === 'tasks' || value === 'review') {
+    if (value === 'tasks') {
       return value;
     }
     return undefined;
@@ -216,7 +216,6 @@ export function usePortalPageController(): PortalPageController {
   const taskContentProps: ComponentProps<typeof PortalTaskContent> = {
     visibleTasks: taskState.visibleTasks,
     isTasksLoading: taskState.isTasksLoading,
-    autoCodeReview: scmState.autoCodeReview,
     onTaskClick: handleTaskClick,
     onTaskDelete: taskState.setPendingDeleteTask,
     onTaskCancelRun: taskState.handleCancelTaskRun,
@@ -273,8 +272,6 @@ export function usePortalPageController(): PortalPageController {
     filteredEnvRepos: scmState.filteredEnvRepos,
     selectedEnvRepo: scmState.selectedEnvRepo,
     onSelectedEnvRepoChange: scmState.setSelectedEnvRepo,
-    autoCodeReview: scmState.autoCodeReview,
-    onAutoCodeReviewChange: scmState.setAutoCodeReview,
     networkAccess: scmState.networkAccess,
     onNetworkAccessChange: scmState.setNetworkAccess,
     onCreate: () => {

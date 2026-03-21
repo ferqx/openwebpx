@@ -12,8 +12,6 @@ from sqlalchemy.pool import NullPool
 
 from app.core.auth import authenticated_user
 from app.routers.auth import router as auth_router
-from app.routers.code_review import public_router as code_review_public_router
-from app.routers.code_review import router as code_review_router
 from app.routers.common import router as common_router
 from app.routers.sandbox import router as sandbox_router
 from app.routers.scm import router as scm_router
@@ -62,10 +60,8 @@ app = FastAPI(lifespan=lifespan)
 # Public routes
 app.include_router(common_router)
 app.include_router(auth_router)
-app.include_router(code_review_public_router)
 
 # Protected custom routes
 app.include_router(sandbox_router, dependencies=[Depends(authenticated_user)])
 app.include_router(scm_router, dependencies=[Depends(authenticated_user)])
-app.include_router(code_review_router, dependencies=[Depends(authenticated_user)])
 app.include_router(telemetry_router, dependencies=[Depends(authenticated_user)])

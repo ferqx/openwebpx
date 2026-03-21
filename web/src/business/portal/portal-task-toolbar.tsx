@@ -42,7 +42,6 @@ export function PortalTaskToolbar({
     <div className="flex items-center justify-between">
       <TabsList variant="line">
         <TabsTrigger value="tasks">任务</TabsTrigger>
-        <TabsTrigger value="review">代码审查</TabsTrigger>
       </TabsList>
       {tab === 'tasks' && (
         <Popover open={taskSearchOpen} onOpenChange={onTaskSearchOpenChange}>

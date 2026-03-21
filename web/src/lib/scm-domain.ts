@@ -84,10 +84,6 @@ export const resolveScmApiOptionsFromSource = (source: PortalScmSource) => ({
     source.provider === 'gitlab_enterprise' ? source.gitlabBaseUrl : undefined
 });
 
-export const toCodeReviewProvider = (
-  provider: ScmProvider
-): 'github' | 'gitlab' => (provider === 'github' ? 'github' : 'gitlab');
-
 export const isScmConnectionsEndpointUnavailable = (error: unknown) => {
   if (error instanceof ScmRequestError) {
     const normalizedMessage = error.message.toLowerCase();

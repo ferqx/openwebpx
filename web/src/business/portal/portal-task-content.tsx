@@ -8,7 +8,6 @@ import { statusLabel, type TaskItem } from '@/lib/tasks';
 type PortalTaskContentProps = {
   visibleTasks: TaskItem[];
   isTasksLoading: boolean;
-  autoCodeReview: boolean;
   onTaskClick: (item: TaskItem) => void;
   onTaskDelete: (item: TaskItem) => void;
   onTaskCancelRun: (item: TaskItem) => void;
@@ -19,7 +18,6 @@ type PortalTaskContentProps = {
 export function PortalTaskContent({
   visibleTasks,
   isTasksLoading,
-  autoCodeReview,
   onTaskClick,
   onTaskDelete,
   onTaskCancelRun,
@@ -69,33 +67,6 @@ export function PortalTaskContent({
           )}
         </div>
       </TabsContent>
-
-      <TabsContent value="review">
-        <div className="flex min-h-95 items-center justify-center">
-          <div className="flex max-w-2xl flex-col items-center gap-5 text-center">
-            <div className="bg-card ring-foreground/10 flex size-20 items-center justify-center rounded-3xl ring-1 shadow-xs">
-              <Bug className="size-10" />
-            </div>
-            <h2 className="text-2xl font-semibold">
-              {autoCodeReview ? '代码审查已启用' : '代码审查未启用'}
-            </h2>
-            <p className="text-base text-muted-foreground">
-              {autoCodeReview
-                ? '将自动审核你推送至关联存储库的 PR。'
-                : '启用后，将在你推送 PR 时自动执行审查。'}
-            </p>
-            <Button
-              className="min-w-72 rounded-full"
-              size="lg"
-              type="button"
-              onClick={onOpenReviewSettings}
-            >
-              {autoCodeReview ? '管理代码审查' : '启用代码审查'}
-            </Button>
-          </div>
-        </div>
-      </TabsContent>
-
     </>
   );
 }

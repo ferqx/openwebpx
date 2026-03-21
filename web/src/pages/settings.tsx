@@ -1,6 +1,4 @@
-import { useEffect } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { toast } from 'sonner';
+import { useNavigate } from 'react-router-dom';
 import { PortalHeader } from '@/business/portal/portal-header';
 import { useAuth } from '@/provider/auth';
 import { Button } from '@/components/ui/button';
@@ -14,22 +12,10 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { CodeReviewSettings } from './code-review-config';
 
 export function SettingsPage() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { logout } = useAuth();
-  const focusCodeReviewRepo =
-    typeof (location.state as { focusCodeReviewRepo?: unknown } | null)
-      ?.focusCodeReviewRepo === 'string'
-      ? ((location.state as { focusCodeReviewRepo?: string }).focusCodeReviewRepo || '')
-      : '';
-
-  useEffect(() => {
-    if (!focusCodeReviewRepo) return;
-    toast.info(`已定位到仓库：${focusCodeReviewRepo}`);
-  }, [focusCodeReviewRepo]);
 
   return (
     <main className="h-full overflow-auto bg-background">
@@ -45,7 +31,7 @@ export function SettingsPage() {
           </h1>
         </div>
         <Tabs
-          defaultValue="code-review"
+          defaultValue="profile"
           orientation="vertical"
           className="flex w-full flex-col gap-6 md:flex-row md:gap-10"
         >
@@ -55,12 +41,6 @@ export function SettingsPage() {
               className="w-auto justify-start px-3 py-2 data-[state=active]:bg-background data-[state=active]:shadow-sm md:w-full"
             >
               个人资料
-            </TabsTrigger>
-            <TabsTrigger
-              value="code-review"
-              className="w-auto justify-start px-3 py-2 data-[state=active]:bg-background data-[state=active]:shadow-sm md:w-full"
-            >
-              代码审查
             </TabsTrigger>
           </TabsList>
 
@@ -85,10 +65,6 @@ export function SettingsPage() {
                   <Button>保存更改</Button>
                 </CardContent>
               </Card>
-            </TabsContent>
-
-            <TabsContent value="code-review" className="mt-0">
-              <CodeReviewSettings initialSearchQuery={focusCodeReviewRepo} />
             </TabsContent>
 
             <TabsContent value="appearance" className="mt-0">

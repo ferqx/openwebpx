@@ -8,7 +8,6 @@
 - [身份验证 (Authentication)](auth_module.md): 用户会话与**解耦鉴权架构**。
 - [沙箱服务 (Sandbox)](sandbox_module.md): 容器执行与引导流程。
 - [SCM 模块 (Source Control)](scm_module.md): GitHub/GitLab 集成与令牌管理。
-- [代码审查 (Code Review)](code_review_module.md): 自动审查与 Webhook 触发。
 
 ## 开发者快速开始
 1. **环境配置**: 复制 `.env.example` 为 `.env` 并配置必要的模型令牌。

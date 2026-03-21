@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { type NavigateFunction } from 'react-router-dom';
 import { toast } from 'sonner';
-import { fetchCodeReviewSettings, upsertCodeReviewRepositorySetting } from '@/lib/code-review';
 import {
   consumeScmOAuthResult,
   isValidScmBaseUrl,
@@ -14,8 +13,7 @@ import {
   normalizeGitlabBaseUrl,
   rememberEnterpriseBaseUrls,
   rememberProviderHints,
-  resolveScmSourceLabel,
-  toCodeReviewProvider
+  resolveScmSourceLabel
 } from '@/lib/scm-domain';
 import { usePortalScmConnections } from '@/hooks/use-portal-scm-connections';
 import { usePortalScmRepositories } from '@/hooks/use-portal-scm-repositories';
@@ -47,7 +45,6 @@ export const usePortalScmState = ({
   const [selectedOrg, setSelectedOrg] = useState('');
   const [envRepoQuery, setEnvRepoQuery] = useState('');
   const [selectedEnvRepo, setSelectedEnvRepo] = useState<string>('');
-  const [autoCodeReview, setAutoCodeReview] = useState(false);
   const [networkAccess, setNetworkAccess] = useState<'off' | 'on'>('off');
 
   const [filterSourcesState, setFilterSourcesState] = useState<
@@ -91,22 +88,6 @@ export const usePortalScmState = ({
     if (!query) return source;
     return source.filter((repo) => repo.toLowerCase().includes(query));
   }, [envRepoQuery, repositoriesState.repositoryNames, selectedOrg]);
-
-  useEffect(() => {
-    let isCancelled = false;
-    fetchCodeReviewSettings()
-      .then(({ global }) => {
-        if (isCancelled) return;
-        setAutoCodeReview(Boolean(global.autoReviewEnabled));
-      })
-      .catch((error) => {
-        if (isCancelled) return;
-        console.error('Failed to load code review global settings', error);
-      });
-    return () => {
-      isCancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     if (selectedOrg && orgs.includes(selectedOrg)) return;
@@ -261,32 +242,7 @@ export const usePortalScmState = ({
 
     repositoriesState.setSelectedRepoKey(targetOption.key);
     setCreateDialogOpen(false);
-
-    try {
-      const provider = toCodeReviewProvider(targetOption.source.provider);
-      await upsertCodeReviewRepositorySetting({
-        provider,
-        repository: targetOption.fullName,
-        gitlabBaseUrl:
-          provider === 'gitlab' && targetOption.source.provider === 'gitlab_enterprise'
-            ? targetOption.source.gitlabBaseUrl
-            : provider === 'gitlab'
-              ? 'https://gitlab.com'
-              : undefined,
-        autoReview: autoCodeReview ? 'enabled' : 'disabled',
-        trigger: 'follow_global'
-      });
-    } catch (error) {
-      console.error('Failed to persist code review setting from create dialog', error);
-      toast.warning('环境已创建，但代码审查设置保存失败，请在“设置-代码审查”中重试');
-    }
-
-    if (autoCodeReview) {
-      navigate('/settings', {
-        state: { focusCodeReviewRepo: targetOption.fullName }
-      });
-    }
-  }, [autoCodeReview, navigate, repositoriesState, selectedEnvRepo]);
+  }, [repositoriesState, selectedEnvRepo]);
 
   const handleRevokeScmSource = useCallback(
     async (source: PortalScmSource) => {
@@ -303,8 +259,6 @@ export const usePortalScmState = ({
   return {
     models,
     envRepoSearchId,
-    autoCodeReview,
-    setAutoCodeReview,
     networkAccess,
     setNetworkAccess,
     isAuthorizingScm,
