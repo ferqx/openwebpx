@@ -2,7 +2,8 @@ FROM alpine:3.20
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:/root/.local/bin:/root/.npm-global/bin"
 
 # Preinstall common tooling for coding-agent terminal workflows.
 RUN apk add --no-cache \
@@ -48,10 +49,20 @@ RUN apk add --no-cache \
     wget \
     xz \
     zip \
-    && npm install -g pm2 \
-    && npm install -g pnpm yarn \
-    && npm install -g repomix \
     && update-ca-certificates
+
+# Ensure npm global packages are in PATH and install Node.js package managers
+RUN npm config set prefix '/root/.npm-global' && \
+    mkdir -p /root/.npm-global/bin && \
+    mkdir -p /root/.local/bin && \
+    echo "Installing Node.js package managers..." && \
+    npm install -g pm2@latest && \
+    npm install -g pnpm@latest yarn@latest && \
+    npm install -g repomix@latest && \
+    npm install -g corepack@latest && \
+    corepack enable && \
+    corepack prepare yarn@stable --activate && \
+    corepack prepare pnpm@latest --activate
 
 WORKDIR /workspace
 

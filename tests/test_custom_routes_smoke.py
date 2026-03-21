@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import UTC, datetime
+from hashlib import sha256
+from hmac import new as hmac_new
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1758,7 +1761,495 @@ def test_code_review_webhook_dispatches_enabled_targets(
     assert payload["accepted"] is True
     assert payload["target_count"] == 1
     assert payload["success_count"] == 1
+    assert payload["skipped_count"] == 0
     assert len(dispatched) == 1
+
+
+def test_code_review_webhook_skips_duplicate_delivery(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    targets = [
+        {"user_id": "local-dev", "provider": "github", "repository": "owner/repo-a"}
+    ]
+    dispatched: list[dict[str, Any]] = []
+    claimed_deliveries: set[tuple[str, str | None]] = set()
+
+    async def fake_resolve_targets(
+        event: code_review_router.WebhookEventContext,
+    ) -> list[dict[str, Any]]:
+        assert event.provider == "github"
+        assert event.trigger == "push"
+        return targets
+
+    async def fake_claim_code_review_delivery(
+        *,
+        user_id: str,
+        event: code_review_router.WebhookEventContext,
+        delivery_id: str | None,
+    ) -> bool:
+        key = (user_id, delivery_id)
+        if key in claimed_deliveries:
+            return False
+        claimed_deliveries.add(key)
+        assert event.repository == "owner/repo-a"
+        return True
+
+    async def fake_dispatch(
+        *,
+        target: dict[str, Any],
+        event: code_review_router.WebhookEventContext,
+    ) -> dict[str, Any]:
+        dispatched.append({"target": target, "repository": event.repository})
+        return {"ok": True, "run_id": "run-1", "thread_id": "th-1"}
+
+    monkeypatch.setattr(
+        code_review_router, "_resolve_webhook_targets", fake_resolve_targets
+    )
+    monkeypatch.setattr(
+        code_review_router,
+        "_claim_code_review_delivery",
+        fake_claim_code_review_delivery,
+    )
+    monkeypatch.setattr(code_review_router, "_dispatch_code_review_run", fake_dispatch)
+
+    payload = {
+        "repository": {"full_name": "owner/repo-a"},
+        "ref": "refs/heads/main",
+        "head_commit": {"message": "fix: sample"},
+        "before": "a" * 40,
+        "after": "b" * 40,
+    }
+    headers = {"x-github-event": "push", "x-github-delivery": "delivery-1"}
+
+    first = client.post(
+        "/integrations/code-review/webhook", headers=headers, json=payload
+    )
+    second = client.post(
+        "/integrations/code-review/webhook",
+        headers=headers,
+        json=payload,
+    )
+
+    assert first.status_code == 200
+    assert first.json()["success_count"] == 1
+    assert first.json()["skipped_count"] == 0
+    assert second.status_code == 200
+    assert second.json()["success_count"] == 0
+    assert second.json()["skipped_count"] == 1
+    assert second.json()["results"][0]["reason"] == "duplicate_delivery"
+    assert second.json()["results"][0]["skipped"] is True
+    assert len(dispatched) == 1
+
+
+def test_code_review_webhook_accepts_provider_secret_without_custom_header(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    targets = [
+        {"user_id": "local-dev", "provider": "github", "repository": "owner/repo-a"}
+    ]
+
+    async def fake_resolve_targets(
+        event: code_review_router.WebhookEventContext,
+    ) -> list[dict[str, Any]]:
+        assert event.provider == "github"
+        return targets
+
+    async def fake_dispatch(
+        *,
+        target: dict[str, Any],
+        event: code_review_router.WebhookEventContext,
+    ) -> dict[str, Any]:
+        assert target["user_id"] == "local-dev"
+        assert event.repository == "owner/repo-a"
+        return {"ok": True, "run_id": "run-1", "thread_id": "th-1"}
+
+    monkeypatch.setenv("OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET", "shared-secret")
+    monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
+    monkeypatch.setattr(
+        code_review_router, "_resolve_webhook_targets", fake_resolve_targets
+    )
+    monkeypatch.setattr(code_review_router, "_dispatch_code_review_run", fake_dispatch)
+
+    payload = {
+        "repository": {"full_name": "owner/repo-a"},
+        "ref": "refs/heads/main",
+        "head_commit": {"message": "fix: sample"},
+        "before": "a" * 40,
+        "after": "b" * 40,
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+    signature = hmac_new(b"shared-secret", raw_body, sha256).hexdigest()
+
+    response = client.post(
+        "/integrations/code-review/webhook",
+        content=raw_body,
+        headers={
+            "content-type": "application/json",
+            "x-github-event": "push",
+            "x-hub-signature-256": f"sha256={signature}",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+
+
+def test_resolve_webhook_targets_repo_enabled_follow_global_uses_profile_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_list_global_profiles_by_trigger(
+        trigger: str,
+    ) -> list[dict[str, Any]]:
+        assert trigger == "push"
+        return []
+
+    async def fake_list_matching_repo_rows(**kwargs: Any) -> list[dict[str, Any]]:  # noqa: ANN401
+        _ = kwargs
+        return [
+            {
+                "user_id": "user-1",
+                "auto_review": "enabled",
+                "trigger": "follow_global",
+            }
+        ]
+
+    async def fake_select_profile(user_id: str) -> dict[str, Any]:
+        assert user_id == "user-1"
+        return {
+            "user_id": user_id,
+            "auto_review_enabled": False,
+            "default_trigger": "push",
+            "updated_at": None,
+            "updated_by": None,
+        }
+
+    monkeypatch.setattr(
+        code_review_router,
+        "_list_global_profiles_by_trigger",
+        fake_list_global_profiles_by_trigger,
+    )
+    monkeypatch.setattr(
+        code_review_router, "_list_matching_repo_rows", fake_list_matching_repo_rows
+    )
+    monkeypatch.setattr(code_review_router, "_select_profile", fake_select_profile)
+
+    targets = asyncio.run(
+        code_review_router._resolve_webhook_targets(  # noqa: SLF001
+            code_review_router.WebhookEventContext(
+                provider="github",
+                trigger="push",
+                repository="owner/repo-a",
+                checkout_repository="owner/repo-a",
+                branch="main",
+                gitlab_base_url=None,
+                checkout_gitlab_base_url=None,
+                title="Push event",
+                event_name="push",
+                payload={},
+            )
+        )
+    )
+
+    assert targets == [
+        {
+            "user_id": "user-1",
+            "provider": "github",
+            "repository": "owner/repo-a",
+            "branch": "main",
+            "gitlab_base_url": None,
+        }
+    ]
+
+
+def test_extract_review_comments_from_text_parses_json_block() -> None:
+    text = """
+总结：发现两个高风险问题。
+
+```review-comments-json
+{
+  "summary": "发现 2 个需要优先修复的问题。",
+  "comments": [
+    {"path": "app/main.py", "line": 42, "body": "这里缺少错误处理，会导致 500 直接暴露。"},
+    {"path": "app/auth.py", "line": 8, "body": "这里的鉴权分支会绕过权限校验。"}
+  ]
+}
+```
+"""
+
+    summary, comments = code_review_router._extract_review_comments_from_text(  # noqa: SLF001
+        text
+    )
+
+    assert summary == "发现 2 个需要优先修复的问题。"
+    assert [(item.path, item.line) for item in comments] == [
+        ("app/main.py", 42),
+        ("app/auth.py", 8),
+    ]
+
+
+def test_filter_review_comments_drops_invalid_path_and_line() -> None:
+    comments = [
+        code_review_router.ReviewInlineComment(
+            path="app/main.py",
+            line=41,
+            body="valid",
+        ),
+        code_review_router.ReviewInlineComment(
+            path="app/main.py",
+            line=99,
+            body="wrong line",
+        ),
+        code_review_router.ReviewInlineComment(
+            path="app/other.py",
+            line=12,
+            body="wrong path",
+        ),
+        code_review_router.ReviewInlineComment(
+            path="app/main.py",
+            line=41,
+            body="valid",
+        ),
+    ]
+
+    filtered = code_review_router._filter_review_comments(  # noqa: SLF001
+        comments,
+        {"app/main.py": [41, 42]},
+    )
+
+    assert [(item.path, item.line, item.body) for item in filtered] == [
+        ("app/main.py", 41, "valid")
+    ]
+
+
+def test_build_review_prompt_includes_inline_comment_contract() -> None:
+    prompt = code_review_router._build_review_prompt(  # noqa: SLF001
+        code_review_router.WebhookEventContext(
+            provider="github",
+            trigger="pr_open",
+            repository="owner/repo-a",
+            checkout_repository="owner/repo-a",
+            branch="main",
+            gitlab_base_url=None,
+            checkout_gitlab_base_url=None,
+            title="Fix sample",
+            event_name="pull_request",
+            payload={},
+        ),
+        [
+            {
+                "path": "app/main.py",
+                "status": "modified",
+                "patch": "@@ -40,2 +40,3 @@\n old\n+new_line\n keep",
+            }
+        ],
+    )
+
+    assert "```review-comments-json" in prompt
+    assert '"comments": [{"path": string, "line": number, "body": string}]' in prompt
+    assert "【可评论的新代码行】" in prompt
+    assert "app/main.py: 41" in prompt
+
+
+@pytest.mark.asyncio
+async def test_dispatch_code_review_run_uses_fork_checkout_repository(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    created_tasks: list[str] = []
+
+    async def fake_resolve_scm_access_token(**kwargs: Any) -> str:  # noqa: ANN401
+        assert kwargs["user_id"] == "local-dev"
+        assert kwargs["provider"] == "github"
+        return "token-123"
+
+    async def fake_fetch_github_diff_files(**kwargs: Any) -> list[dict[str, Any]]:  # noqa: ANN401
+        assert kwargs["event"].repository == "owner/base-repo"
+        return [
+            {
+                "path": "app.py",
+                "status": "modified",
+                "patch": "@@ -1 +1 @@\n-old\n+new",
+            }
+        ]
+
+    async def fake_create_run(**kwargs: Any) -> Any:  # noqa: ANN401
+        assert kwargs["thread_id"]
+        return SimpleNamespace(run_id="run-1")
+
+    class FakeSession:
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:  # noqa: ARG002
+            return None
+
+        def add(self, thread: Any) -> None:  # noqa: ANN401
+            captured["thread"] = thread
+
+        async def flush(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    class FakeSessionMaker:
+        def __call__(self) -> FakeSession:
+            return FakeSession()
+
+    monkeypatch.setattr(
+        code_review_router,
+        "_resolve_scm_access_token",
+        fake_resolve_scm_access_token,
+    )
+    monkeypatch.setattr(
+        code_review_router,
+        "_fetch_github_diff_files",
+        fake_fetch_github_diff_files,
+    )
+    monkeypatch.setattr(code_review_router, "create_run", fake_create_run)
+    monkeypatch.setattr(
+        code_review_router.asyncio,
+        "create_task",
+        lambda coro: (created_tasks.append(str(coro)), coro.close(), SimpleNamespace())[
+            2
+        ],
+    )
+    monkeypatch.setattr(
+        code_review_router, "_get_session_maker", lambda: FakeSessionMaker()
+    )
+
+    result = await code_review_router._dispatch_code_review_run(  # noqa: SLF001
+        target={
+            "user_id": "local-dev",
+            "provider": "github",
+            "repository": "owner/base-repo",
+            "branch": "feature-branch",
+        },
+        event=code_review_router.WebhookEventContext(
+            provider="github",
+            trigger="pr_open",
+            repository="owner/base-repo",
+            checkout_repository="contributor/fork-repo",
+            branch="feature-branch",
+            gitlab_base_url=None,
+            checkout_gitlab_base_url=None,
+            title="Fix bug from fork",
+            event_name="pull_request",
+            payload={
+                "pull_request": {
+                    "number": 12,
+                    "head": {
+                        "sha": "abc123",
+                        "repo": {"full_name": "contributor/fork-repo"},
+                    },
+                }
+            },
+        ),
+    )
+
+    thread = captured.get("thread")
+    assert thread is not None
+    metadata = thread.metadata_json if isinstance(thread.metadata_json, dict) else {}
+    assert result["thread_id"] == thread.thread_id
+    assert metadata["repo"] == "contributor/fork-repo"
+    assert metadata["review_repository"] == "owner/base-repo"
+    assert metadata["branch"] == "feature-branch"
+    assert metadata["review_commentable_lines"] == {"app.py": [1]}
+    assert metadata["review_locator"]["provider"] == "github"
+    assert len(created_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_review_comments_after_run_records_publish_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_status: dict[str, Any] = {}
+    thread = SimpleNamespace(
+        thread_id="thread-1",
+        user_id="user-1",
+        metadata_json={
+            "review_locator": {
+                "provider": "github",
+                "pull_number": 7,
+                "commit_id": "abc123",
+            },
+            "review_repository": "owner/repo-a",
+            "review_commentable_lines": {"app/main.py": [41]},
+        },
+    )
+
+    async def fake_wait_for_run_terminal_state(**kwargs: Any) -> Any:  # noqa: ANN401
+        assert kwargs["run_id"] == "run-1"
+        return SimpleNamespace(
+            status="success",
+            output={
+                "messages": [
+                    {
+                        "type": "ai",
+                        "content": """总结
+
+```review-comments-json
+{"summary":"发现 1 个问题","comments":[{"path":"app/main.py","line":41,"body":"这里可能会抛异常。"}]}
+```""",
+                    }
+                ]
+            },
+        )
+
+    class FakeSession:
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:  # noqa: ARG002
+            return None
+
+        async def scalar(self, stmt: Any) -> Any:  # noqa: ANN401, ARG002
+            return thread
+
+    class FakeSessionMaker:
+        def __call__(self) -> FakeSession:
+            return FakeSession()
+
+    async def fake_publish_github_pr_review_comments(**kwargs: Any) -> int:  # noqa: ANN401
+        assert kwargs["repository"] == "owner/repo-a"
+        assert kwargs["pull_number"] == 7
+        assert kwargs["commit_id"] == "abc123"
+        assert len(kwargs["comments"]) == 1
+        return 1
+
+    async def fake_update_thread_review_publish_status(**kwargs: Any) -> None:  # noqa: ANN401
+        captured_status.update(kwargs["status"])
+
+    monkeypatch.setattr(
+        code_review_router,
+        "_wait_for_run_terminal_state",
+        fake_wait_for_run_terminal_state,
+    )
+    monkeypatch.setattr(
+        code_review_router, "_get_session_maker", lambda: FakeSessionMaker()
+    )
+    monkeypatch.setattr(
+        code_review_router,
+        "_publish_github_pr_review_comments",
+        fake_publish_github_pr_review_comments,
+    )
+    monkeypatch.setattr(
+        code_review_router,
+        "_update_thread_review_publish_status",
+        fake_update_thread_review_publish_status,
+    )
+
+    await code_review_router._publish_review_comments_after_run(  # noqa: SLF001
+        run_id="run-1",
+        thread_id="thread-1",
+        user_id="user-1",
+    )
+
+    assert captured_status["status"] == "published"
+    assert captured_status["provider"] == "github"
+    assert captured_status["extracted_count"] == 1
+    assert captured_status["filtered_count"] == 1
+    assert captured_status["published_count"] == 1
 
 
 def test_code_review_repo_setting_returns_manual_webhook_fallback(

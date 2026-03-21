@@ -1283,21 +1283,20 @@ class DockerMiddleware(AgentMiddleware):
                 current_container,
                 command,
             ),
-            exec_stream_fn=lambda current_container,
-            command,
-            on_output_line: self._exec_stream(
-                current_container,
-                command,
-                on_output_line=on_output_line,
+            exec_stream_fn=lambda current_container, command, on_output_line: (
+                self._exec_stream(
+                    current_container,
+                    command,
+                    on_output_line=on_output_line,
+                )
             ),
-            report_progress=lambda current_reporter,
-            stage,
-            level,
-            message: self._report_progress(
-                current_reporter,
-                stage=stage,
-                level=level,
-                message=message,
+            report_progress=lambda current_reporter, stage, level, message: (
+                self._report_progress(
+                    current_reporter,
+                    stage=stage,
+                    level=level,
+                    message=message,
+                )
             ),
             container=container,
             package_manager=package_manager,
@@ -1338,14 +1337,13 @@ class DockerMiddleware(AgentMiddleware):
                 command,
                 environment=environment,
             ),
-            report_progress=lambda current_reporter,
-            stage,
-            level,
-            message: self._report_progress(
-                current_reporter,
-                stage=stage,
-                level=level,
-                message=message,
+            report_progress=lambda current_reporter, stage, level, message: (
+                self._report_progress(
+                    current_reporter,
+                    stage=stage,
+                    level=level,
+                    message=message,
+                )
             ),
             is_service_running_fn=lambda: self._is_service_running(container),
             tail_service_logs_fn=lambda lines: self._tail_service_logs(
