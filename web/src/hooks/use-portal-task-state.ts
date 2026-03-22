@@ -96,6 +96,7 @@ export const usePortalTaskState = ({
   );
 
   return {
+    tasks,
     taskQuery,
     setTaskQuery,
     taskSearchOpen,

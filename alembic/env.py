@@ -3,13 +3,14 @@
 import asyncio
 from logging.config import fileConfig
 
-# Import your SQLAlchemy models here
 from aegra_api.core.orm import Base
 from aegra_api.settings import settings
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+# Import your SQLAlchemy models here
+import app.core.env  # noqa: F401
 from alembic import context
 
 # This is the Alembic Config object, which provides

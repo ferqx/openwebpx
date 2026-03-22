@@ -1,7 +1,7 @@
 """Add auth_users table for local and LDAP identities
 
 Revision ID: 6fd5c9f2a1b4
-Revises: c4d8f8b8a812
+Revises: 3c2f7a9b1d4e
 Create Date: 2026-03-03 11:00:00.000000
 """
 
@@ -11,7 +11,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "6fd5c9f2a1b4"
-down_revision = "c4d8f8b8a812"
+down_revision = "3c2f7a9b1d4e"
 branch_labels = None
 depends_on = None
 

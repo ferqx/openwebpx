@@ -1,7 +1,7 @@
 """Add tool telemetry table for agent performance analysis
 
 Revision ID: c8b3e5d02g21
-Revises: b7a2d4c91f10
+Revises: 6fd5c9f2a1b4
 Create Date: 2026-03-21 12:00:00.000000
 """
 
@@ -12,7 +12,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "c8b3e5d02g21"
-down_revision = "b7a2d4c91f10"
+down_revision = "6fd5c9f2a1b4"
 branch_labels = None
 depends_on = None
 

@@ -7,6 +7,7 @@ This file provides local development context. For global collaboration rules, re
 - **Frontend Master Docs**: [web/AGENTS.md](web/AGENTS.md) & [web/CLAUDE.md](web/CLAUDE.md)
 - **Tech Conventions**: [docs/development/conventions.md](docs/development/conventions.md)
 - **Architecture**: [docs/architecture.md](docs/architecture.md)
+- **Backend Code Review Platform**: [docs/backend/code_review_platform.md](docs/backend/code_review_platform.md)
 
 ## 2. Global Commands (Root)
 - `make dev-install`: Setup both backend and frontend environments.

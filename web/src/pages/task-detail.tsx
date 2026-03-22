@@ -15,7 +15,13 @@ import {
   commitSandboxThreadGitChanges,
   type SandboxThreadGitCommitResult
 } from '@/lib/sandbox';
-import { mapThreadToTaskItem, type TaskItem } from '@/lib/tasks';
+import { mapThreadToTaskItem } from '@/lib/tasks';
+import {
+  buildBackToPortalState,
+  deriveInitialAutoRunState,
+  stripConsumedTaskRouteState,
+  type TaskRouteState
+} from '@/pages/task-detail-route-state';
 import { useStreamContext } from '@/provider/stream';
 import { useThreads } from '@/provider/thread';
 import {
@@ -28,13 +34,6 @@ import {
 } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
-
-type TaskRouteState = {
-  task?: TaskItem;
-  initialPrompt?: string;
-  shouldAutoRun?: boolean;
-  portalTab?: 'tasks' | 'review';
-};
 
 export function TaskDetailPage() {
   const navigate = useNavigate();
@@ -77,14 +76,7 @@ export function TaskDetailPage() {
   // 路由态只用于首轮进入时的兜底信息与自动运行参数。
   const routeState = location.state as TaskRouteState | null;
   const routeTask = routeState?.task;
-  const routePortalTab = routeState?.portalTab;
-  const [initialAutoRun] = useState(() => {
-    const shouldAutoRun = Boolean(routeState?.shouldAutoRun);
-    return {
-      shouldAutoRun,
-      prompt: shouldAutoRun ? (routeState?.initialPrompt?.trim() ?? '') : ''
-    };
-  });
+  const [initialAutoRun] = useState(() => deriveInitialAutoRunState(routeState));
   const initialPrompt = initialAutoRun.prompt;
   const requestedThreadIdsRef = useRef<Set<string>>(new Set());
   const autoSubmittedThreadIdsRef = useRef<Set<string>>(new Set());
@@ -103,21 +95,17 @@ export function TaskDetailPage() {
   // 自动运行参数消费后，清理 shouldAutoRun，避免刷新后重复触发。
   useEffect(() => {
     if (!routeState?.shouldAutoRun) return;
-
-    const nextState: TaskRouteState = {};
-    if (routeTask) nextState.task = routeTask;
-    if (routePortalTab) nextState.portalTab = routePortalTab;
+    const nextState = stripConsumedTaskRouteState(routeState);
 
     navigate(location.pathname, {
       replace: true,
-      state: Object.keys(nextState).length > 0 ? nextState : null
+      state: nextState
     });
   }, [
     location.pathname,
     navigate,
-    routePortalTab,
     routeState?.shouldAutoRun,
-    routeTask
+    routeState
   ]);
 
   // 线程列表拉取只做“是否存在当前线程”的检查，不直接参与消息渲染。
@@ -326,8 +314,9 @@ export function TaskDetailPage() {
 
   // 返回时尽量保持门户页 tab 上下文。
   const handleBackToPortal = () => {
-    if (routePortalTab) {
-      navigate('/', { state: { portalTab: routePortalTab } });
+    const nextState = buildBackToPortalState(routeState);
+    if (nextState) {
+      navigate('/', { state: nextState });
       return;
     }
     navigate('/');

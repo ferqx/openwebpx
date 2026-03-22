@@ -84,6 +84,30 @@ def test_auth_register_and_login_smoke(client: TestClient) -> None:
     assert "Max-Age=2592000" in login_cookie
 
 
+def test_api_prefixed_auth_routes_smoke(client: TestClient) -> None:
+    register_response = client.post(
+        "/api/auth/register",
+        json={
+            "username": "api-prefixed-user",
+            "password": "secret123",
+        },
+    )
+
+    assert register_response.status_code == 200
+    assert register_response.json()["user"]["identity"] == "api_prefixed_user"
+
+    login_response = client.post(
+        "/api/auth/login",
+        json={
+            "username": "api-prefixed-user",
+            "password": "secret123",
+        },
+    )
+
+    assert login_response.status_code == 200
+    assert login_response.json()["user"]["identity"] == "api_prefixed_user"
+
+
 @pytest.mark.asyncio
 async def test_aegra_auth_supports_cookie_token(client: TestClient) -> None:
     login_response = client.post(
@@ -1339,6 +1363,47 @@ def test_scm_connections_route_lists_multiple_sources(
     keys = {item["connection_key"] for item in payload["connections"]}
     assert "github" in keys
     assert "gitlab" in keys
+
+
+def test_api_prefixed_scm_connections_route_smoke(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    github_payload = scm_router._encrypt_scm_token_payload(  # noqa: SLF001
+        {
+            "provider": "github",
+            "access_token": "gh-token",
+            "refresh_token": "gh-refresh",
+            "expires_at": time.time() + 3600,
+        }
+    )
+
+    async def fake_list_rows(user_id: str) -> list[dict[str, Any]]:
+        assert user_id == "local-dev"
+        return [
+            {
+                "cache_key": "local-dev:github:github_app",
+                "provider": "github",
+                "github_auth_mode": "github_app",
+                "gitlab_base_url": None,
+                "token_encrypted": github_payload,
+                "updated_at": time.time(),
+            }
+        ]
+
+    monkeypatch.setattr(scm_router, "_list_scm_token_rows_for_user", fake_list_rows)
+
+    response = client.get("/api/integrations/scm/connections")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["connections"]) == 1
+    assert payload["connections"][0]["connection_key"] == "github"
+
+
+def test_api_prefixed_threads_search_route_exists(client: TestClient) -> None:
+    paths = {getattr(route, "path", "") for route in app.routes}
+
+    assert "/api/threads/search" in paths
 
 
 def test_scm_connections_route_tolerates_legacy_github_auth_mode(
