@@ -1,7 +1,9 @@
 import { Tabs } from '@/components/ui/tabs';
 import { CreateEnvironmentDialog } from '@/business/portal/create-environment-dialog';
+import { PortalCodeReviewContinueFixDialog } from '@/business/portal/portal-code-review-continue-fix-dialog';
 import { PortalDeleteTaskDialog } from '@/business/portal/portal-delete-task-dialog';
 import { PortalHeader } from '@/business/portal/portal-header';
+import { PortalCodeReviewSettingsSheet } from '@/business/portal/portal-code-review-settings-sheet';
 import { PortalPromptPanel } from '@/business/portal/portal-prompt-panel';
 import { PortalTaskContent } from '@/business/portal/portal-task-content';
 import { PortalTaskToolbar } from '@/business/portal/portal-task-toolbar';
@@ -46,6 +48,10 @@ export function PortalPage() {
       <PortalDeleteTaskDialog {...controller.deleteTaskDialogProps} />
       <ScmOauthDialog {...controller.scmOauthDialogProps} />
       <CreateEnvironmentDialog {...controller.createEnvironmentDialogProps} />
+      <PortalCodeReviewSettingsSheet {...controller.codeReviewSettingsSheetProps} />
+      <PortalCodeReviewContinueFixDialog
+        {...controller.codeReviewContinueFixDialogProps}
+      />
     </main>
   );
 }

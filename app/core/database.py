@@ -13,8 +13,10 @@ def get_async_session_maker():
     """统一获取异步 SessionMaker 的入口."""
     session_maker = getattr(aegra_orm, "async_session_maker", None)
     if session_maker is None:
-        # 这里可以加入 fallback 逻辑，比如如果 aegra 没初始化，尝试根据本地环境变量初始化
-        logger.warning("Core: async_session_maker not found in aegra_api.")
+        try:
+            session_maker = aegra_orm._get_session_maker()
+        except RuntimeError:
+            logger.warning("Core: async_session_maker not found in aegra_api.")
     return session_maker
 
 

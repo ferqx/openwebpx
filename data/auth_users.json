@@ -1,0 +1,9 @@
+{
+  "codex_review_smoke": {
+    "password_hash": "pbkdf2_sha256$260000$9ca8b005719a1f20423ff79bb7d6e646$762b5862b83c2ef10e9e44e4f7e570388d87da01dc3d0520c921978683a19ffc",
+    "role": "admin",
+    "team_id": "codex_review_smoke",
+    "email": "codex_review_smoke@example.com",
+    "display_name": "User codex_review_smoke"
+  }
+}

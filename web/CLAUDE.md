@@ -29,3 +29,4 @@ This file provides local development context. For global collaboration rules, re
 - **Constraint Thresholds**: Strictly follow 500/300 line limits defined in [AGENTS.md](AGENTS.md).
 - **Quality Mandates**: Zero `any` usage; mandatory error handling; no empty-state flashing.
 - **SCM**: Use `/integrations/scm/` endpoints; state source is the backend connections.
+- **Portal Code Review**: The portal now contains a `review` tab alongside `tasks`. Review state lives in `use-portal-code-review-state.ts`; continue-fix thread handoff lives in `use-portal-code-review-continuation.ts`; all review UI stays under `src/business/portal/`.

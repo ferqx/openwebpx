@@ -1,4 +1,4 @@
-import { Search } from 'lucide-react';
+import { Search, Settings2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Command,
@@ -15,7 +15,13 @@ import {
 } from '@/components/ui/popover';
 import { TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { type TaskItem } from '@/lib/tasks';
-import { type PortalTab } from '@/business/portal/types';
+import { portalTabs, type PortalTab } from '@/business/portal/types';
+
+export type PortalToolbarAction = 'search' | 'settings';
+
+export const resolvePortalToolbarAction = (
+  tab: PortalTab
+): PortalToolbarAction => (tab === 'review' ? 'settings' : 'search');
 
 type PortalTaskToolbarProps = {
   tab: PortalTab;
@@ -26,6 +32,7 @@ type PortalTaskToolbarProps = {
   isTasksLoading: boolean;
   visibleTasks: TaskItem[];
   onTaskSelect: (item: TaskItem) => void;
+  onReviewSettingsClick: () => void;
 };
 
 export function PortalTaskToolbar({
@@ -36,14 +43,21 @@ export function PortalTaskToolbar({
   onTaskQueryChange,
   isTasksLoading,
   visibleTasks,
-  onTaskSelect
+  onTaskSelect,
+  onReviewSettingsClick
 }: PortalTaskToolbarProps) {
+  const toolbarAction = resolvePortalToolbarAction(tab);
+
   return (
     <div className="flex items-center justify-between">
       <TabsList variant="line">
-        <TabsTrigger value="tasks">任务</TabsTrigger>
+        {portalTabs.map((portalTab) => (
+          <TabsTrigger key={portalTab} value={portalTab}>
+            {portalTab === 'tasks' ? '任务' : '代码审查'}
+          </TabsTrigger>
+        ))}
       </TabsList>
-      {tab === 'tasks' && (
+      {toolbarAction === 'search' ? (
         <Popover open={taskSearchOpen} onOpenChange={onTaskSearchOpenChange}>
           <PopoverTrigger asChild>
             <Button
@@ -88,6 +102,16 @@ export function PortalTaskToolbar({
             </Command>
           </PopoverContent>
         </Popover>
+      ) : (
+        <Button
+          aria-label="审查设置"
+          type="button"
+          variant="ghost"
+          size="icon"
+          onClick={onReviewSettingsClick}
+        >
+          <Settings2 />
+        </Button>
       )}
     </div>
   );
