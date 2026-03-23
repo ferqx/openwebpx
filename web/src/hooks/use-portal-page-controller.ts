@@ -129,8 +129,7 @@ export function usePortalPageController(): PortalPageController {
   const scmState = usePortalScmState({
     pathname: location.pathname,
     search: location.search,
-    hash: location.hash,
-    navigate
+    hash: location.hash
   });
   const codeReviewState = usePortalCodeReviewState({
     selectedRepo: scmState.validatedSelectedRepo,

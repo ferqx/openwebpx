@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 // Mock import.meta.env before importing scm.ts
-// @ts-ignore
+// @ts-expect-error: Mocking import.meta.env for Node.js test environment
 import.meta.env = {};
 
 import {
@@ -111,7 +111,7 @@ test('OAuth result management', () => {
 
 test('fetchScmRepositories returns repository list on success', async () => {
   const mockRepos = [{ id: '1', fullName: 'user/repo' }];
-  global.fetch = async (url) => {
+  global.fetch = async () => {
     return {
       ok: true,
       status: 200,

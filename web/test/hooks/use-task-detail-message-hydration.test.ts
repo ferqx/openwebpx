@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildMessagesDigest } from '../../src/business/task-detail/task-detail-utils.ts';
-import { type ThreadChatDisplayMessage } from '../../src/business/thread-chat/types.ts';
 
 // Tests for the logic behind message hydration in task detail
 test('buildMessagesDigest generates different strings for different message lists', () => {

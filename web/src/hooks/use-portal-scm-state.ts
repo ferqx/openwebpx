@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { type NavigateFunction } from 'react-router-dom';
 import { toast } from 'sonner';
 import {
   consumeScmOAuthResult,
@@ -26,14 +25,12 @@ type UsePortalScmStateOptions = {
   pathname: string;
   search: string;
   hash: string;
-  navigate: NavigateFunction;
 };
 
 export const usePortalScmState = ({
   pathname,
   search,
-  hash,
-  navigate
+  hash
 }: UsePortalScmStateOptions) => {
   const [isAuthorizingScm, setIsAuthorizingScm] = useState(false);
   const [authDialogProvider, setAuthDialogProvider] =

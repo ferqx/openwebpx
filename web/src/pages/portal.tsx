@@ -30,7 +30,7 @@ export function PortalPage() {
                 onSettingsClick={controller.onSettingsClick}
                 onLogout={controller.onLogout}
               />
-              <div className="mt-4 space-y-5 mx-auto max-w-3xl">
+              <div className="mx-auto mt-4 max-w-3xl space-y-5">
                 <h1 className="text-center text-3xl tracking-tight">
                   你可以提问让它帮你写代码，或者审查你的改动
                 </h1>
@@ -38,7 +38,7 @@ export function PortalPage() {
                 <PortalTaskToolbar {...controller.taskToolbarProps} />
               </div>
             </div>
-            <div className="w-full mx-auto max-w-3xl">
+            <div className="mx-auto w-full max-w-3xl">
               <PortalTaskContent {...controller.taskContentProps} />
             </div>
           </Tabs>
@@ -48,7 +48,9 @@ export function PortalPage() {
       <PortalDeleteTaskDialog {...controller.deleteTaskDialogProps} />
       <ScmOauthDialog {...controller.scmOauthDialogProps} />
       <CreateEnvironmentDialog {...controller.createEnvironmentDialogProps} />
-      <PortalCodeReviewSettingsSheet {...controller.codeReviewSettingsSheetProps} />
+      <PortalCodeReviewSettingsSheet
+        {...controller.codeReviewSettingsSheetProps}
+      />
       <PortalCodeReviewContinueFixDialog
         {...controller.codeReviewContinueFixDialogProps}
       />

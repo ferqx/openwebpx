@@ -67,41 +67,36 @@ export function PortalCodeReviewFindings({
 
   return (
     <div className="space-y-4">
-      <Card size="sm">
-        <CardContent className="space-y-4 py-4">
-          <div className="space-y-1">
-            <p className="text-sm font-medium text-foreground">审查发现</p>
-            <p className="text-xs text-muted-foreground">
-              共 {findings.length} 项，当前显示 {visibleFindings.length} 项
-            </p>
-          </div>
-
-          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_140px_160px]">
+      <div className="rounded-xl border bg-card p-3 shadow-sm">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <div className="flex-1">
             <div className="relative">
               <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
-                aria-label="筛选文件路径"
-                className="pl-9"
-                placeholder="搜索文件路径"
+                id="finding-search"
+                aria-label="搜索文件路径"
+                className="h-9 pl-9 text-sm"
+                placeholder={`筛选文件 (共 ${findings.length} 项)`}
                 value={fileQuery}
                 onChange={(event) => setFileQuery(event.target.value)}
               />
             </div>
+          </div>
+          <div className="flex shrink-0 gap-2">
             <Select
               value={severityFilter}
               onValueChange={(value) =>
                 setSeverityFilter(value as FindingSeverityFilter)
               }
             >
-              <SelectTrigger className="w-full" size="sm">
-                <SelectValue placeholder="严重级别" />
+              <SelectTrigger aria-label="筛选级别" className="h-9 w-24 text-sm" size="sm">
+                <SelectValue placeholder="级别" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">全部级别</SelectItem>
                 <SelectItem value="high">高</SelectItem>
                 <SelectItem value="medium">中</SelectItem>
                 <SelectItem value="low">低</SelectItem>
-                <SelectItem value="info">信息</SelectItem>
               </SelectContent>
             </Select>
             <Select
@@ -110,17 +105,17 @@ export function PortalCodeReviewFindings({
                 setAutoFixFilter(value as 'all' | 'fixable')
               }
             >
-              <SelectTrigger className="w-full" size="sm">
-                <SelectValue placeholder="修复能力" />
+              <SelectTrigger aria-label="筛选修复能力" className="h-9 w-28 text-sm" size="sm">
+                <SelectValue placeholder="修复" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">全部发现</SelectItem>
-                <SelectItem value="fixable">仅自动修复</SelectItem>
+                <SelectItem value="fixable">可修复</SelectItem>
               </SelectContent>
             </Select>
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </div>
 
       {visibleFindings.length === 0 ? (
         <Card size="sm">

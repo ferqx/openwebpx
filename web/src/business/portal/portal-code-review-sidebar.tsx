@@ -77,6 +77,7 @@ type PortalCodeReviewSidebarProps = {
   publishingRunIds?: Record<number, true>;
   approvingFixRequestIds?: Record<number, true>;
   rejectingFixRequestIds?: Record<number, true>;
+  layout?: 'full' | 'compact' | 'timeline';
 };
 
 const getFixRequestStatusMeta = (status: CodeReviewFixRequest['status']) => {
@@ -106,7 +107,8 @@ export function PortalCodeReviewSidebar({
   continueFixHint,
   publishingRunIds = {},
   approvingFixRequestIds = {},
-  rejectingFixRequestIds = {}
+  rejectingFixRequestIds = {},
+  layout = 'full'
 }: PortalCodeReviewSidebarProps) {
   const statusMeta = getReviewStatusMeta(run.status);
   const mode = resolvePortalCodeReviewMode(run);
@@ -124,6 +126,174 @@ export function PortalCodeReviewSidebar({
     return leftTime - rightTime;
   });
 
+  if (layout === 'compact') {
+    return (
+      <div className="space-y-4">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+          <div className="flex flex-1 items-center gap-2">
+            <Badge variant="outline" className={statusMeta.className}>
+              {statusMeta.label}
+            </Badge>
+            <Badge variant="outline" className={modeMeta.className}>
+              {modeMeta.label}
+            </Badge>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              disabled={run.status !== 'completed' || Boolean(publishingRunIds[run.id])}
+              onClick={() => void onPublishRun(run.id)}
+            >
+              Publish
+            </Button>
+            {showContinueFix ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!canContinueFix}
+                onClick={() => void onContinueFix(run)}
+              >
+                继续修复
+              </Button>
+            ) : null}
+          </div>
+        </div>
+
+        {pendingFixRequests.length > 0 ? (
+          <div className="space-y-3">
+            <p className="text-xs font-medium text-amber-700">待处理修复请求 ({pendingFixRequests.length})</p>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {pendingFixRequests.map((fixRequest) => {
+                const finding = fixRequest.review_finding_id
+                  ? findingsById.get(fixRequest.review_finding_id)
+                  : null;
+                const isApproving = Boolean(approvingFixRequestIds[fixRequest.id]);
+                const isRejecting = Boolean(rejectingFixRequestIds[fixRequest.id]);
+                return (
+                  <div
+                    key={fixRequest.id}
+                    className="flex flex-col justify-between gap-3 rounded-lg border bg-amber-50/50 p-3"
+                  >
+                    <div className="space-y-1">
+                      <p className="line-clamp-1 text-sm font-medium text-foreground">
+                        {finding?.title ?? `修复请求 #${fixRequest.id}`}
+                      </p>
+                      <p className="line-clamp-1 text-[10px] text-muted-foreground">
+                        {finding?.file_path ?? '未关联文件'}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 flex-1 bg-background text-xs"
+                        disabled={isApproving || isRejecting}
+                        onClick={() => void onApproveFixRequest(fixRequest.id, run.id)}
+                      >
+                        Approve
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 flex-1 bg-background text-xs"
+                        disabled={isApproving || isRejecting}
+                        onClick={() => void onRejectFixRequest(fixRequest.id, run.id)}
+                      >
+                        Reject
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (layout === 'timeline') {
+    return (
+      <div className="grid gap-4 md:grid-cols-2">
+        <Card size="sm">
+          <CardHeader className="py-3">
+            <CardTitle className="text-sm font-medium">运行统计</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap gap-2">
+              {fixRequestSummary.pending_approval > 0 ? (
+                <Badge variant="outline" className="border-amber-300 bg-amber-50 text-amber-700">
+                  待审批 {fixRequestSummary.pending_approval}
+                </Badge>
+              ) : null}
+              {fixRequestSummary.running > 0 ? (
+                <Badge variant="outline" className="border-sky-300 bg-sky-50 text-sky-700">
+                  执行中 {fixRequestSummary.running}
+                </Badge>
+              ) : null}
+              {fixRequestSummary.completed > 0 ? (
+                <Badge variant="outline" className="border-emerald-300 bg-emerald-50 text-emerald-700">
+                  已完成 {fixRequestSummary.completed}
+                </Badge>
+              ) : null}
+              {fixRequestSummary.failed > 0 ? (
+                <Badge variant="outline" className="border-red-300 bg-red-50 text-red-700">
+                  已失败 {fixRequestSummary.failed}
+                </Badge>
+              ) : null}
+            </div>
+
+            <div className="space-y-2 text-xs text-muted-foreground">
+              <div className="flex justify-between">
+                <span>审查发现总数</span>
+                <span className="font-medium text-foreground">{run.findings.length}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>修复请求总数</span>
+                <span className="font-medium text-foreground">{run.fix_requests.length}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Provider</span>
+                <span className="font-medium text-foreground">{run.provider}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card size="sm">
+          <CardHeader className="py-3">
+            <CardTitle className="text-sm font-medium">最近动态</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-4">
+              {timeline.slice(-3).reverse().map((event) => (
+                <div key={event.id} className="relative border-l pb-4 pl-4 last:pb-0">
+                  <div className="absolute -left-1 top-1 h-2 w-2 rounded-full bg-primary" />
+                  <p className="text-xs font-medium text-foreground">
+                    {humanizeTimelineEvent(event.event_type)}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground">
+                    {event.created_at
+                      ? new Date(event.created_at).toLocaleString('zh-CN')
+                      : '时间未知'}
+                  </p>
+                </div>
+              ))}
+              {timeline.length > 3 ? (
+                <p className="text-[10px] text-center text-muted-foreground">查看完整时间线请访问详情</p>
+              ) : null}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  // Original 'full' layout (can be used for drawer or dedicated sidebar if needed)
   return (
     <div className="space-y-4">
       <Card size="sm">
