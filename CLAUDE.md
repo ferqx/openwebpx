@@ -11,7 +11,7 @@ This file provides local development context. For global collaboration rules, re
 
 ## 2. Global Commands (Root)
 - `make dev-install`: Setup both backend and frontend environments.
-- `make run`: Run the backend server.
+- `make run`: Run the backend server (`app.main:app`).
 - `pnpm --prefix web dev`: Run the frontend dev server.
 - `make ci-check`: Run all static checks and tests (Backend + Frontend).
 

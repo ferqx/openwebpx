@@ -13,7 +13,7 @@ services:
       timeout: 5s
       retries: 5
 
-  aegra:
+  api:
     build:
       context: .
       dockerfile: deployments/docker/Dockerfile
@@ -40,8 +40,8 @@ services:
       sh -c "
         echo 'Running database migrations...' &&
         /app/.venv/bin/alembic -c /app/alembic.ini upgrade head &&
-        echo 'Starting Aegra server...' &&
-        /app/.venv/bin/uvicorn aegra_api.main:app --host 0.0.0.0 --port $${PORT:-8000}
+        echo 'Starting OpenWebPX API server...' &&
+        /app/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8000}
       "
 
   redis:
