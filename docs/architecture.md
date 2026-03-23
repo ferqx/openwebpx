@@ -37,5 +37,5 @@ graph TD
 - 环境变量 `VITE_API_BASE_URL` 用于配置生产环境下的后端地址。
 
 ### 容器化部署
-- 使用 `docker-compose.yml` 同时启动 `postgres`, `aegra` (后端) 和 `web` (前端) 服务。
+- 使用 `docker-compose.yml` 同时启动 `postgres`, `api` (后端) 和 `web` (前端) 服务。
 - 前端 Nginx 配置已预设 `/api/` 路由转发至后端容器。
