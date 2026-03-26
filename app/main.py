@@ -75,35 +75,41 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await db_manager.close()
 
 
-app = FastAPI(lifespan=lifespan)
+def create_app(*, include_lifespan: bool = True) -> FastAPI:
+    app = FastAPI(lifespan=lifespan if include_lifespan else None)
 
-# Core Aegra API routes expected by the frontend SDK.
-app.include_router(health_router, prefix="/api")
-app.include_router(assistants_router, prefix="/api")
-app.include_router(threads_router, prefix="/api")
-app.include_router(runs_router, prefix="/api")
-app.include_router(stateless_runs_router, prefix="/api")
-app.include_router(store_router, prefix="/api")
+    # Core Aegra API routes expected by the frontend SDK.
+    app.include_router(health_router, prefix="/api")
+    app.include_router(assistants_router, prefix="/api")
+    app.include_router(threads_router, prefix="/api")
+    app.include_router(runs_router, prefix="/api")
+    app.include_router(stateless_runs_router, prefix="/api")
+    app.include_router(store_router, prefix="/api")
+
+    # Public routes
+    app.include_router(common_router)
+    app.include_router(auth_router)
+    app.include_router(auth_router, prefix="/api")
+    app.include_router(code_review_webhooks_router)
+    app.include_router(
+        scm_router, prefix="/api", dependencies=[Depends(authenticated_user)]
+    )
+    app.include_router(
+        sandbox_router, prefix="/api", dependencies=[Depends(authenticated_user)]
+    )
+
+    # Protected custom routes
+    app.include_router(sandbox_router, dependencies=[Depends(authenticated_user)])
+    app.include_router(scm_router, dependencies=[Depends(authenticated_user)])
+    app.include_router(
+        code_review_repositories_router, dependencies=[Depends(authenticated_user)]
+    )
+    app.include_router(
+        code_review_runs_router, dependencies=[Depends(authenticated_user)]
+    )
+    app.include_router(code_review_fixes_router)
+    app.include_router(telemetry_router, dependencies=[Depends(authenticated_user)])
+    return app
 
 
-# Public routes
-app.include_router(common_router)
-app.include_router(auth_router)
-app.include_router(auth_router, prefix="/api")
-app.include_router(code_review_webhooks_router)
-app.include_router(
-    scm_router, prefix="/api", dependencies=[Depends(authenticated_user)]
-)
-app.include_router(
-    sandbox_router, prefix="/api", dependencies=[Depends(authenticated_user)]
-)
-
-# Protected custom routes
-app.include_router(sandbox_router, dependencies=[Depends(authenticated_user)])
-app.include_router(scm_router, dependencies=[Depends(authenticated_user)])
-app.include_router(
-    code_review_repositories_router, dependencies=[Depends(authenticated_user)]
-)
-app.include_router(code_review_runs_router, dependencies=[Depends(authenticated_user)])
-app.include_router(code_review_fixes_router)
-app.include_router(telemetry_router, dependencies=[Depends(authenticated_user)])
+app = create_app()

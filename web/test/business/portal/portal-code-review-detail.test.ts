@@ -155,6 +155,46 @@ test('PortalCodeReviewDetail surfaces pending fix count in tab label', () => {
   assert.match(markup, />1</);
 });
 
+test('PortalCodeReviewDetail renders approved fixes as queued copy', () => {
+  const approvedRun: CodeReviewRunDetail = {
+    ...run,
+    fix_requests: [
+      {
+        id: 16,
+        review_run_id: 8,
+        review_finding_id: 1,
+        source: 'auto_policy',
+        status: 'approved',
+        approval_required: true
+      }
+    ],
+    timeline_events: [
+      {
+        id: 5,
+        event_type: 'fix_request_approved',
+        payload: { fix_request_id: 16, review_finding_id: 1 },
+        created_at: '2026-03-22T10:02:00.000Z'
+      }
+    ]
+  };
+
+  const markup = renderToStaticMarkup(
+    React.createElement(PortalCodeReviewDetail, {
+      selectedRunId: approvedRun.id,
+      run: approvedRun,
+      isLoading: false,
+      errorMessage: null,
+      onRetry: () => undefined,
+      onContinueFix: () => undefined,
+      onApproveFixRequest: () => undefined,
+      onRejectFixRequest: () => undefined,
+      canContinueFix: true
+    })
+  );
+
+  assert.match(markup, /已入队/);
+});
+
 test('PortalCodeReviewDetail renders nothing when no run is selected', () => {
   const markup = renderToStaticMarkup(
     React.createElement(PortalCodeReviewDetail, {

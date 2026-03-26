@@ -188,8 +188,11 @@ class CodeReviewRepositoryService:
         self,
         *,
         session: AsyncSession,
-        _current_user: Any,
+        current_user: Any,
     ) -> list[dict[str, Any]]:
+        # Keep the same keyword contract as the router and callers even though
+        # the current list endpoint does not filter by user visibility.
+        _ = current_user
         integrations = await self._load_integrations(session)
         integrations.sort(key=lambda item: item.id or 0)
         config_by_repository_id = {

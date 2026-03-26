@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React from 'react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -16,7 +16,9 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select';
-import { Textarea } from '@/components/ui/textarea';
+import {
+  Textarea
+} from '@/components/ui/textarea';
 import { type CodeReviewRunDetail } from '@/business/portal/code-review-types';
 import { statusLabel, type TaskItem } from '@/lib/tasks';
 
@@ -49,22 +51,6 @@ const formatFindingLocation = (filePath: string | null, lineStart: number | null
   return `${filePath}:${lineStart}`;
 };
 
-export const deriveContinueFixTaskOptions = (
-  tasks: TaskItem[],
-  run: CodeReviewRunDetail | null
-) => {
-  if (run === null) return [];
-  const repositoryName = run.repository?.full_name?.trim();
-  if (!repositoryName) return [];
-  return tasks
-    .filter((task) => task.repo.trim() === repositoryName)
-    .sort((left, right) => {
-      const leftTime = left.createdAt ? Date.parse(left.createdAt) : 0;
-      const rightTime = right.createdAt ? Date.parse(right.createdAt) : 0;
-      return rightTime - leftTime;
-    });
-};
-
 export const findContinueFixTemplate = (instruction: string) =>
   CONTINUE_FIX_PROMPT_TEMPLATES.find(
     (template) => template.instruction === instruction.trim()
@@ -74,7 +60,7 @@ export const resolveContinueFixInstruction = (templateId: string) =>
   CONTINUE_FIX_PROMPT_TEMPLATES.find((template) => template.id === templateId)
     ?.instruction ?? '';
 
-export const describeContinueFixTask = (task: TaskItem) =>
+const describeContinueFixTask = (task: TaskItem) =>
   `${task.repo} · ${task.branch} · ${statusLabel[task.status]}`;
 
 export const buildContinueFixPrompt = ({
@@ -113,9 +99,8 @@ type PortalCodeReviewContinueFixDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   run: CodeReviewRunDetail | null;
-  tasks: TaskItem[];
-  selectedTaskId: string;
-  onSelectedTaskIdChange: (taskId: string) => void;
+  threadId: string | null;
+  threadTask: TaskItem | null;
   instruction: string;
   onInstructionChange: (value: string) => void;
   onInstructionTemplateChange?: (value: string) => void;
@@ -127,23 +112,14 @@ export function PortalCodeReviewContinueFixDialog({
   open,
   onOpenChange,
   run,
-  tasks,
-  selectedTaskId,
-  onSelectedTaskIdChange,
+  threadId,
+  threadTask,
   instruction,
   onInstructionChange,
   onInstructionTemplateChange,
   isSubmitting,
   onSubmit
 }: PortalCodeReviewContinueFixDialogProps) {
-  const taskOptions = useMemo(
-    () => deriveContinueFixTaskOptions(tasks, run),
-    [run, tasks]
-  );
-  const selectedTask =
-    taskOptions.find((task) => task.id === selectedTaskId) ?? taskOptions[0] ?? null;
-  const isSelectedTaskBusy =
-    selectedTask?.status === 'running' || selectedTask?.status === 'starting';
   const findingsPreview = run?.findings.slice(0, 3) ?? [];
   const selectedTemplateId = findContinueFixTemplate(instruction);
   const promptPreview = run
@@ -159,42 +135,33 @@ export function PortalCodeReviewContinueFixDialog({
         <DialogHeader>
           <DialogTitle>继续修复</DialogTitle>
           <DialogDescription>
-            将当前代码审查结果整理成新提问，追加到已有线程中继续执行修复。
+            将当前代码审查结果整理成新提问，追加到该审查绑定的唯一线程中继续执行修复。
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label>目标线程</Label>
-            {taskOptions.length === 0 ? (
+            <Label>绑定线程</Label>
+            {threadId ? (
               <p className="text-sm text-muted-foreground">
-                当前仓库还没有可继续的线程，请先在任务页创建至少一个同仓库线程。
+                这次修复只能继续到审查绑定的线程 <span className="font-medium text-foreground">{threadId}</span>。
               </p>
             ) : (
-              <Select value={selectedTask?.id ?? ''} onValueChange={onSelectedTaskIdChange}>
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="选择目标线程" />
-                </SelectTrigger>
-                <SelectContent>
-                  {taskOptions.map((task) => (
-                    <SelectItem key={task.id} value={task.id}>
-                      {task.title} · {task.branch}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-            {selectedTask ? (
-              <div className="rounded-lg border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                <p className="font-medium text-foreground">{selectedTask.title}</p>
-                <p>{describeContinueFixTask(selectedTask)}</p>
-                <p>最近更新 {selectedTask.updatedAt}</p>
-              </div>
-            ) : null}
-            {isSelectedTaskBusy ? (
-              <p className="text-xs text-muted-foreground">
-                目标线程当前仍在执行中，请等待其空闲后再继续修复。
+              <p className="text-sm text-muted-foreground">
+                当前审查没有绑定线程，无法继续修复。
               </p>
+            )}
+            {threadTask ? (
+              <div className="rounded-lg border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                <p className="font-medium text-foreground">{threadTask.title}</p>
+                <p>{describeContinueFixTask(threadTask)}</p>
+                <p>最近更新 {threadTask.updatedAt}</p>
+              </div>
+            ) : threadId ? (
+              <div className="rounded-lg border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                <p className="font-medium text-foreground">线程 {threadId}</p>
+                <p>该线程尚未加载到本地任务列表，提交后仍会直接跳转到对应线程页。</p>
+              </div>
             ) : null}
           </div>
 
@@ -272,8 +239,7 @@ export function PortalCodeReviewContinueFixDialog({
               isSubmitting ||
               run === null ||
               run.findings.length === 0 ||
-              selectedTask === null ||
-              isSelectedTaskBusy
+              !threadId
             }
             onClick={() => void onSubmit()}
           >

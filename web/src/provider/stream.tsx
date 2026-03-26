@@ -11,7 +11,7 @@ import { type Message } from '@langchain/langgraph-sdk';
 import { useThreads } from './thread';
 import { client } from '@/lib/langgraph-sdk';
 import { resolveAgentConfigByPath } from '@/lib/agent-config';
-import { useLocation, useParams } from 'react-router-dom';
+import { matchPath, useLocation } from 'react-router-dom';
 
 export type StateType = {
   messages: Message[];
@@ -54,10 +54,10 @@ const resolveStreamThrottle = () => {
 };
 
 const StreamSession = ({ children }: { children: ReactNode }) => {
-  const params = useParams();
   const location = useLocation();
   const { getThreads } = useThreads();
-  const threadId = params.id ?? null;
+  const taskRouteMatch = matchPath('/tasks/:id', location.pathname);
+  const threadId = taskRouteMatch?.params.id ?? null;
 
   useEffect(() => {
     void getThreads();

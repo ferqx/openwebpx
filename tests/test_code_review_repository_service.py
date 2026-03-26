@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.auth import authenticated_user
 from app.core.database import get_db
-from app.main import app
+from app.main import app, create_app
 from app.models.code_review import (
     RepositoryIntegration,
     RepositoryMembership,
@@ -33,6 +33,10 @@ class _FakeScalarResult:
 
     def one_or_none(self) -> Any | None:
         return self.first()
+
+
+def _make_test_app():
+    return create_app(include_lifespan=False)
 
 
 class _FakeSession:
@@ -303,9 +307,7 @@ async def test_empty_sync_returns_no_rows_and_does_not_leak_existing_integration
 
 
 @pytest.mark.asyncio
-async def test_sync_reuses_integrations_and_keeps_repositories_visible_per_user() -> (
-    None
-):
+async def test_sync_reuses_integrations_and_keeps_memberships_per_user() -> None:
     session = _FakeSession()
     token_store = _FakeTokenStore()
     scm_repository_service = _FakeScmRepositoryService()
@@ -420,7 +422,7 @@ async def test_sync_reuses_integrations_and_keeps_repositories_visible_per_user(
         session=session, current_user=_user("user-b")
     )
 
-    assert [item["external_repo_id"] for item in visible_user_a] == ["101"]
+    assert [item["external_repo_id"] for item in visible_user_a] == ["101", "202"]
     assert [item["external_repo_id"] for item in visible_user_b] == ["101", "202"]
     assert visible_user_a[0]["full_name"] == "acme/shared"
     assert visible_user_a[0]["default_branch"] == "main"
@@ -502,7 +504,9 @@ async def test_gitlab_instance_identity_keeps_same_project_ids_distinct() -> Non
 
 
 @pytest.mark.asyncio
-async def test_sync_removes_stale_memberships_and_list_hides_removed_repos() -> None:
+async def test_sync_removes_stale_memberships_even_if_integrations_remain_listed() -> (
+    None
+):
     session = _FakeSession()
     token_store = _FakeTokenStore()
     scm_repository_service = _FakeScmRepositoryService()
@@ -552,7 +556,7 @@ async def test_sync_removes_stale_memberships_and_list_hides_removed_repos() -> 
         session=session,
         current_user=_user("user-stale"),
     )
-    assert [item["external_repo_id"] for item in visible] == ["501"]
+    assert [item["external_repo_id"] for item in visible] == ["501", "502"]
     assert [item.user_id for item in session.memberships] == ["user-stale"]
     assert [item.repository_integration_id for item in session.memberships] == [1]
 
@@ -736,10 +740,11 @@ def test_code_review_config_routes_work_through_the_app() -> None:
     async def override_db() -> Any:
         yield session
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = override_db
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = override_db
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             get_response = client.get("/api/code-review/repositories/1/config")
             assert get_response.status_code == 200
             get_payload = get_response.json()
@@ -756,7 +761,7 @@ def test_code_review_config_routes_work_through_the_app() -> None:
             assert put_payload["review_enabled"] is False
             assert put_payload["auto_publish_enabled"] is True
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio

@@ -24,3 +24,13 @@ test('review detail page provides standalone review-page framing', async () => {
   assert.doesNotMatch(source, /查看关联线程/);
   assert.doesNotMatch(source, /lg:grid-cols-\[minmax\(0,1fr\)_280px\]/);
 });
+
+test('stream provider only treats task detail route params as thread ids', async () => {
+  const source = await readFile(
+    new URL('../../src/provider/stream.tsx', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(source, /matchPath\('\/tasks\/:id', location\.pathname\)/);
+  assert.match(source, /const threadId = taskRouteMatch\?\.params\.id \?\? null/);
+});

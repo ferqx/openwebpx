@@ -4,7 +4,6 @@ import { toast } from 'sonner';
 import {
   buildContinueFixPrompt,
   DEFAULT_CONTINUE_FIX_INSTRUCTION,
-  deriveContinueFixTaskOptions,
   PortalCodeReviewContinueFixDialog,
   resolveContinueFixInstruction
 } from '@/business/portal/portal-code-review-continue-fix-dialog';
@@ -27,45 +26,32 @@ export const usePortalCodeReviewContinuation = ({
 }: UsePortalCodeReviewContinuationOptions) => {
   const [continueFixOpen, setContinueFixOpen] = useState(false);
   const [isContinueFixSubmitting, setIsContinueFixSubmitting] = useState(false);
-  const [continueFixRunId, setContinueFixRunId] = useState<number | null>(null);
-  const [continueFixTaskId, setContinueFixTaskId] = useState('');
+  const [continueFixRun, setContinueFixRun] = useState<CodeReviewRunDetail | null>(null);
   const [continueFixInstruction, setContinueFixInstruction] = useState(
     DEFAULT_CONTINUE_FIX_INSTRUCTION
   );
 
-  const continueFixRun = useMemo(
-    () =>
-      continueFixRunId === null || selectedRun?.id !== continueFixRunId
-        ? null
-        : selectedRun,
-    [continueFixRunId, selectedRun]
+  const continueFixThreadId = continueFixRun?.thread_id?.trim() ?? '';
+  const continueFixTask = useMemo(
+    () => (continueFixThreadId ? tasks.find((task) => task.id === continueFixThreadId) ?? null : null),
+    [continueFixThreadId, tasks]
   );
-  const continueFixTaskOptions = useMemo(
-    () => deriveContinueFixTaskOptions(tasks, selectedRun),
-    [selectedRun, tasks]
-  );
-  const canContinueCodeReviewFix = continueFixTaskOptions.length > 0;
-  const continueCodeReviewFixHint = canContinueCodeReviewFix
-    ? '会把 findings 整理成新提问并追加到同仓库线程。'
-    : '当前仓库还没有可继续的线程。';
+  const canContinueCodeReviewFixState = Boolean(selectedRun?.thread_id?.trim());
+  const continueCodeReviewFixHint = canContinueCodeReviewFixState
+    ? '会把 findings 整理成新提问并追加到审查绑定的唯一线程。'
+    : '当前审查没有绑定线程，无法继续修复。';
 
   const handleOpenContinueFix = (run: CodeReviewRunDetail) => {
-    const nextOptions = deriveContinueFixTaskOptions(tasks, run);
-    setContinueFixRunId(run.id);
-    setContinueFixTaskId(nextOptions[0]?.id ?? '');
+    setContinueFixRun(run);
     setContinueFixInstruction(DEFAULT_CONTINUE_FIX_INSTRUCTION);
     setContinueFixOpen(true);
   };
 
   const handleSubmitContinueFix = async () => {
-    if (continueFixRun === null || !continueFixTaskId.trim() || isContinueFixSubmitting) {
+    if (continueFixRun === null || !continueFixThreadId || isContinueFixSubmitting) {
       return;
     }
-    const targetTask = tasks.find((task) => task.id === continueFixTaskId) ?? null;
-    if (targetTask === null) {
-      toast.error('未找到目标线程，请重新选择');
-      return;
-    }
+    const targetTask = continueFixTask;
 
     try {
       setIsContinueFixSubmitting(true);
@@ -73,12 +59,12 @@ export const usePortalCodeReviewContinuation = ({
         run: continueFixRun,
         instruction: continueFixInstruction
       });
-      navigate(`/tasks/${targetTask.id}`, {
+      navigate(`/tasks/${continueFixThreadId}`, {
         state: {
-          task: targetTask,
           initialPrompt: prompt,
           shouldAutoRun: true,
-          portalTab: tab
+          portalTab: tab,
+          ...(targetTask ? { task: targetTask } : {})
         }
       });
       setContinueFixOpen(false);
@@ -94,11 +80,15 @@ export const usePortalCodeReviewContinuation = ({
     typeof PortalCodeReviewContinueFixDialog
   > = {
     open: continueFixOpen,
-    onOpenChange: setContinueFixOpen,
+    onOpenChange: (open) => {
+      setContinueFixOpen(open);
+      if (!open) {
+        setContinueFixRun(null);
+      }
+    },
     run: continueFixRun,
-    tasks,
-    selectedTaskId: continueFixTaskId,
-    onSelectedTaskIdChange: setContinueFixTaskId,
+    threadId: continueFixRun?.thread_id?.trim() ?? null,
+    threadTask: continueFixTask,
     instruction: continueFixInstruction,
     onInstructionChange: setContinueFixInstruction,
     onInstructionTemplateChange: (templateId) => {
@@ -111,7 +101,7 @@ export const usePortalCodeReviewContinuation = ({
   };
 
   return {
-    canContinueCodeReviewFix,
+    canContinueCodeReviewFix: canContinueCodeReviewFixState,
     continueCodeReviewFixHint,
     handleOpenContinueFix,
     codeReviewContinueFixDialogProps

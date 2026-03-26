@@ -5,12 +5,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.core import database as database_module
 from app.core.auth import authenticated_user
 from app.core.database import get_db
-from app.main import app
+from app.main import app, create_app
 from app.models.code_review import (
     RepositoryIntegration,
     RepositoryMembership,
@@ -24,6 +25,7 @@ from app.models.code_review import (
     ReviewTimelineEvent,
 )
 from app.services.code_review.dispatcher import code_review_run_dispatcher
+from app.services.code_review.publish_service import code_review_publish_service
 from app.services.code_review.timeline_service import code_review_timeline_service
 
 
@@ -33,6 +35,40 @@ class _FakeScalarResult:
 
     def all(self) -> list[Any]:
         return list(self._items)
+
+    def one_or_none(self) -> Any | None:
+        return self._items[0] if self._items else None
+
+
+class _FakeExecuteResult:
+    def __init__(
+        self,
+        *,
+        rows: list[Any] | None = None,
+        scalar_items: list[Any] | None = None,
+    ) -> None:
+        self._rows = rows or []
+        self._scalar_items = scalar_items or []
+
+    def all(self) -> list[Any]:
+        return list(self._rows)
+
+    def scalars(self) -> _FakeScalarResult:
+        return _FakeScalarResult(self._scalar_items)
+
+    def scalar_one_or_none(self) -> Any | None:
+        if self._scalar_items:
+            return self._scalar_items[0]
+        if not self._rows:
+            return None
+        first_row = self._rows[0]
+        if isinstance(first_row, tuple) and len(first_row) == 1:
+            return first_row[0]
+        return first_row
+
+
+def _make_test_app():
+    return create_app(include_lifespan=False)
 
 
 class _FakeRunSession:
@@ -72,6 +108,100 @@ class _FakeRunSession:
         if entity is ReviewTimelineEvent:
             return _FakeScalarResult(self.timeline_events)
         return _FakeScalarResult([])
+
+    async def execute(self, stmt: Any) -> _FakeExecuteResult:
+        sql = str(stmt)
+        params = stmt.compile().params
+        entity = stmt.column_descriptions[0]["entity"]
+
+        if entity is ReviewRun:
+            runs = list(self.runs)
+            if "review_runs.id =" in sql:
+                run_id = next(
+                    value for key, value in params.items() if key.startswith("id_")
+                )
+                runs = [run for run in runs if run.id == run_id]
+            elif "review_runs.repository_integration_id IN" in sql:
+                visible_ids = {
+                    repository_id
+                    for key, value in params.items()
+                    if key.startswith("repository_integration_id")
+                    for repository_id in (
+                        value if isinstance(value, (list, tuple, set)) else [value]
+                    )
+                }
+                runs = [
+                    run for run in runs if run.repository_integration_id in visible_ids
+                ]
+                runs.sort(
+                    key=lambda run: (
+                        run.created_at or datetime.min.replace(tzinfo=UTC),
+                        run.id or 0,
+                    ),
+                    reverse=True,
+                )
+            return _FakeExecuteResult(scalar_items=runs)
+
+        if entity is RepositoryReviewConfig:
+            repository_integration_id = next(
+                (
+                    value
+                    for key, value in params.items()
+                    if key.startswith("repository_integration_id")
+                ),
+                None,
+            )
+            configs = list(self.configs)
+            if repository_integration_id is not None:
+                configs = [
+                    config
+                    for config in configs
+                    if config.repository_integration_id == repository_integration_id
+                ]
+            return _FakeExecuteResult(scalar_items=configs)
+
+        if entity is ReviewFinding and "count(review_findings.id)" in sql:
+            run_ids = {
+                run_id
+                for key, value in params.items()
+                if key.startswith("review_run_id")
+                for run_id in (
+                    value if isinstance(value, (list, tuple, set)) else [value]
+                )
+            }
+            rows = []
+            for run_id in sorted(run_ids):
+                count = sum(
+                    1 for finding in self.findings if finding.review_run_id == run_id
+                )
+                if count:
+                    rows.append((run_id, count))
+            return _FakeExecuteResult(rows=rows)
+
+        if entity is ReviewFixRequest and "review_fix_requests.review_run_id" in sql:
+            run_ids = {
+                run_id
+                for key, value in params.items()
+                if key.startswith("review_run_id")
+                for run_id in (
+                    value if isinstance(value, (list, tuple, set)) else [value]
+                )
+            }
+            status = next(
+                (value for key, value in params.items() if key.startswith("status_")),
+                None,
+            )
+            rows = sorted(
+                {
+                    (fix_request.review_run_id,)
+                    for fix_request in self.fix_requests
+                    if fix_request.review_run_id in run_ids
+                    and (status is None or fix_request.status == status)
+                }
+            )
+            return _FakeExecuteResult(rows=rows)
+
+        return _FakeExecuteResult()
 
     def add(self, obj: Any) -> None:
         self._prepare_object(obj)
@@ -334,6 +464,69 @@ def _override_db(session: _FakeRunSession):
     return override_db
 
 
+def _patch_publish_service_for_route_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_publish_run(
+        *,
+        session: _FakeRunSession,
+        current_user: Any,
+        run_id: int,
+    ) -> dict[str, Any]:
+        visible_repository_ids = {
+            membership.repository_integration_id
+            for membership in session.memberships
+            if membership.user_id == current_user.identity
+        }
+        run = next(
+            (
+                candidate
+                for candidate in session.runs
+                if candidate.id == run_id
+                and candidate.repository_integration_id in visible_repository_ids
+            ),
+            None,
+        )
+        if run is None:
+            raise HTTPException(404, "Review run not found")
+        if run.status != ReviewRunStatus.COMPLETED:
+            raise HTTPException(409, "Review run must be completed before publish")
+
+        already_published = any(
+            event.review_run_id == run.id and event.event_type == "publish_completed"
+            for event in session.timeline_events
+        )
+        if not already_published:
+            session.timeline_events.extend(
+                [
+                    ReviewTimelineEvent(
+                        review_run=run,
+                        review_run_id=run.id,
+                        event_type="publish_requested",
+                        dedupe_key=f"{run.id}:publish_requested",
+                        payload={"run_id": run.id},
+                        created_at=run.created_at,
+                    ),
+                    ReviewTimelineEvent(
+                        review_run=run,
+                        review_run_id=run.id,
+                        event_type="publish_completed",
+                        dedupe_key=f"{run.id}:publish_completed",
+                        payload={"run_id": run.id},
+                        created_at=run.created_at,
+                    ),
+                ]
+            )
+
+        return {
+            "published": True,
+            "run_id": run.id,
+            "status": run.status.value,
+        }
+
+    monkeypatch.setattr(code_review_publish_service, "publish_run", fake_publish_run)
+
+
 @pytest.mark.asyncio
 async def test_timeline_service_records_initial_review_lifecycle_events_once() -> None:
     session = _FakeRunSession()
@@ -398,7 +591,28 @@ async def test_analyzer_persists_findings_and_auto_fix_requests_and_completes_ru
         dedupe_key=run.idempotency_key,
     )
 
-    analyzed = await code_review_run_dispatcher.analyze_run(session=session, run_id=1)
+    analyzed = await code_review_run_dispatcher.analyze_run(
+        session=session,
+        run_id=1,
+        analysis_result={
+            "status": "success",
+            "thread_id": "thread-1",
+            "analysis_mode": "ai_agent",
+            "findings": [
+                {
+                    "severity": "medium",
+                    "category": "correctness",
+                    "file_path": "src/example.py",
+                    "line_start": 12,
+                    "line_end": 12,
+                    "title": "Use safer pattern",
+                    "body": "Potential issue",
+                    "rule_id": "R001",
+                    "metadata": {"source": "test", "auto_fixable": True},
+                }
+            ],
+        },
+    )
 
     assert analyzed["status"] == ReviewRunStatus.COMPLETED.value
     assert run.status == ReviewRunStatus.COMPLETED
@@ -678,10 +892,11 @@ def test_run_routes_list_and_detail_scope_results_to_visible_memberships() -> No
     async def override_user() -> SimpleNamespace:
         return _user("run-user")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             list_response = client.get("/api/code-review/runs")
             assert list_response.status_code == 200
             list_payload = list_response.json()
@@ -704,7 +919,7 @@ def test_run_routes_list_and_detail_scope_results_to_visible_memberships() -> No
             hidden_response = client.get("/api/code-review/runs/22")
             assert hidden_response.status_code == 404
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_code_review_run_routes_are_registered_on_main_app() -> None:
@@ -739,10 +954,11 @@ def test_run_detail_includes_findings() -> None:
     async def override_user() -> SimpleNamespace:
         return _user("run-user")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             detail_response = client.get("/api/code-review/runs/11")
             assert detail_response.status_code == 200
             detail_payload = detail_response.json()
@@ -766,10 +982,12 @@ def test_run_detail_includes_findings() -> None:
                 }
             ]
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
-def test_publish_run_requires_visibility_and_completed_status() -> None:
+def test_publish_run_requires_visibility_and_completed_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session = _FakeRunSession()
     visible_integration = _seed_integration(session, integration_id=1)
     hidden_integration = _seed_integration(session, integration_id=2)
@@ -804,10 +1022,12 @@ def test_publish_run_requires_visibility_and_completed_status() -> None:
     async def override_user() -> SimpleNamespace:
         return _user("run-user")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    _patch_publish_service_for_route_test(monkeypatch)
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             publish_response = client.post("/api/code-review/runs/11/publish")
             assert publish_response.status_code == 200
             publish_payload = publish_response.json()
@@ -833,7 +1053,7 @@ def test_publish_run_requires_visibility_and_completed_status() -> None:
             analyzing_response = client.post("/api/code-review/runs/33/publish")
             assert analyzing_response.status_code == 409
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_code_review_publish_route_is_registered_on_main_app() -> None:

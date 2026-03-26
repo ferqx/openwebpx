@@ -21,7 +21,7 @@ const humanizeTimelineEvent = (eventType: string) => {
     analysis_completed: '分析完成',
     analysis_failed: '分析失败',
     fix_request_created: '已创建修复请求',
-    fix_request_approved: '修复已批准',
+    fix_request_approved: '修复已入队',
     fix_request_running: '修复执行中',
     fix_request_completed: '修复完成',
     fix_request_failed: '修复失败',
@@ -83,7 +83,7 @@ const getFixRequestStatusMeta = (status: CodeReviewFixRequest['status']) => {
     case 'pending_approval':
       return { label: '待审批', className: 'border-amber-300 bg-amber-50 text-amber-700' };
     case 'approved':
-      return { label: '已批准', className: 'border-sky-300 bg-sky-50 text-sky-700' };
+      return { label: '排队中', className: 'border-sky-300 bg-sky-50 text-sky-700' };
     case 'running':
       return { label: '执行中', className: 'border-sky-300 bg-sky-50 text-sky-700' };
     case 'completed':

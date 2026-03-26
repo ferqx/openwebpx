@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_db
-from app.main import app
+from app.main import app, create_app
 from app.models.code_review import (
     RepositoryIntegration,
     RepositoryReviewConfig,
@@ -54,6 +54,7 @@ class _FakeWebhookSession:
         self.configs: list[RepositoryReviewConfig] = []
         self.runs: list[ReviewRun] = []
         self.timeline_events: list[ReviewTimelineEvent] = []
+        self.threads: list[Any] = []
         self._pending: list[Any] = []
         self._fail_commit_once = fail_commit_once
         self._conflict_run_on_rollback = conflict_run_on_rollback
@@ -69,6 +70,7 @@ class _FakeWebhookSession:
             ReviewRun: 1,
             ReviewTimelineEvent: 1,
         }
+        self._next_thread_id = 1
 
     async def scalars(self, stmt: Any) -> _FakeScalarResult:  # noqa: ARG002
         entity = stmt.column_descriptions[0]["entity"]
@@ -88,6 +90,10 @@ class _FakeWebhookSession:
     def add_all(self, objs: list[Any]) -> None:
         self._pending.extend(objs)
 
+    async def flush(self) -> None:
+        self._materialize_pending()
+        self._pending.clear()
+
     async def commit(self) -> None:
         self._commit_calls += 1
         if self._fail_commit_once and self._commit_calls == 1:
@@ -98,6 +104,13 @@ class _FakeWebhookSession:
 
     def _materialize_pending(self) -> None:
         for obj in self._pending:
+            if obj.__class__.__name__ == "Thread":
+                if not getattr(obj, "thread_id", None):
+                    obj.thread_id = str(self._next_thread_id)
+                    self._next_thread_id += 1
+                if obj not in self.threads:
+                    self.threads.append(obj)
+                continue
             if getattr(obj, "id", None) is None:
                 obj.id = self._next_ids[type(obj)]
                 self._next_ids[type(obj)] += 1
@@ -320,8 +333,10 @@ def _override_db_factory(session: _FakeWebhookSession):
     return override_db
 
 
-def _override_main_app_db(session: _FakeWebhookSession) -> None:
-    app.dependency_overrides[get_db] = _override_db_factory(session)
+def _make_test_app(session: _FakeWebhookSession):
+    test_app = create_app(include_lifespan=False)
+    test_app.dependency_overrides[get_db] = _override_db_factory(session)
+    return test_app
 
 
 def _set_webhook_secrets(
@@ -471,15 +486,15 @@ def test_authenticated_malformed_webhook_payload_returns_400(
     body = body_factory()
     headers = headers_factory(body)
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
-            response = client.post(path, data=body, headers=headers)
+        with TestClient(test_app) as client:
+            response = client.post(path, content=body, headers=headers)
             assert response.status_code == 400
             assert session.runs == []
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_github_webhook_rejects_invalid_signature(
@@ -496,12 +511,12 @@ def test_github_webhook_rejects_invalid_signature(
     )
     _seed_config(session, config_id=1, repository_integration_id=1)
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/webhooks/github",
-                data=json.dumps(
+                content=json.dumps(
                     _github_payload(), separators=(",", ":"), ensure_ascii=False
                 ),
                 headers={
@@ -514,7 +529,7 @@ def test_github_webhook_rejects_invalid_signature(
             assert session.runs == []
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_gitlab_webhook_rejects_invalid_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -530,9 +545,9 @@ def test_gitlab_webhook_rejects_invalid_token(monkeypatch: pytest.MonkeyPatch) -
     )
     _seed_config(session, config_id=1, repository_integration_id=1)
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/webhooks/gitlab",
                 json=_gitlab_payload(),
@@ -546,7 +561,7 @@ def test_gitlab_webhook_rejects_invalid_token(monkeypatch: pytest.MonkeyPatch) -
             assert session.runs == []
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 @pytest.mark.parametrize(
@@ -594,16 +609,16 @@ def test_supported_auth_but_unsupported_webhook_events_are_ignored(
             "X-Hub-Signature-256": _github_signature("github-secret", body),
         }
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(path, content=body, headers=headers)
             assert response.status_code == 202
             assert response.json() == {"ok": True, "queued": False}
             assert session.runs == []
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_github_webhook_creates_an_idempotent_review_run(
@@ -625,12 +640,12 @@ def test_github_webhook_creates_an_idempotent_review_run(
     ).encode("utf-8")
     secret = "github-secret"
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             first_response = client.post(
                 "/api/code-review/webhooks/github",
-                data=body,
+                content=body,
                 headers={
                     "Content-Type": "application/json",
                     "X-GitHub-Event": "pull_request",
@@ -657,7 +672,7 @@ def test_github_webhook_creates_an_idempotent_review_run(
 
             second_response = client.post(
                 "/api/code-review/webhooks/github",
-                data=body,
+                content=body,
                 headers={
                     "Content-Type": "application/json",
                     "X-GitHub-Event": "pull_request",
@@ -677,7 +692,7 @@ def test_github_webhook_creates_an_idempotent_review_run(
             ]
             assert len(session.timeline_events) == 3
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_gitlab_webhook_creates_run_for_mixed_case_instance(
@@ -701,12 +716,12 @@ def test_gitlab_webhook_creates_run_for_mixed_case_instance(
     )
     token = "gitlab-secret"
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/webhooks/gitlab",
-                data=body,
+                content=body,
                 headers={
                     "Content-Type": "application/json",
                     "X-Gitlab-Token": token,
@@ -729,7 +744,7 @@ def test_gitlab_webhook_creates_run_for_mixed_case_instance(
                 "analysis_started",
             ]
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_gitlab_webhook_matches_subpath_instance_identity(
@@ -753,12 +768,12 @@ def test_gitlab_webhook_matches_subpath_instance_identity(
         ensure_ascii=False,
     ).encode("utf-8")
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/webhooks/gitlab",
-                data=body,
+                content=body,
                 headers={
                     "Content-Type": "application/json",
                     "X-Gitlab-Token": "gitlab-secret",
@@ -777,7 +792,7 @@ def test_gitlab_webhook_matches_subpath_instance_identity(
                 "analysis_started",
             ]
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_disabled_repository_config_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -802,12 +817,12 @@ def test_disabled_repository_config_is_ignored(monkeypatch: pytest.MonkeyPatch) 
     ).encode("utf-8")
     secret = "github-secret"
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/webhooks/github",
-                data=body,
+                content=body,
                 headers={
                     "Content-Type": "application/json",
                     "X-GitHub-Event": "pull_request",
@@ -821,7 +836,7 @@ def test_disabled_repository_config_is_ignored(monkeypatch: pytest.MonkeyPatch) 
             assert session.runs == []
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_missing_repository_config_safely_declines_webhook(
@@ -841,12 +856,12 @@ def test_missing_repository_config_safely_declines_webhook(
         _github_payload(), separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/webhooks/github",
-                data=body,
+                content=body,
                 headers={
                     "Content-Type": "application/json",
                     "X-GitHub-Event": "pull_request",
@@ -860,7 +875,7 @@ def test_missing_repository_config_safely_declines_webhook(
             assert session.runs == []
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_repository_config_for_another_integration_does_not_authorize_match(
@@ -888,12 +903,12 @@ def test_repository_config_for_another_integration_does_not_authorize_match(
         _github_payload(), separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/webhooks/github",
-                data=body,
+                content=body,
                 headers={
                     "Content-Type": "application/json",
                     "X-GitHub-Event": "pull_request",
@@ -907,7 +922,7 @@ def test_repository_config_for_another_integration_does_not_authorize_match(
             assert session.runs == []
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_webhook_routes_are_registered_on_main_app() -> None:
@@ -970,12 +985,12 @@ def test_webhook_service_handles_commit_conflicts_without_500(
         _github_payload(), separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
 
-    _override_main_app_db(session)
+    test_app = _make_test_app(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/webhooks/github",
-                data=body,
+                content=body,
                 headers={
                     "Content-Type": "application/json",
                     "X-GitHub-Event": "pull_request",
@@ -991,4 +1006,4 @@ def test_webhook_service_handles_commit_conflicts_without_500(
                 "queued",
             ]
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()

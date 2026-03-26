@@ -1,7 +1,7 @@
 # Code Review Platform Backend
 
 ## Scope
-Phase 1 implements a backend-first code review platform in `app/services/code_review/`, `app/routers/`, and the shared `app/models/code_review.py` tables. The platform is intentionally stubbed where external execution would otherwise be required.
+Phase 1 implements a backend-first code review platform in `app/services/code_review/`, `app/routers/`, and the shared `app/models/code_review.py` tables. Review analysis and follow-up fixes now reuse the same bound task thread, with lightweight per-thread FIFO queueing for approved fixes.
 
 ## Request Flow
 - Public webhook routes:
@@ -26,7 +26,9 @@ Phase 1 implements a backend-first code review platform in `app/services/code_re
 - Webhooks normalize payloads, resolve repository integrations, create queued runs, and record initial timeline events.
 - The dispatcher moves runs through `queued -> analyzing -> completed/failed`.
 - The analyzer is deterministic and in-process. It persists findings, can create `ReviewFixRequest` rows from repository policy, and records analysis timeline events.
-- Fix approval is membership-gated. Approve transitions requests to `approved` then `running`, assigns a stable stub `runner_job_id`, and records timeline events.
+- Fix approval is membership-gated. Approve requires `ReviewRun.thread_id`, keeps queued work on that same thread, and only dispatches the next fix when the thread is idle.
+- Approved fixes are appended onto the existing task thread through Aegra `create_run` instead of creating a separate fix thread.
+- The in-process queue worker serializes approved fixes FIFO per `thread_id`. `approved` means queued, `running` means the corresponding Aegra run has been dispatched.
 - Runner callbacks are authenticated with `OPENWEBPX_CODE_REVIEW_FIX_RUNNER_SECRET` or `CODE_REVIEW_FIX_RUNNER_SECRET`, and update requests to `completed` or `failed`.
 - Publish is a stub contract only. `POST /api/code-review/runs/{id}/publish` requires a visible `completed` run, records publish timeline attempts, and returns a deterministic success payload without provider-side comments.
 
@@ -46,7 +48,7 @@ Phase 1 implements a backend-first code review platform in `app/services/code_re
 
 ## Intentionally Stubbed
 - Real analyzer execution
-- Real fix runner execution
+- Durable queue recovery across process restarts
 - Provider-side publishing/comments
 - Webhook delivery retries and queue infrastructure beyond the in-process dispatcher boundary
 

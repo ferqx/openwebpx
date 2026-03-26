@@ -20,7 +20,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
 const FIX_REQUEST_TIMELINE_STATUS: Record<string, string> = {
   fix_request_created: '待审批',
-  fix_request_approved: '已批准',
+  fix_request_approved: '已入队',
   fix_request_running: '修复执行中',
   fix_request_completed: '已完成',
   fix_request_failed: '已失败',
@@ -29,7 +29,7 @@ const FIX_REQUEST_TIMELINE_STATUS: Record<string, string> = {
 
 const FIX_REQUEST_STATUS_LABELS: Record<CodeReviewFixRequestStatus, string> = {
   pending_approval: '待审批',
-  approved: '已批准',
+  approved: '已入队',
   rejected: '已拒绝',
   running: '修复执行中',
   completed: '已完成',

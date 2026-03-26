@@ -5,11 +5,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.core.auth import authenticated_user
 from app.core.database import get_db
-from app.main import app
+from app.main import app, create_app
 from app.models.code_review import (
     RepositoryIntegration,
     RepositoryMembership,
@@ -20,6 +21,10 @@ from app.models.code_review import (
     ReviewRun,
     ReviewRunStatus,
     ReviewTimelineEvent,
+)
+from app.services.code_review.fix_service import (
+    CodeReviewFixService,
+    code_review_fix_service,
 )
 
 
@@ -131,6 +136,10 @@ def _override_db(session: _FakeFixSession):
         yield session
 
     return override_db
+
+
+def _make_test_app():
+    return create_app(include_lifespan=False)
 
 
 def _set_fix_runner_secret(
@@ -267,6 +276,672 @@ def _seed_fix_request(
     return fix_request
 
 
+class _RecordingTimelineService:
+    def __init__(self) -> None:
+        self.event_types: list[str] = []
+
+    async def append_event(
+        self,
+        *,
+        session: _FakeFixSession,
+        review_run: ReviewRun,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+        created_at: datetime | None = None,
+    ) -> ReviewTimelineEvent:
+        event = ReviewTimelineEvent(
+            id=len(session.timeline_events) + 1,
+            review_run=review_run,
+            review_run_id=review_run.id,
+            event_type=event_type,
+            dedupe_key=dedupe_key,
+            payload=payload,
+            created_at=created_at or datetime.now(UTC),
+        )
+        session.timeline_events.append(event)
+        self.event_types.append(event_type)
+        return event
+
+
+class _RecordingFixRunner:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def start_fix(
+        self,
+        *,
+        session: _FakeFixSession,
+        fix_request: ReviewFixRequest,
+        thread: Any,
+        instruction: str,
+    ) -> dict[str, Any]:
+        metadata = {
+            "runner_job_id": f"fix-request-{fix_request.id}",
+            "thread_id": thread.thread_id,
+            "status": "running",
+            "queue_scope": "thread",
+        }
+        self.calls.append(
+            {
+                "session": session,
+                "fix_request_id": fix_request.id,
+                "thread_id": thread.thread_id,
+                "instruction": instruction,
+                "metadata": metadata,
+            }
+        )
+        return metadata
+
+
+def _make_fake_thread(
+    *, thread_id: str, status: str = "idle", user_id: str = "author"
+) -> SimpleNamespace:
+    return SimpleNamespace(thread_id=thread_id, status=status, user_id=user_id)
+
+
+def _patch_service_for_immediate_queue_dispatch(
+    *,
+    service: CodeReviewFixService,
+    fix_request: ReviewFixRequest,
+    fix_runner: _RecordingFixRunner,
+    timeline_service: _RecordingTimelineService,
+    thread_status: str = "idle",
+) -> None:
+    thread = _make_fake_thread(
+        thread_id=str(fix_request.review_run.thread_id or ""),
+        status=thread_status,
+    )
+
+    async def fake_load_thread(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> SimpleNamespace:
+        assert thread_id == thread.thread_id
+        return thread
+
+    async def fake_process_thread_queue_once(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> bool:
+        assert thread_id == thread.thread_id
+        if thread.status != "idle":
+            return False
+        metadata = await fix_runner.start_fix(
+            session=session,
+            fix_request=fix_request,
+            thread=thread,
+            instruction=service._build_fix_instruction(fix_request),
+        )
+        fix_request.runner_job_id = metadata["runner_job_id"]
+        fix_request.status = ReviewFixRequestStatus.RUNNING
+        await timeline_service.append_event(
+            session=session,
+            review_run=fix_request.review_run,
+            event_type="fix_request_running",
+            dedupe_key=f"{fix_request.id}:fix_request_running",
+            payload={
+                "fix_request_id": fix_request.id,
+                "runner_job_id": metadata["runner_job_id"],
+                "thread_id": thread_id,
+            },
+        )
+        return True
+
+    async def fake_ensure_background_worker(*, thread_id: str) -> None:
+        assert thread_id == thread.thread_id
+
+    service._load_thread = fake_load_thread  # type: ignore[method-assign]
+    service.process_thread_queue_once = fake_process_thread_queue_once  # type: ignore[method-assign]
+    service.ensure_background_worker = fake_ensure_background_worker  # type: ignore[method-assign]
+
+
+def _patch_route_service_for_immediate_queue_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session: _FakeFixSession,
+) -> None:
+    async def fake_get_fix_request(
+        *, session: _FakeFixSession, fix_request_id: int
+    ) -> ReviewFixRequest:
+        for candidate in session.fix_requests:
+            if candidate.id == fix_request_id:
+                return candidate
+        raise HTTPException(404, "Fix request not found")
+
+    async def fake_ensure_approval_permission(
+        *,
+        session: _FakeFixSession,
+        current_user: Any,
+        repository_integration_id: int | None,
+    ) -> None:
+        user_id = getattr(current_user, "identity", None)
+        membership = next(
+            (
+                candidate
+                for candidate in session.memberships
+                if candidate.repository_integration_id == repository_integration_id
+                and candidate.user_id == user_id
+            ),
+            None,
+        )
+        if membership and membership.can_approve_fixes:
+            return
+        raise HTTPException(403, "Current user cannot approve fix requests")
+
+    async def fake_load_thread(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> SimpleNamespace:
+        return _make_fake_thread(thread_id=thread_id)
+
+    async def fake_process_thread_queue_once(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> bool:
+        fix_request = next(
+            (
+                candidate
+                for candidate in session.fix_requests
+                if candidate.status == ReviewFixRequestStatus.APPROVED
+            ),
+            None,
+        )
+        if fix_request is None:
+            return False
+        fix_request.runner_job_id = f"fix-request-{fix_request.id}"
+        fix_request.status = ReviewFixRequestStatus.RUNNING
+        await code_review_fix_service.timeline_service.append_event(
+            session=session,
+            review_run=fix_request.review_run,
+            event_type="fix_request_running",
+            dedupe_key=f"{fix_request.id}:fix_request_running",
+            payload={
+                "fix_request_id": fix_request.id,
+                "runner_job_id": fix_request.runner_job_id,
+                "thread_id": thread_id,
+            },
+        )
+        return True
+
+    async def fake_ensure_background_worker(*, thread_id: str) -> None:
+        return None
+
+    async def fake_get_fix_request_by_runner_job_id(
+        *, session: _FakeFixSession, runner_job_id: str
+    ) -> ReviewFixRequest | None:
+        return next(
+            (
+                candidate
+                for candidate in session.fix_requests
+                if candidate.runner_job_id == runner_job_id
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(code_review_fix_service, "_load_thread", fake_load_thread)
+    monkeypatch.setattr(
+        code_review_fix_service, "_get_fix_request", fake_get_fix_request
+    )
+    monkeypatch.setattr(
+        code_review_fix_service,
+        "_ensure_approval_permission",
+        fake_ensure_approval_permission,
+    )
+    monkeypatch.setattr(
+        code_review_fix_service,
+        "process_thread_queue_once",
+        fake_process_thread_queue_once,
+    )
+    monkeypatch.setattr(
+        code_review_fix_service,
+        "ensure_background_worker",
+        fake_ensure_background_worker,
+    )
+    monkeypatch.setattr(
+        code_review_fix_service,
+        "_get_fix_request_by_runner_job_id",
+        fake_get_fix_request_by_runner_job_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_service_approve_transitions_request_and_starts_runner() -> None:
+    session = _FakeFixSession()
+    timeline_service = _RecordingTimelineService()
+    fix_runner = _RecordingFixRunner()
+    service = CodeReviewFixService(
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+    integration = _seed_integration(session, integration_id=1)
+    run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-existing-1"
+    run.repository_integration = integration
+    finding = _seed_finding(session, finding_id=1, review_run=run)
+    fix_request = _seed_fix_request(
+        session,
+        fix_request_id=1,
+        review_run=run,
+        review_finding=finding,
+    )
+
+    async def fake_get_fix_request(
+        *, session: _FakeFixSession, fix_request_id: int
+    ) -> ReviewFixRequest:
+        assert fix_request_id == 1
+        return fix_request
+
+    async def fake_ensure_approval_permission(
+        *,
+        session: _FakeFixSession,
+        current_user: Any,
+        repository_integration_id: int | None,
+    ) -> None:
+        assert repository_integration_id == integration.id
+        assert getattr(current_user, "identity", None) == "approver"
+
+    service._get_fix_request = fake_get_fix_request  # type: ignore[method-assign]
+    service._ensure_approval_permission = fake_ensure_approval_permission  # type: ignore[method-assign]
+    _patch_service_for_immediate_queue_dispatch(
+        service=service,
+        fix_request=fix_request,
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+
+    payload = await service.approve_fix_request(
+        session=session,
+        current_user=_user("approver"),
+        fix_request_id=1,
+    )
+
+    assert payload["status"] == ReviewFixRequestStatus.RUNNING.value
+    assert payload["runner_job_id"] == "fix-request-1"
+    assert payload["runner"] == {
+        "runner_job_id": "fix-request-1",
+        "thread_id": "thread-existing-1",
+        "status": "running",
+        "queue_scope": "thread",
+    }
+    assert fix_request.status == ReviewFixRequestStatus.RUNNING
+    assert fix_request.runner_job_id == "fix-request-1"
+    assert fix_runner.calls == [
+        {
+            "session": session,
+            "fix_request_id": 1,
+            "thread_id": "thread-existing-1",
+            "instruction": (
+                "Fix request #1 for review run #1.\n"
+                "Finding: Use safer pattern\n"
+                "Location: src/app.py:10\n"
+                "Detail: Potential issue\n"
+                "Continue in the same task thread and make the minimal correct fix."
+            ),
+            "metadata": {
+                "runner_job_id": "fix-request-1",
+                "thread_id": "thread-existing-1",
+                "status": "running",
+                "queue_scope": "thread",
+            },
+        }
+    ]
+    assert timeline_service.event_types == [
+        "fix_request_approved",
+        "fix_request_running",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_approve_uses_existing_review_run_thread_id() -> None:
+    session = _FakeFixSession()
+    timeline_service = _RecordingTimelineService()
+    fix_runner = _RecordingFixRunner()
+    service = CodeReviewFixService(
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+    integration = _seed_integration(session, integration_id=1)
+    run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-review-123"
+    run.repository_integration = integration
+    finding = _seed_finding(session, finding_id=1, review_run=run)
+    fix_request = _seed_fix_request(
+        session,
+        fix_request_id=1,
+        review_run=run,
+        review_finding=finding,
+    )
+
+    async def fake_get_fix_request(
+        *, session: _FakeFixSession, fix_request_id: int
+    ) -> ReviewFixRequest:
+        assert fix_request_id == 1
+        return fix_request
+
+    async def fake_ensure_approval_permission(
+        *,
+        session: _FakeFixSession,
+        current_user: Any,
+        repository_integration_id: int | None,
+    ) -> None:
+        assert repository_integration_id == integration.id
+        assert getattr(current_user, "identity", None) == "approver"
+
+    service._get_fix_request = fake_get_fix_request  # type: ignore[method-assign]
+    service._ensure_approval_permission = fake_ensure_approval_permission  # type: ignore[method-assign]
+    _patch_service_for_immediate_queue_dispatch(
+        service=service,
+        fix_request=fix_request,
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+
+    payload = await service.approve_fix_request(
+        session=session,
+        current_user=_user("approver"),
+        fix_request_id=1,
+    )
+
+    assert payload["runner"]["thread_id"] == "thread-review-123"
+    assert fix_runner.calls[0]["thread_id"] == "thread-review-123"
+
+
+@pytest.mark.asyncio
+async def test_service_approve_fails_clearly_when_review_run_thread_id_missing() -> (
+    None
+):
+    session = _FakeFixSession()
+    timeline_service = _RecordingTimelineService()
+    fix_runner = _RecordingFixRunner()
+    service = CodeReviewFixService(
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+    integration = _seed_integration(session, integration_id=1)
+    run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = None
+    run.repository_integration = integration
+    finding = _seed_finding(session, finding_id=1, review_run=run)
+    fix_request = _seed_fix_request(
+        session,
+        fix_request_id=1,
+        review_run=run,
+        review_finding=finding,
+    )
+
+    async def fake_get_fix_request(
+        *, session: _FakeFixSession, fix_request_id: int
+    ) -> ReviewFixRequest:
+        assert fix_request_id == 1
+        return fix_request
+
+    async def fake_ensure_approval_permission(
+        *,
+        session: _FakeFixSession,
+        current_user: Any,
+        repository_integration_id: int | None,
+    ) -> None:
+        assert repository_integration_id == integration.id
+        assert getattr(current_user, "identity", None) == "approver"
+
+    service._get_fix_request = fake_get_fix_request  # type: ignore[method-assign]
+    service._ensure_approval_permission = fake_ensure_approval_permission  # type: ignore[method-assign]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.approve_fix_request(
+            session=session,
+            current_user=_user("approver"),
+            fix_request_id=1,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "Review run has no bound thread_id for fix approval"
+    assert fix_request.status == ReviewFixRequestStatus.PENDING_APPROVAL
+    assert fix_request.runner_job_id is None
+    assert fix_runner.calls == []
+    assert timeline_service.event_types == []
+
+
+@pytest.mark.asyncio
+async def test_service_approve_does_not_create_or_return_new_thread_id() -> None:
+    session = _FakeFixSession()
+    timeline_service = _RecordingTimelineService()
+    fix_runner = _RecordingFixRunner()
+    service = CodeReviewFixService(
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+    integration = _seed_integration(session, integration_id=1)
+    run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-original-9"
+    run.repository_integration = integration
+    finding = _seed_finding(session, finding_id=1, review_run=run)
+    fix_request = _seed_fix_request(
+        session,
+        fix_request_id=1,
+        review_run=run,
+        review_finding=finding,
+    )
+
+    async def fake_get_fix_request(
+        *, session: _FakeFixSession, fix_request_id: int
+    ) -> ReviewFixRequest:
+        assert fix_request_id == 1
+        return fix_request
+
+    async def fake_ensure_approval_permission(
+        *,
+        session: _FakeFixSession,
+        current_user: Any,
+        repository_integration_id: int | None,
+    ) -> None:
+        assert repository_integration_id == integration.id
+        assert getattr(current_user, "identity", None) == "approver"
+
+    service._get_fix_request = fake_get_fix_request  # type: ignore[method-assign]
+    service._ensure_approval_permission = fake_ensure_approval_permission  # type: ignore[method-assign]
+    _patch_service_for_immediate_queue_dispatch(
+        service=service,
+        fix_request=fix_request,
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+
+    payload = await service.approve_fix_request(
+        session=session,
+        current_user=_user("approver"),
+        fix_request_id=1,
+    )
+
+    assert payload["runner"]["thread_id"] == "thread-original-9"
+    assert "new_thread_id" not in payload
+    assert "new_thread_id" not in payload["runner"]
+    assert all(call["thread_id"] == "thread-original-9" for call in fix_runner.calls)
+
+
+@pytest.mark.asyncio
+async def test_serialize_fix_request_does_not_report_queued_runner_for_terminal_status() -> (
+    None
+):
+    session = _FakeFixSession()
+    integration = _seed_integration(session, integration_id=1)
+    run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-terminal-1"
+    run.repository_integration = integration
+    finding = _seed_finding(session, finding_id=1, review_run=run)
+    fix_request = _seed_fix_request(
+        session,
+        fix_request_id=1,
+        review_run=run,
+        review_finding=finding,
+        status=ReviewFixRequestStatus.COMPLETED,
+    )
+    fix_request.runner_job_id = "fix-request-1"
+
+    service = CodeReviewFixService()
+
+    payload = service._serialize_fix_request(fix_request)
+
+    assert payload["runner_job_id"] == "fix-request-1"
+    assert payload["runner"] is None
+
+
+@pytest.mark.asyncio
+async def test_process_thread_queue_once_does_not_start_next_fix_while_thread_busy() -> (
+    None
+):
+    session = _FakeFixSession()
+    timeline_service = _RecordingTimelineService()
+    fix_runner = _RecordingFixRunner()
+    service = CodeReviewFixService(
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+    integration = _seed_integration(session, integration_id=1)
+    run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-busy-1"
+    run.repository_integration = integration
+    finding = _seed_finding(session, finding_id=1, review_run=run)
+    fix_request = _seed_fix_request(
+        session,
+        fix_request_id=1,
+        review_run=run,
+        review_finding=finding,
+        status=ReviewFixRequestStatus.APPROVED,
+    )
+    fix_request.approved_at = datetime(2026, 3, 26, 10, 0, tzinfo=UTC)
+    thread = _make_fake_thread(thread_id="thread-busy-1", status="busy")
+
+    async def fake_load_thread(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> SimpleNamespace:
+        assert thread_id == thread.thread_id
+        return thread
+
+    async def fake_get_running_fix_request(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> ReviewFixRequest | None:
+        return None
+
+    async def fake_get_next_approved_fix_request(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> ReviewFixRequest | None:
+        return fix_request
+
+    service._load_thread = fake_load_thread  # type: ignore[method-assign]
+    service._get_running_fix_request = fake_get_running_fix_request  # type: ignore[method-assign]
+    service._get_next_approved_fix_request = fake_get_next_approved_fix_request  # type: ignore[method-assign]
+
+    progressed = await service.process_thread_queue_once(
+        session=session,
+        thread_id="thread-busy-1",
+    )
+
+    assert progressed is False
+    assert fix_request.status == ReviewFixRequestStatus.APPROVED
+    assert fix_request.runner_job_id is None
+    assert fix_runner.calls == []
+    assert timeline_service.event_types == []
+
+
+@pytest.mark.asyncio
+async def test_process_thread_queue_once_dispatches_fifo_after_running_fix_completes() -> (
+    None
+):
+    session = _FakeFixSession()
+    timeline_service = _RecordingTimelineService()
+    fix_runner = _RecordingFixRunner()
+    service = CodeReviewFixService(
+        fix_runner=fix_runner,
+        timeline_service=timeline_service,
+    )
+    integration = _seed_integration(session, integration_id=1)
+    run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-fifo-1"
+    run.repository_integration = integration
+    finding_one = _seed_finding(session, finding_id=1, review_run=run)
+    finding_two = _seed_finding(session, finding_id=2, review_run=run)
+    first_fix = _seed_fix_request(
+        session,
+        fix_request_id=1,
+        review_run=run,
+        review_finding=finding_one,
+        status=ReviewFixRequestStatus.RUNNING,
+    )
+    first_fix.approved_at = datetime(2026, 3, 26, 10, 0, tzinfo=UTC)
+    first_fix.runner_job_id = "run-existing-1"
+    second_fix = _seed_fix_request(
+        session,
+        fix_request_id=2,
+        review_run=run,
+        review_finding=finding_two,
+        status=ReviewFixRequestStatus.APPROVED,
+    )
+    second_fix.approved_at = datetime(2026, 3, 26, 10, 5, tzinfo=UTC)
+    thread = _make_fake_thread(thread_id="thread-fifo-1", status="idle")
+
+    async def fake_load_thread(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> SimpleNamespace:
+        assert thread_id == thread.thread_id
+        return thread
+
+    async def fake_get_running_fix_request(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> ReviewFixRequest | None:
+        for candidate in session.fix_requests:
+            if (
+                candidate.review_run.thread_id == thread_id
+                and candidate.status == ReviewFixRequestStatus.RUNNING
+            ):
+                return candidate
+        return None
+
+    async def fake_get_next_approved_fix_request(
+        *, session: _FakeFixSession, thread_id: str
+    ) -> ReviewFixRequest | None:
+        approved = [
+            candidate
+            for candidate in session.fix_requests
+            if (
+                candidate.review_run.thread_id == thread_id
+                and candidate.status == ReviewFixRequestStatus.APPROVED
+            )
+        ]
+        approved.sort(
+            key=lambda candidate: (
+                candidate.approved_at or datetime.max.replace(tzinfo=UTC),
+                candidate.created_at or datetime.max.replace(tzinfo=UTC),
+                candidate.id or 0,
+            )
+        )
+        return approved[0] if approved else None
+
+    async def fake_get_aegra_run(
+        *, session: _FakeFixSession, run_id: str
+    ) -> SimpleNamespace | None:
+        if run_id != "run-existing-1":
+            return None
+        return SimpleNamespace(status="success", output={"summary": "done"})
+
+    service._load_thread = fake_load_thread  # type: ignore[method-assign]
+    service._get_running_fix_request = fake_get_running_fix_request  # type: ignore[method-assign]
+    service._get_next_approved_fix_request = fake_get_next_approved_fix_request  # type: ignore[method-assign]
+    service._get_aegra_run = fake_get_aegra_run  # type: ignore[method-assign]
+
+    progressed = await service.process_thread_queue_once(
+        session=session,
+        thread_id="thread-fifo-1",
+    )
+
+    assert progressed is True
+    assert first_fix.status == ReviewFixRequestStatus.COMPLETED
+    assert second_fix.status == ReviewFixRequestStatus.RUNNING
+    assert second_fix.runner_job_id == "fix-request-2"
+    assert [call["fix_request_id"] for call in fix_runner.calls] == [2]
+    assert timeline_service.event_types == [
+        "fix_request_completed",
+        "fix_request_running",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_approve_requires_approval_rights() -> None:
     session = _FakeFixSession()
@@ -279,16 +954,20 @@ async def test_approve_requires_approval_rights() -> None:
         can_approve_fixes=False,
     )
     run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-route-forbidden-1"
     finding = _seed_finding(session, finding_id=1, review_run=run)
     _seed_fix_request(session, fix_request_id=1, review_run=run, review_finding=finding)
 
     async def override_user() -> SimpleNamespace:
         return _user("approver")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
+    monkeypatch = pytest.MonkeyPatch()
+    _patch_route_service_for_immediate_queue_dispatch(monkeypatch, session=session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post("/api/code-review/fix-requests/1/approve")
             assert response.status_code == 403
             assert (
@@ -297,11 +976,14 @@ async def test_approve_requires_approval_rights() -> None:
             )
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        monkeypatch.undo()
+        test_app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
-async def test_approve_transitions_request_and_starts_runner() -> None:
+async def test_approve_transitions_request_and_starts_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session = _FakeFixSession()
     integration = _seed_integration(session, integration_id=1)
     _seed_membership(
@@ -312,16 +994,19 @@ async def test_approve_transitions_request_and_starts_runner() -> None:
         can_approve_fixes=True,
     )
     run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-route-1"
     finding = _seed_finding(session, finding_id=1, review_run=run)
     _seed_fix_request(session, fix_request_id=1, review_run=run, review_finding=finding)
+    _patch_route_service_for_immediate_queue_dispatch(monkeypatch, session=session)
 
     async def override_user() -> SimpleNamespace:
         return _user("approver")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post("/api/code-review/fix-requests/1/approve")
             assert response.status_code == 200
             payload = response.json()
@@ -334,11 +1019,13 @@ async def test_approve_transitions_request_and_starts_runner() -> None:
                 "fix_request_running",
             ]
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
-async def test_approve_rejects_non_pending_fix_request() -> None:
+async def test_approve_rejects_non_pending_fix_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session = _FakeFixSession()
     integration = _seed_integration(session, integration_id=1)
     _seed_membership(
@@ -349,6 +1036,7 @@ async def test_approve_rejects_non_pending_fix_request() -> None:
         can_approve_fixes=True,
     )
     run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-route-conflict-1"
     finding = _seed_finding(session, finding_id=1, review_run=run)
     _seed_fix_request(
         session,
@@ -361,19 +1049,23 @@ async def test_approve_rejects_non_pending_fix_request() -> None:
     async def override_user() -> SimpleNamespace:
         return _user("approver")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
+    _patch_route_service_for_immediate_queue_dispatch(monkeypatch, session=session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post("/api/code-review/fix-requests/1/approve")
             assert response.status_code == 409
             assert session.timeline_events == []
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
-async def test_reject_transitions_request_to_rejected() -> None:
+async def test_reject_transitions_request_to_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session = _FakeFixSession()
     integration = _seed_integration(session, integration_id=1)
     _seed_membership(
@@ -384,16 +1076,19 @@ async def test_reject_transitions_request_to_rejected() -> None:
         can_approve_fixes=True,
     )
     run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-route-reject-1"
     finding = _seed_finding(session, finding_id=1, review_run=run)
     _seed_fix_request(session, fix_request_id=1, review_run=run, review_finding=finding)
 
     async def override_user() -> SimpleNamespace:
         return _user("approver")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
+    _patch_route_service_for_immediate_queue_dispatch(monkeypatch, session=session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             response = client.post(
                 "/api/code-review/fix-requests/1/reject",
                 json={"reason": "not needed"},
@@ -406,7 +1101,7 @@ async def test_reject_transitions_request_to_rejected() -> None:
                 "fix_request_rejected",
             ]
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
@@ -426,16 +1121,19 @@ async def test_runner_callback_updates_terminal_state_and_is_idempotent(
         can_approve_fixes=True,
     )
     run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-callback-1"
     finding = _seed_finding(session, finding_id=1, review_run=run)
     _seed_fix_request(session, fix_request_id=1, review_run=run, review_finding=finding)
+    _patch_route_service_for_immediate_queue_dispatch(monkeypatch, session=session)
 
     async def override_user() -> SimpleNamespace:
         return _user("approver")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             approve_response = client.post("/api/code-review/fix-requests/1/approve")
             assert approve_response.status_code == 200
             runner_job_id = approve_response.json()["runner_job_id"]
@@ -478,7 +1176,7 @@ async def test_runner_callback_updates_terminal_state_and_is_idempotent(
                 f"fix_request_{terminal_status}",
             ]
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
@@ -496,16 +1194,19 @@ async def test_runner_callback_requires_shared_secret(
         can_approve_fixes=True,
     )
     run = _seed_run(session, run_id=1, repository_integration_id=integration.id or 1)
+    run.thread_id = "thread-callback-secret-1"
     finding = _seed_finding(session, finding_id=1, review_run=run)
     _seed_fix_request(session, fix_request_id=1, review_run=run, review_finding=finding)
+    _patch_route_service_for_immediate_queue_dispatch(monkeypatch, session=session)
 
     async def override_user() -> SimpleNamespace:
         return _user("approver")
 
-    app.dependency_overrides[authenticated_user] = override_user
-    app.dependency_overrides[get_db] = _override_db(session)
+    test_app = _make_test_app()
+    test_app.dependency_overrides[authenticated_user] = override_user
+    test_app.dependency_overrides[get_db] = _override_db(session)
     try:
-        with TestClient(app) as client:
+        with TestClient(test_app) as client:
             approve_response = client.post("/api/code-review/fix-requests/1/approve")
             assert approve_response.status_code == 200
 
@@ -525,7 +1226,7 @@ async def test_runner_callback_requires_shared_secret(
                 "fix_request_running",
             ]
     finally:
-        app.dependency_overrides.clear()
+        test_app.dependency_overrides.clear()
 
 
 def test_fix_routes_are_registered_on_main_app() -> None:

@@ -558,7 +558,7 @@ export const usePortalCodeReviewState = ({
       setApprovingFixRequestIds((current) => ({ ...current, [fixRequestId]: true }));
       try {
         await approveCodeReviewFixRequest(fixRequestId);
-        toast.success('修复请求已批准');
+        toast.success('修复请求已进入关联线程队列');
         await loadRunDetail(runId, { silent: true });
       } catch (error) {
         console.error('Failed to approve code review fix request', error);
