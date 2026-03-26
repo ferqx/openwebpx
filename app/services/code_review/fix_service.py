@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from app.models.code_review import (
     RepositoryMembership,
@@ -15,7 +16,7 @@ from app.models.code_review import (
     ReviewRun,
 )
 from app.services.code_review.fix_runner import (
-    CodeReviewFixRunnerAdapter,
+    CodeReviewFixRunner,
     code_review_fix_runner,
 )
 from app.services.code_review.run_service import _resolve_user_identity
@@ -29,7 +30,7 @@ class CodeReviewFixService:
     def __init__(
         self,
         *,
-        fix_runner: CodeReviewFixRunnerAdapter = code_review_fix_runner,
+        fix_runner: CodeReviewFixRunner = code_review_fix_runner,
         timeline_service: CodeReviewTimelineService = code_review_timeline_service,
     ) -> None:
         self.fix_runner = fix_runner
@@ -58,6 +59,7 @@ class CodeReviewFixService:
         fix_request.approved_by = _resolve_user_identity(current_user)
         fix_request.approved_at = now
         fix_request.updated_at = now
+
         await self.timeline_service.append_event(
             session=session,
             review_run=fix_request.review_run,
@@ -69,10 +71,16 @@ class CodeReviewFixService:
                 "approved_by": fix_request.approved_by,
             },
         )
-        runner_job_id = await self.fix_runner.start_fix(fix_request=fix_request)
+
+        # 启动 Runner
+        runner_job_id = await self.fix_runner.start_fix(
+            session=session, fix_request=fix_request
+        )
+
         fix_request.runner_job_id = runner_job_id
         fix_request.status = ReviewFixRequestStatus.RUNNING
         fix_request.updated_at = datetime.now(UTC)
+
         await self.timeline_service.append_event(
             session=session,
             review_run=fix_request.review_run,
@@ -196,16 +204,20 @@ class CodeReviewFixService:
         session: AsyncSession,
         fix_request_id: int,
     ) -> ReviewFixRequest:
-        result = await session.scalars(select(ReviewFixRequest))
-        for fix_request in result.all():
-            if fix_request.id == fix_request_id:
-                if fix_request.review_run is None:
-                    fix_request.review_run = await self._get_run(
-                        session=session,
-                        run_id=fix_request.review_run_id,
-                    )
-                return fix_request
-        raise HTTPException(404, "Fix request not found")
+        result = await session.execute(
+            select(ReviewFixRequest)
+            .options(
+                joinedload(ReviewFixRequest.review_run).joinedload(
+                    ReviewRun.repository_integration
+                ),
+                joinedload(ReviewFixRequest.review_finding),
+            )
+            .where(ReviewFixRequest.id == fix_request_id)
+        )
+        fix_request = result.scalar_one_or_none()
+        if not fix_request:
+            raise HTTPException(404, "Fix request not found")
+        return fix_request
 
     async def _get_fix_request_by_runner_job_id(
         self,
@@ -213,28 +225,16 @@ class CodeReviewFixService:
         session: AsyncSession,
         runner_job_id: str,
     ) -> ReviewFixRequest | None:
-        result = await session.scalars(select(ReviewFixRequest))
-        for fix_request in result.all():
-            if fix_request.runner_job_id == runner_job_id:
-                if fix_request.review_run is None:
-                    fix_request.review_run = await self._get_run(
-                        session=session,
-                        run_id=fix_request.review_run_id,
-                    )
-                return fix_request
-        return None
-
-    async def _get_run(
-        self,
-        *,
-        session: AsyncSession,
-        run_id: int,
-    ) -> ReviewRun:
-        result = await session.scalars(select(ReviewRun))
-        for run in result.all():
-            if run.id == run_id:
-                return run
-        raise HTTPException(404, "Review run not found")
+        result = await session.execute(
+            select(ReviewFixRequest)
+            .options(
+                joinedload(ReviewFixRequest.review_run).joinedload(
+                    ReviewRun.repository_integration
+                )
+            )
+            .where(ReviewFixRequest.runner_job_id == runner_job_id)
+        )
+        return result.scalar_one_or_none()
 
     async def _ensure_approval_permission(
         self,
@@ -246,22 +246,17 @@ class CodeReviewFixService:
         if repository_integration_id is None:
             raise HTTPException(404, "Fix request not found")
         user_id = _resolve_user_identity(current_user)
-        memberships = await self._load_memberships(session=session)
-        for membership in memberships:
-            if (
-                membership.repository_integration_id == repository_integration_id
-                and membership.user_id == user_id
-            ):
-                if membership.can_approve_fixes:
-                    return
-                raise HTTPException(403, "Current user cannot approve fix requests")
+        result = await session.execute(
+            select(RepositoryMembership).where(
+                RepositoryMembership.repository_integration_id
+                == repository_integration_id,
+                RepositoryMembership.user_id == user_id,
+            )
+        )
+        membership = result.scalar_one_or_none()
+        if membership and membership.can_approve_fixes:
+            return
         raise HTTPException(403, "Current user cannot approve fix requests")
-
-    async def _load_memberships(
-        self, *, session: AsyncSession
-    ) -> list[RepositoryMembership]:
-        result = await session.scalars(select(RepositoryMembership))
-        return list(result.all())
 
     def _serialize_fix_request(self, fix_request: ReviewFixRequest) -> dict[str, Any]:
         return {

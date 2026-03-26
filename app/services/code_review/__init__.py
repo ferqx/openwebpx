@@ -1,5 +1,5 @@
 from .dispatcher import CodeReviewRunDispatcher, code_review_run_dispatcher
-from .fix_runner import CodeReviewFixRunnerAdapter, code_review_fix_runner
+from .fix_runner import CodeReviewFixRunner, code_review_fix_runner
 from .fix_service import CodeReviewFixService, code_review_fix_service
 from .publish_service import CodeReviewPublishService, code_review_publish_service
 from .repository_service import (
@@ -13,7 +13,7 @@ from .timeline_service import CodeReviewTimelineService, code_review_timeline_se
 __all__ = [
     "CodeReviewRepositoryService",
     "code_review_repository_service",
-    "CodeReviewFixRunnerAdapter",
+    "CodeReviewFixRunner",
     "code_review_fix_runner",
     "CodeReviewFixService",
     "code_review_fix_service",

@@ -22,6 +22,12 @@
 4. **验证闭环**:
    - 后端改动运行 `uv run pytest`。
    - 前端改动运行 `pnpm --prefix web test:hooks`。
+5. **数据库变更验证 (Database Migration Validation)**: 在执行 `alembic upgrade` 前，必须人工核对 `alembic/versions/` 下生成的脚本，禁止包含非预期的 `drop_table` 或 `drop_column` 操作。所有新定义的 SQLAlchemy 模型必须在 `app/models/__init__.py` 中导出并在 `alembic/env.py` 中被正确加载，以防止 autogenerate 误判。
+
+## <CRITICAL> 数据库安全红线
+- **禁止盲目迁移**: 在执行 `alembic upgrade` 之前，**必须**读取 `alembic/versions/` 下生成的 Python 脚本。若发现非预期的 `op.drop_table` 或 `op.drop_column` 破坏性操作，必须立即停止并核对 `alembic/env.py` 中的模型导入链。
+- **严禁硬编码**: 严禁在代码中硬编码任何 API Token、Secret 或敏感凭证。所有测试令牌必须通过 `.env.test.local` 加载，并通过 `app.core.env` 统一管理。
+- **数据完整性**: 执行涉及删除数据的操作前，必须进行备份或提供回滚脚本。
 
 ## 4. 禁止行为 (Anti-Patterns)
 - **禁止后端硬编码前端逻辑**: 后端不应感知前端路由或文件布局。

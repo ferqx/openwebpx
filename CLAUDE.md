@@ -20,6 +20,12 @@ This file provides local development context. For global collaboration rules, re
 - `uv run ruff check .`: Lint Python code.
 - `python scripts/migrate.py upgrade`: Apply DB migrations.
 
+### Database & Migrations
+- **Generate Revision**: `uv run alembic revision --autogenerate -m "description"`
+- **Mandatory Review**: Check generated file in `alembic/versions/` for unintended `drop_table`/`drop_column` commands.
+- **Run Upgrade**: `uv run alembic upgrade head`
+- **Integrity Check**: Ensure all models are imported in `app/models/__init__.py` and `alembic/env.py`.
+
 ## 4. Frontend Commands (web/)
 - See [web/CLAUDE.md](web/CLAUDE.md) for detailed frontend commands.
 - `pnpm --prefix web test:hooks`: Run frontend unit tests.

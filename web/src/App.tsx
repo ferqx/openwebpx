@@ -1,5 +1,6 @@
 import Dashboard from '@/pages/dashboard';
 import { SettingsPage } from '@/pages/settings';
+import CodeReviewSettingsPage from '@/pages/code-review-settings';
 import {
   Routes,
   Route,
@@ -10,6 +11,7 @@ import { RedirectIfAuthenticated, RequireAuth } from '@/provider/auth';
 import { LoginPage } from './pages/login';
 import { RegisterPage } from './pages/register';
 import { PortalPage } from './pages/portal';
+import { ReviewDetailPage } from './pages/review-detail';
 import { ScmOauthCallbackPage } from './pages/scm-oauth-callback';
 import { TaskDetailPage } from './pages/task-detail';
 import { Toaster } from '@/components/ui/sonner';
@@ -26,8 +28,10 @@ export function App() {
           <Route path="/" element={<Dashboard />}>
             <Route index element={<PortalPage />} />
             <Route path="tasks/:id" element={<TaskDetailPage />} />
+            <Route path="reviews/:id" element={<ReviewDetailPage />} />
           </Route>
-          <Route path="/settings" element={<SettingsPage />}></Route>
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/settings/code-review" element={<CodeReviewSettingsPage />} />
         </Route>
         <Route path="/oauth/scm/callback" element={<ScmOauthCallbackPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

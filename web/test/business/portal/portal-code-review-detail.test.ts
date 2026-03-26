@@ -87,8 +87,6 @@ test('PortalCodeReviewDetail renders findings and timeline for selected run', ()
       isLoading: false,
       errorMessage: null,
       onRetry: () => undefined,
-      onBack: () => undefined,
-      onPublishRun: () => undefined,
       onContinueFix: () => undefined,
       onApproveFixRequest: () => undefined,
       onRejectFixRequest: () => undefined,
@@ -96,16 +94,12 @@ test('PortalCodeReviewDetail renders findings and timeline for selected run', ()
     })
   );
 
-  assert.match(markup, /acme\/web/);
-  assert.match(markup, /返回结果列表/);
   assert.match(markup, /Unsanitized value/);
-  assert.match(markup, /审查已请求/);
-  assert.match(markup, /分析完成/);
-  assert.match(markup, /运行摘要/);
-  assert.match(markup, /待处理事项/);
-  assert.match(markup, /最近事件 分析完成/);
-  assert.match(markup, /执行中/);
-  assert.match(markup, /修复请求/);
+  assert.match(markup, /评审报告/);
+  assert.match(markup, /修复建议/);
+  assert.doesNotMatch(markup, /运行信息/);
+  assert.doesNotMatch(markup, /同步审查结果/);
+  assert.doesNotMatch(markup, /返回列表|返回结果列表|查看关联线程/);
 });
 
 test('PortalCodeReviewDetail renders error state when detail load fails', () => {
@@ -116,8 +110,6 @@ test('PortalCodeReviewDetail renders error state when detail load fails', () => 
       isLoading: false,
       errorMessage: '加载审查详情失败，请稍后重试',
       onRetry: () => undefined,
-      onBack: () => undefined,
-      onPublishRun: () => undefined,
       onContinueFix: () => undefined,
       onApproveFixRequest: () => undefined,
       onRejectFixRequest: () => undefined,
@@ -125,12 +117,12 @@ test('PortalCodeReviewDetail renders error state when detail load fails', () => 
     })
   );
 
-  assert.match(markup, /审查详情加载失败/);
-  assert.match(markup, /返回结果列表/);
+  assert.match(markup, /审查加载失败/);
   assert.match(markup, /重试/);
+  assert.doesNotMatch(markup, /返回列表|返回结果列表/);
 });
 
-test('PortalCodeReviewDetail renders approval actions for pending fix requests', () => {
+test('PortalCodeReviewDetail surfaces pending fix count in tab label', () => {
   const pendingRun: CodeReviewRunDetail = {
     ...run,
     fix_requests: [
@@ -152,8 +144,6 @@ test('PortalCodeReviewDetail renders approval actions for pending fix requests',
       isLoading: false,
       errorMessage: null,
       onRetry: () => undefined,
-      onBack: () => undefined,
-      onPublishRun: () => undefined,
       onContinueFix: () => undefined,
       onApproveFixRequest: () => undefined,
       onRejectFixRequest: () => undefined,
@@ -161,9 +151,8 @@ test('PortalCodeReviewDetail renders approval actions for pending fix requests',
     })
   );
 
-  assert.match(markup, /Approve/);
-  assert.match(markup, /Reject/);
-  assert.match(markup, /待审批/);
+  assert.match(markup, /修复建议/);
+  assert.match(markup, />1</);
 });
 
 test('PortalCodeReviewDetail renders nothing when no run is selected', () => {
@@ -174,8 +163,6 @@ test('PortalCodeReviewDetail renders nothing when no run is selected', () => {
       isLoading: false,
       errorMessage: null,
       onRetry: () => undefined,
-      onBack: () => undefined,
-      onPublishRun: () => undefined,
       onContinueFix: () => undefined,
       onApproveFixRequest: () => undefined,
       onRejectFixRequest: () => undefined,

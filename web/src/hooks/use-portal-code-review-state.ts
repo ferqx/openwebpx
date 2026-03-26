@@ -205,6 +205,11 @@ export const deriveVisibleCodeReviewRuns = ({
       const detail = runDetailsById[run.id];
       const mode = resolvePortalCodeReviewMode(detail);
       const pendingApprovalCount = getPendingApprovalCount(detail);
+
+      // 优先使用 Run Summary 中自带的统计数据 (后端优化版)
+      const findingsCount = run.findings_count ?? (detail?.findings.length ?? null);
+      const hasPendingApproval = run.has_pending_approval ?? (pendingApprovalCount > 0);
+
       const lastEventType =
         detail?.timeline_events[detail.timeline_events.length - 1]?.event_type ?? null;
       return {
@@ -213,13 +218,17 @@ export const deriveVisibleCodeReviewRuns = ({
         repositoryName: repository?.full_name ?? '',
         repositoryDefaultBranch: repository?.default_branch ?? null,
         mode,
-        hasPendingApproval: pendingApprovalCount > 0,
+        hasPendingApproval,
         pendingApprovalCount,
-        findingsCount: detail?.findings.length ?? null,
+        findingsCount,
         lastEventType
       };
     })
-    .filter((run) => matchesCodeReviewRepositoryContext(run.repository, context))
+    .filter((run) => {
+      // 关键改动：如果 context.selectedRepo 为空，则不进行仓库过滤，显示全部。
+      if (!context.selectedRepo) return true;
+      return matchesCodeReviewRepositoryContext(run.repository, context);
+    })
     .filter((run) => (statusFilter === 'all' ? true : run.status === statusFilter))
     .filter((run) => (modeFilter === 'all' ? true : run.mode === modeFilter))
     .filter((run) => matchesRunSearch(run, searchQuery))
@@ -264,31 +273,26 @@ export const deriveCodeReviewPrefetchRunIds = ({
 };
 
 export const getCodeReviewEmptyStateMessage = ({
-  hasSelectedRepository,
   hasLoadedInitialData,
   hasRepositories,
   visibleRunCount,
   hasFilters
 }: {
-  hasSelectedRepository: boolean;
   hasLoadedInitialData: boolean;
   hasRepositories: boolean;
   visibleRunCount: number;
   hasFilters: boolean;
 }) => {
   if (!hasLoadedInitialData) {
-    return '正在加载审查运行...';
+    return '正在加载评审线程...';
   }
   if (!hasRepositories) {
-    return '当前还没有可用的代码审查仓库';
-  }
-  if (!hasSelectedRepository) {
-    return '请选择仓库后查看代码审查';
+    return '您目前还没有关联任何代码仓库';
   }
   if (visibleRunCount > 0) {
     return '';
   }
-  return hasFilters ? '没有匹配条件的审查运行' : '当前仓库还没有审查运行';
+  return hasFilters ? '没有找到符合条件的评审记录' : '当前暂无评审记录';
 };
 
 export const loadPortalCodeReviewSnapshot = async ({
@@ -462,11 +466,17 @@ export const usePortalCodeReviewState = ({
       }
 
       const generation = detailLoadGenerationRef.current;
-      const request = (async () => {
+      let resolveRequest: () => void = () => {};
+      const request = new Promise<void>((resolve) => {
+        resolveRequest = resolve;
+      });
+
+      void (async () => {
         setLoadingDetailIds((current) => ({ ...current, [runId]: true }));
         try {
           const detail = await getCodeReviewRun(runId);
           if (detailLoadGenerationRef.current !== generation) {
+            resolveRequest();
             return;
           }
           setRunDetailsById((current) => ({ ...current, [runId]: detail }));
@@ -476,6 +486,7 @@ export const usePortalCodeReviewState = ({
         } catch (error) {
           console.error('Failed to load code review run detail', error);
           if (detailLoadGenerationRef.current !== generation) {
+            resolveRequest();
             return;
           }
           if (!options?.silent && selectedRunIdRef.current === runId) {
@@ -491,6 +502,7 @@ export const usePortalCodeReviewState = ({
               return next;
             });
           }
+          resolveRequest();
         }
       })();
 
@@ -500,6 +512,8 @@ export const usePortalCodeReviewState = ({
     []
   );
 
+  // 移除详情预取逻辑，统计数据现在由 Run Summary 直接提供
+  /*
   useEffect(() => {
     if (!enabled) return;
     if (prefetchRunIds.length === 0) return;
@@ -510,6 +524,7 @@ export const usePortalCodeReviewState = ({
       })
     );
   }, [enabled, loadRunDetail, prefetchRunIds]);
+  */
 
   useEffect(() => {
     if (!enabled || selectedRunId === null) return;
@@ -584,7 +599,6 @@ export const usePortalCodeReviewState = ({
   const hasFilters =
     statusFilter !== 'all' || modeFilter !== 'all' || searchQuery.trim().length > 0;
   const emptyStateMessage = getCodeReviewEmptyStateMessage({
-    hasSelectedRepository: selectedRepo.trim().length > 0,
     hasLoadedInitialData:
       hasLoadedInitialData &&
       !(modeFilter !== 'all' && prefetchRunIds.length > 0 && visibleRuns.length === 0),

@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Import your SQLAlchemy models here
 import app.core.env  # noqa: F401
+import app.models.code_review  # noqa: F401
+import app.models.tool_telemetry  # noqa: F401
 from alembic import context
 
 # This is the Alembic Config object, which provides

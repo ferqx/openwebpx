@@ -15,6 +15,9 @@ from app.models.code_review import (
     RepositoryMembership,
     RepositoryReviewConfig,
 )
+from app.routers.code_review_repositories import (
+    list_repositories as list_repositories_route,
+)
 from app.services.code_review.repository_service import CodeReviewRepositoryService
 
 
@@ -754,6 +757,62 @@ def test_code_review_config_routes_work_through_the_app() -> None:
             assert put_payload["auto_publish_enabled"] is True
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_code_review_repository_list_route_returns_all_integrations() -> None:
+    session = _FakeSession()
+    _seed_integration(
+        session,
+        integration_id=1,
+        provider="github",
+        external_repo_id="101",
+    )
+    _seed_integration(
+        session,
+        integration_id=2,
+        provider="gitlab",
+        external_repo_id="202",
+        gitlab_base_url="https://gitlab.example.com",
+    )
+
+    payload = await list_repositories_route(
+        current_user=_user("route-user"),
+        db=session,
+    )
+
+    assert [repository["id"] for repository in payload["repositories"]] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_list_repositories_returns_all_integrations_without_membership_filter() -> (
+    None
+):
+    session = _FakeSession()
+    service = CodeReviewRepositoryService()
+    first = _seed_integration(
+        session,
+        integration_id=1,
+        provider="github",
+        external_repo_id="101",
+    )
+    second = _seed_integration(
+        session,
+        integration_id=2,
+        provider="gitlab",
+        external_repo_id="202",
+        gitlab_base_url="https://gitlab.example.com",
+    )
+
+    repositories = await service.list_repositories(
+        session=session,
+        current_user=_user("list-user"),
+    )
+
+    assert [repository["id"] for repository in repositories] == [
+        first.id,
+        second.id,
+    ]
 
 
 def test_code_review_routes_are_registered_on_main_app() -> None:

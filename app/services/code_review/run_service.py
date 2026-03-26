@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.code_review import (
@@ -54,20 +54,45 @@ class CodeReviewRunService:
             session=session,
             current_user=current_user,
         )
-        runs = await self._load_runs(session)
-        visible_runs = [
-            run
-            for run in runs
-            if run.repository_integration_id in visible_integration_ids
-        ]
-        visible_runs.sort(
-            key=lambda run: (
-                run.created_at or datetime.min.replace(tzinfo=UTC),
-                run.id or 0,
-            ),
-            reverse=True,
+
+        # 使用聚合查询一次性获取 Run 及其统计信息
+        result = await session.execute(
+            select(ReviewRun)
+            .where(ReviewRun.repository_integration_id.in_(visible_integration_ids))
+            .order_by(desc(ReviewRun.created_at), desc(ReviewRun.id))
         )
-        return [self._serialize_summary(run) for run in visible_runs]
+        runs = result.scalars().all()
+
+        if not runs:
+            return []
+
+        # 批量获取 findings count
+        findings_count_result = await session.execute(
+            select(ReviewFinding.review_run_id, func.count(ReviewFinding.id))
+            .where(ReviewFinding.review_run_id.in_([r.id for r in runs]))
+            .group_by(ReviewFinding.review_run_id)
+        )
+        findings_counts = dict(findings_count_result.all())
+
+        # 批量获取待审批修复请求
+        pending_fix_result = await session.execute(
+            select(ReviewFixRequest.review_run_id)
+            .where(
+                ReviewFixRequest.review_run_id.in_([r.id for r in runs]),
+                ReviewFixRequest.status == "pending_approval",
+            )
+            .distinct()
+        )
+        pending_fix_run_ids = {r[0] for r in pending_fix_result.all()}
+
+        return [
+            self._serialize_summary(
+                run,
+                findings_count=findings_counts.get(run.id, 0),
+                has_pending_approval=(run.id in pending_fix_run_ids),
+            )
+            for run in runs
+        ]
 
     async def get_run(
         self,
@@ -235,7 +260,12 @@ class CodeReviewRunService:
                 return integration
         return None
 
-    def _serialize_summary(self, run: ReviewRun) -> dict[str, Any]:
+    def _serialize_summary(
+        self,
+        run: ReviewRun,
+        findings_count: int | None = None,
+        has_pending_approval: bool | None = None,
+    ) -> dict[str, Any]:
         return {
             "id": run.id,
             "repository_integration_id": run.repository_integration_id,
@@ -243,8 +273,11 @@ class CodeReviewRunService:
             "event_type": run.event_type,
             "status": self._status_value(run.status),
             "idempotency_key": run.idempotency_key,
+            "thread_id": run.thread_id,
             "external_pr_or_mr_id": run.external_pr_or_mr_id,
             "head_commit_id": run.head_commit_id,
+            "findings_count": findings_count,
+            "has_pending_approval": has_pending_approval,
             "created_at": run.created_at,
             "updated_at": run.updated_at,
         }

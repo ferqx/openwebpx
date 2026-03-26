@@ -6,12 +6,16 @@ type PortalHeaderProps = {
   onLogoClick: () => void;
   onSettingsClick: () => void;
   onLogout: () => void;
+  showSettingsButton?: boolean;
+  showLogoutButton?: boolean;
 };
 
 export function PortalHeader({
   onLogoClick,
   onSettingsClick,
-  onLogout
+  onLogout,
+  showSettingsButton = true,
+  showLogoutButton = true
 }: PortalHeaderProps) {
   return (
     <header>
@@ -19,15 +23,21 @@ export function PortalHeader({
         <AppLogo onClick={() => onLogoClick()} className="cursor-pointer" />
         <div className="flex items-center gap-2 sm:gap-5">
           <ThemeModeMenu />
-          <Button type="button" variant="ghost" size="sm" onClick={onSettingsClick}>
-            设置
-          </Button>
-          <Button type="button" variant="ghost" size="sm">
-            文档
-          </Button>
-          <Button type="button" variant="ghost" size="sm" onClick={onLogout}>
-            退出登录
-          </Button>
+          {showSettingsButton ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onSettingsClick}
+            >
+              设置
+            </Button>
+          ) : null}
+          {showLogoutButton ? (
+            <Button type="button" variant="ghost" size="sm" onClick={onLogout}>
+              退出登录
+            </Button>
+          ) : null}
         </div>
       </div>
     </header>

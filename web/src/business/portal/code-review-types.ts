@@ -52,6 +52,9 @@ export type CodeReviewRunSummary = {
   event_type: string;
   status: CodeReviewRunStatus;
   idempotency_key: string;
+  thread_id?: string | null;
+  findings_count?: number | null;
+  has_pending_approval?: boolean | null;
   external_pr_or_mr_id?: string | null;
   head_commit_id?: string | null;
   created_at?: string | null;

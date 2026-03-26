@@ -95,6 +95,9 @@ def normalize_gitlab_webhook_payload(
         or attributes.get("last_commit_sha")
         or payload.get("checkout_sha")
     )
+    last_commit_message = last_commit.get("message") or attributes.get(
+        "last_commit", {}
+    ).get("message")
     base_commit_id = diff_refs.get("base_sha") or attributes.get("oldrev")
 
     instance_url = gitlab_base_url
@@ -125,6 +128,9 @@ def normalize_gitlab_webhook_payload(
         else None,
         "head_commit_id": str(head_commit_id).strip()
         if head_commit_id is not None
+        else None,
+        "head_commit_message": str(last_commit_message).strip()
+        if last_commit_message
         else None,
         "repository_full_name": str(project.get("path_with_namespace") or "").strip()
         or None,

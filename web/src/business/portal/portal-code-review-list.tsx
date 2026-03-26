@@ -1,4 +1,3 @@
-import React from 'react';
 import { Search, Sparkles } from 'lucide-react';
 import {
   Empty,
@@ -83,7 +82,7 @@ type PortalCodeReviewQuickFilter =
   | 'auto_fix_enabled';
 
 const QUICK_FILTERS: FilterOption<PortalCodeReviewQuickFilter>[] = [
-  { value: 'all', label: '全部结果' },
+  { value: 'all', label: '全部' },
   { value: 'pending_approval', label: '待审批' },
   { value: 'analyzing', label: '分析中' },
   { value: 'completed', label: '已完成' },
@@ -110,21 +109,17 @@ const resolveQuickFilter = ({
 
 function PortalCodeReviewLoadingState() {
   return (
-    <div className="grid gap-3">
+    <div className="space-y-3">
       {Array.from({ length: 3 }).map((_, index) => (
-        <div key={`review-skeleton-${index}`} className="rounded-xl border p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0 flex-1 space-y-2">
-              <Skeleton className="h-4 w-44" />
-              <Skeleton className="h-3 w-72" />
-            </div>
-            <Skeleton className="h-5 w-20" />
+        <div
+          key={`review-skeleton-${index}`}
+          className="flex items-center justify-between p-4 border rounded-xl"
+        >
+          <div className="space-y-2">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-3 w-48" />
           </div>
-          <div className="mt-4 flex flex-wrap gap-2">
-            <Skeleton className="h-5 w-24" />
-            <Skeleton className="h-5 w-20" />
-            <Skeleton className="h-5 w-28" />
-          </div>
+          <Skeleton className="h-7 w-20 rounded-full" />
         </div>
       ))}
     </div>
@@ -148,9 +143,7 @@ function PortalCodeReviewEmptyState({
         )}
       </EmptyMedia>
       <EmptyContent>
-        <EmptyTitle>
-          {hasFilters ? '没有匹配条件的审查运行' : '当前仓库还没有审查运行'}
-        </EmptyTitle>
+        <EmptyTitle>{hasFilters ? '没有匹配结果' : '暂无评审记录'}</EmptyTitle>
         <EmptyDescription>{message}</EmptyDescription>
       </EmptyContent>
     </Empty>
@@ -170,69 +163,70 @@ export function PortalCodeReviewFilters({
   const quickFilter = resolveQuickFilter({ statusFilter, modeFilter });
 
   return (
-    <div className="py-1">
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="relative flex-1 min-w-[160px]">
-          <InputGroup>
-            <InputGroupInput
-              disabled={showLoadingState}
-              placeholder="搜索审查结果..."
-              value={searchQuery}
-              onChange={(event) => onSearchQueryChange(event.target.value)}
-            />
-            <InputGroupAddon>
-              <Search />
-            </InputGroupAddon>
-          </InputGroup>
-        </div>
-        <div className="shrink-0">
-          <Select
-            value={quickFilter}
-            onValueChange={(value) => {
-              const next = value as PortalCodeReviewQuickFilter;
-              if (next === 'pending_approval') {
-                onStatusFilterChange('all');
-                onModeFilterChange('pending_approval');
-                return;
-              }
-              if (next === 'review_only') {
-                onStatusFilterChange('all');
-                onModeFilterChange('review_only');
-                return;
-              }
-              if (next === 'auto_fix_enabled') {
-                onStatusFilterChange('all');
-                onModeFilterChange('auto_fix_enabled');
-                return;
-              }
-              if (
-                next === 'analyzing' ||
-                next === 'completed' ||
-                next === 'failed'
-              ) {
-                onStatusFilterChange(next as PortalCodeReviewStatusFilter);
-                onModeFilterChange('all');
-                return;
-              }
-              onStatusFilterChange('all');
-              onModeFilterChange('all');
-            }}
-          >
-            <SelectTrigger>
-              <SelectValue placeholder="筛选" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {QUICK_FILTERS.map((item) => (
-                  <SelectItem key={item.value} value={item.value}>
-                    {item.label}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-        </div>
+    <div className="flex items-center gap-2 pb-4">
+      <div className="relative flex-1">
+        <InputGroup>
+          <InputGroupInput
+            className="h-9 text-xs"
+            disabled={showLoadingState}
+            placeholder="搜索项目或分支..."
+            value={searchQuery}
+            onChange={(event) => onSearchQueryChange(event.target.value)}
+          />
+          <InputGroupAddon>
+            <Search className="size-3.5" />
+          </InputGroupAddon>
+        </InputGroup>
       </div>
+      <Select
+        value={quickFilter}
+        onValueChange={(value) => {
+          const next = value as PortalCodeReviewQuickFilter;
+          if (next === 'pending_approval') {
+            onStatusFilterChange('all');
+            onModeFilterChange('pending_approval');
+            return;
+          }
+          if (next === 'review_only') {
+            onStatusFilterChange('all');
+            onModeFilterChange('review_only');
+            return;
+          }
+          if (next === 'auto_fix_enabled') {
+            onStatusFilterChange('all');
+            onModeFilterChange('auto_fix_enabled');
+            return;
+          }
+          if (
+            next === 'analyzing' ||
+            next === 'completed' ||
+            next === 'failed'
+          ) {
+            onStatusFilterChange(next as PortalCodeReviewStatusFilter);
+            onModeFilterChange('all');
+            return;
+          }
+          onStatusFilterChange('all');
+          onModeFilterChange('all');
+        }}
+      >
+        <SelectTrigger className="h-9 w-[90px] text-xs">
+          <SelectValue placeholder="筛选" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectGroup>
+            {QUICK_FILTERS.map((item) => (
+              <SelectItem
+                key={item.value}
+                value={item.value}
+                className="text-xs"
+              >
+                {item.label}
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        </SelectContent>
+      </Select>
     </div>
   );
 }
@@ -248,7 +242,7 @@ export function PortalCodeReviewList({
   const showLoadingState = isLoading || !hasLoadedInitialData;
 
   return (
-    <div className="space-y-3">
+    <div className="flex flex-col">
       {showLoadingState ? (
         <PortalCodeReviewLoadingState />
       ) : visibleRuns.length === 0 ? (
@@ -257,7 +251,7 @@ export function PortalCodeReviewList({
           message={emptyStateMessage}
         />
       ) : (
-        <div className="grid gap-3">
+        <div className="space-y-2">
           {visibleRuns.map((run) => (
             <PortalCodeReviewRunCard
               key={run.id}

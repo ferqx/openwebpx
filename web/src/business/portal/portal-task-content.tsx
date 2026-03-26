@@ -1,14 +1,9 @@
-import React from 'react';
 import { Spinner } from '@/components/ui/spinner';
 import { TabsContent } from '@/components/ui/tabs';
 import { TaskListItem } from '@/components/task-list-item';
 import {
-  PortalCodeReviewFilters,
-  type PortalCodeReviewListProps,
   PortalCodeReviewList
 } from '@/business/portal/portal-code-review-list';
-import { PortalCodeReviewDetail } from '@/business/portal/portal-code-review-detail';
-import { type CodeReviewRunDetail } from '@/business/portal/code-review-types';
 import { statusLabel, type TaskItem } from '@/lib/tasks';
 
 type PortalTaskContentProps = {
@@ -18,28 +13,7 @@ type PortalTaskContentProps = {
   onTaskDelete: (item: TaskItem) => void;
   onTaskCancelRun: (item: TaskItem) => void;
   cancellingTaskId?: string | null;
-  codeReviewListProps: PortalCodeReviewListProps;
-  selectedCodeReviewRunId: number | null;
-  onBackFromCodeReviewDetail: () => void;
-  selectedCodeReviewRun: CodeReviewRunDetail | null;
-  selectedCodeReviewRunError: string | null;
-  isSelectedCodeReviewRunLoading: boolean;
-  onRetryCodeReviewRun: () => void | Promise<void>;
-  onPublishCodeReviewRun: (runId: number) => void | Promise<void>;
-  onContinueCodeReviewFix: (run: CodeReviewRunDetail) => void | Promise<void>;
-  onApproveCodeReviewFixRequest: (
-    fixRequestId: number,
-    runId: number
-  ) => void | Promise<void>;
-  onRejectCodeReviewFixRequest: (
-    fixRequestId: number,
-    runId: number
-  ) => void | Promise<void>;
-  canContinueCodeReviewFix: boolean;
-  continueCodeReviewFixHint?: string | null;
-  publishingCodeReviewRunIds?: Record<number, true>;
-  approvingCodeReviewFixRequestIds?: Record<number, true>;
-  rejectingCodeReviewFixRequestIds?: Record<number, true>;
+  codeReviewListProps: any;
 };
 
 export function PortalTaskContent({
@@ -50,21 +24,6 @@ export function PortalTaskContent({
   onTaskCancelRun,
   cancellingTaskId,
   codeReviewListProps,
-  selectedCodeReviewRunId,
-  onBackFromCodeReviewDetail,
-  selectedCodeReviewRun,
-  selectedCodeReviewRunError,
-  isSelectedCodeReviewRunLoading,
-  onRetryCodeReviewRun,
-  onPublishCodeReviewRun,
-  onContinueCodeReviewFix,
-  onApproveCodeReviewFixRequest,
-  onRejectCodeReviewFixRequest,
-  canContinueCodeReviewFix,
-  continueCodeReviewFixHint,
-  publishingCodeReviewRunIds,
-  approvingCodeReviewFixRequestIds,
-  rejectingCodeReviewFixRequestIds
 }: PortalTaskContentProps) {
   return (
     <>
@@ -109,32 +68,17 @@ export function PortalTaskContent({
           )}
         </div>
       </TabsContent>
+
       <TabsContent value="review">
-        <div className="min-h-95 pt-4">
-          <div className="space-y-4">
-            <PortalCodeReviewFilters {...codeReviewListProps} />
-            {selectedCodeReviewRunId === null ? (
-              <PortalCodeReviewList {...codeReviewListProps} />
-            ) : (
-              <PortalCodeReviewDetail
-                selectedRunId={selectedCodeReviewRunId}
-                run={selectedCodeReviewRun}
-                isLoading={isSelectedCodeReviewRunLoading}
-                errorMessage={selectedCodeReviewRunError}
-                onRetry={onRetryCodeReviewRun}
-                onBack={onBackFromCodeReviewDetail}
-                onPublishRun={onPublishCodeReviewRun}
-                onContinueFix={onContinueCodeReviewFix}
-                onApproveFixRequest={onApproveCodeReviewFixRequest}
-                onRejectFixRequest={onRejectCodeReviewFixRequest}
-                canContinueFix={canContinueCodeReviewFix}
-                continueFixHint={continueCodeReviewFixHint}
-                publishingRunIds={publishingCodeReviewRunIds}
-                approvingFixRequestIds={approvingCodeReviewFixRequestIds}
-                rejectingFixRequestIds={rejectingCodeReviewFixRequestIds}
-              />
-            )}
-          </div>
+        <div className="min-h-95 space-y-4 pt-4 pb-12">
+          <PortalCodeReviewList
+            visibleRuns={codeReviewListProps.visibleRuns}
+            selectedRunId={null}
+            onSelectRun={codeReviewListProps.onSelectRun}
+            isLoading={codeReviewListProps.isLoading}
+            hasLoadedInitialData={!codeReviewListProps.isLoading}
+            emptyStateMessage={codeReviewListProps.emptyStateMessage}
+          />
         </div>
       </TabsContent>
     </>

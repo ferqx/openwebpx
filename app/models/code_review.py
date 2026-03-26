@@ -235,6 +235,9 @@ class ReviewRun(Base):
     idempotency_key: Mapped[str] = mapped_column(
         sa.Text, nullable=False, unique=True, comment="幂等键"
     )
+    thread_id: Mapped[str | None] = mapped_column(
+        sa.Text, nullable=True, comment="关联的 Aegra 会话线程 ID"
+    )
     created_by_event_at: Mapped[datetime.datetime | None] = mapped_column(
         sa.DateTime(timezone=True), nullable=True, comment="事件创建时间"
     )

@@ -111,7 +111,8 @@ const toRunList = (payload: unknown): CodeReviewRunSummary[] => {
     (item.provider === 'github' || item.provider === 'gitlab') &&
     typeof item.event_type === 'string' &&
     typeof item.status === 'string' &&
-    typeof item.idempotency_key === 'string'
+    typeof item.idempotency_key === 'string' &&
+    (item.thread_id === undefined || item.thread_id === null || typeof item.thread_id === 'string')
   );
 };
 

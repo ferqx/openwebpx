@@ -11,7 +11,9 @@ import { Outlet, useLocation } from 'react-router-dom';
 export default function Dashboard() {
   const location = useLocation();
   const isPortalPage =
-    location.pathname === '/' || location.pathname.startsWith('/tasks/');
+    location.pathname === '/' ||
+    location.pathname.startsWith('/tasks/') ||
+    location.pathname.startsWith('/reviews/');
 
   return (
     <ThreadProvider>

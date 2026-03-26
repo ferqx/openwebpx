@@ -20,6 +20,14 @@ import { type CodeReviewFinding } from '@/business/portal/code-review-types';
 
 type FindingSeverityFilter = 'all' | 'high' | 'medium' | 'low' | 'info';
 
+const severityRank: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  info: 4
+};
+
 const getFindingSeverityClassName = (severity: string) => {
   switch (severity.toLowerCase()) {
     case 'high':
@@ -45,87 +53,90 @@ export function PortalCodeReviewFindings({
 }: PortalCodeReviewFindingsProps) {
   const [severityFilter, setSeverityFilter] =
     useState<FindingSeverityFilter>('all');
-  const [autoFixFilter, setAutoFixFilter] = useState<'all' | 'fixable'>('all');
   const [fileQuery, setFileQuery] = useState('');
 
-  const visibleFindings = useMemo(() => {
+  const sortedFindings = useMemo(() => {
     const normalizedQuery = fileQuery.trim().toLowerCase();
-    return findings.filter((finding) => {
-      const matchesSeverity =
-        severityFilter === 'all'
-          ? true
-          : finding.severity.toLowerCase() === severityFilter;
-      const matchesAutoFix =
-        autoFixFilter === 'fixable' ? finding.can_auto_fix : true;
-      const matchesFile =
-        normalizedQuery.length === 0
-          ? true
-          : (finding.file_path ?? '').toLowerCase().includes(normalizedQuery);
-      return matchesSeverity && matchesAutoFix && matchesFile;
-    });
-  }, [autoFixFilter, fileQuery, findings, severityFilter]);
+    return [...findings]
+      .filter((finding) => {
+        const matchesSeverity =
+          severityFilter === 'all'
+            ? true
+            : finding.severity.toLowerCase() === severityFilter;
+        const matchesFile =
+          normalizedQuery.length === 0
+            ? true
+            : (finding.file_path ?? '').toLowerCase().includes(normalizedQuery);
+        return matchesSeverity && matchesFile;
+      })
+      .sort((left, right) => {
+        const leftRank = severityRank[left.severity.toLowerCase()] ?? Number.MAX_SAFE_INTEGER;
+        const rightRank = severityRank[right.severity.toLowerCase()] ?? Number.MAX_SAFE_INTEGER;
+        if (leftRank !== rightRank) {
+          return leftRank - rightRank;
+        }
+        return left.id - right.id;
+      });
+  }, [fileQuery, findings, severityFilter]);
 
   return (
     <div className="space-y-4">
-      <div className="rounded-xl border bg-card p-3 shadow-sm">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-          <div className="flex-1">
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                id="finding-search"
-                aria-label="搜索文件路径"
-                className="h-9 pl-9 text-sm"
-                placeholder={`筛选文件 (共 ${findings.length} 项)`}
-                value={fileQuery}
-                onChange={(event) => setFileQuery(event.target.value)}
-              />
-            </div>
+      <div className="rounded-xl border bg-card p-3">
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span>筛选结果</span>
+            <span>显示 {sortedFindings.length} / {findings.length}</span>
           </div>
-          <div className="flex shrink-0 gap-2">
-            <Select
-              value={severityFilter}
-              onValueChange={(value) =>
-                setSeverityFilter(value as FindingSeverityFilter)
-              }
-            >
-              <SelectTrigger aria-label="筛选级别" className="h-9 w-24 text-sm" size="sm">
-                <SelectValue placeholder="级别" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部级别</SelectItem>
-                <SelectItem value="high">高</SelectItem>
-                <SelectItem value="medium">中</SelectItem>
-                <SelectItem value="low">低</SelectItem>
-              </SelectContent>
-            </Select>
-            <Select
-              value={autoFixFilter}
-              onValueChange={(value) =>
-                setAutoFixFilter(value as 'all' | 'fixable')
-              }
-            >
-              <SelectTrigger aria-label="筛选修复能力" className="h-9 w-28 text-sm" size="sm">
-                <SelectValue placeholder="修复" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部发现</SelectItem>
-                <SelectItem value="fixable">可修复</SelectItem>
-              </SelectContent>
-            </Select>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+            <div className="flex-1">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  id="finding-search"
+                  aria-label="搜索文件路径"
+                  className="h-9 pl-9 text-sm"
+                  placeholder="搜索文件路径"
+                  value={fileQuery}
+                  onChange={(event) => setFileQuery(event.target.value)}
+                />
+              </div>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <Select
+                value={severityFilter}
+                onValueChange={(value) =>
+                  setSeverityFilter(value as FindingSeverityFilter)
+                }
+              >
+                <SelectTrigger aria-label="筛选级别" className="h-9 w-24 text-sm" size="sm">
+                  <SelectValue placeholder="级别" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部级别</SelectItem>
+                  <SelectItem value="high">高</SelectItem>
+                  <SelectItem value="medium">中</SelectItem>
+                  <SelectItem value="low">低</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
         </div>
       </div>
 
-      {visibleFindings.length === 0 ? (
+      {sortedFindings.length === 0 ? (
         <Card size="sm">
           <CardContent className="py-10 text-center text-sm text-muted-foreground">
             当前没有匹配条件的审查发现
           </CardContent>
         </Card>
       ) : (
-        <Accordion className="space-y-3" type="multiple">
-          {visibleFindings.map((finding) => {
+        <Accordion
+          className="space-y-3"
+          type="single"
+          collapsible
+          defaultValue={sortedFindings[0]?.id ? `finding-${sortedFindings[0].id}` : undefined}
+        >
+          {sortedFindings.map((finding) => {
             const itemKey = `finding-${finding.id}`;
             const lineRange =
               finding.line_start === null
@@ -145,18 +156,17 @@ export function PortalCodeReviewFindings({
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge
                         variant="outline"
-                        className={getFindingSeverityClassName(finding.severity)}
+                        className={`${getFindingSeverityClassName(finding.severity)} h-5 px-2 text-[11px]`}
                       >
                         {finding.severity}
                       </Badge>
                       {finding.can_auto_fix ? (
-                        <Badge variant="outline">可自动修复</Badge>
-                      ) : null}
-                      {finding.rule_id ? (
-                        <Badge variant="outline">{finding.rule_id}</Badge>
+                        <Badge variant="outline" className="h-5 px-2 text-[11px]">可自动修复</Badge>
                       ) : null}
                       {findingStatusById[finding.id] ? (
-                        <Badge variant="outline">{findingStatusById[finding.id]}</Badge>
+                        <Badge variant="outline" className="h-5 px-2 text-[11px]">
+                          {findingStatusById[finding.id]}
+                        </Badge>
                       ) : null}
                     </div>
                     <div className="space-y-1 text-left">
@@ -175,6 +185,11 @@ export function PortalCodeReviewFindings({
                     <p className="whitespace-pre-wrap text-foreground">
                       {finding.body ?? '暂无附加说明'}
                     </p>
+                    {finding.rule_id ? (
+                      <p className="text-xs text-muted-foreground">
+                        规则 {finding.rule_id}
+                      </p>
+                    ) : null}
                     {finding.category ? (
                       <p className="text-xs text-muted-foreground">
                         分类 {finding.category}

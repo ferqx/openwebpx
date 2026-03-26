@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from app.models.code_review import (
     RepositoryReviewConfig,
@@ -15,6 +18,10 @@ from app.models.code_review import (
     ReviewRun,
     ReviewRunStatus,
 )
+from app.services.code_review.agent_adapter import (
+    CodeReviewAgentAdapter,
+    code_review_agent_adapter,
+)
 from app.services.code_review.run_service import (
     CodeReviewRunService,
     code_review_run_service,
@@ -23,6 +30,9 @@ from app.services.code_review.timeline_service import (
     CodeReviewTimelineService,
     code_review_timeline_service,
 )
+from app.services.scm.repository import scm_repository_service
+
+logger = logging.getLogger(__name__)
 
 
 def _as_lower_text(value: Any) -> str:
@@ -61,9 +71,11 @@ class CodeReviewAnalyzerService:
         *,
         run_service: CodeReviewRunService = code_review_run_service,
         timeline_service: CodeReviewTimelineService = code_review_timeline_service,
+        agent_adapter: CodeReviewAgentAdapter = code_review_agent_adapter,
     ) -> None:
         self.run_service = run_service
         self.timeline_service = timeline_service
+        self.agent_adapter = agent_adapter
 
     async def analyze_run(
         self,
@@ -80,6 +92,13 @@ class CodeReviewAnalyzerService:
 
             if run.status in {ReviewRunStatus.COMPLETED, ReviewRunStatus.FAILED}:
                 return await self.run_service._serialize_run_with_events(  # noqa: SLF001
+                    session=session,
+                    run=run,
+                )
+
+            # 如果没有传入外部分析结果，则启动真实的 AI 分析
+            if analysis_result is None:
+                analysis_result = await self._perform_ai_analysis(
                     session=session,
                     run=run,
                 )
@@ -158,6 +177,11 @@ class CodeReviewAnalyzerService:
 
             session.add_all(findings)
             session.add_all(fix_requests)
+
+            # 更新 thread_id (如果由适配器生成)
+            if analysis_result.get("thread_id"):
+                run.thread_id = analysis_result["thread_id"]
+
             for finding in findings:
                 if (
                     config is not None
@@ -183,12 +207,14 @@ class CodeReviewAnalyzerService:
                 session=session,
                 run_id=run_id,
                 result_payload={
-                    "analysis_mode": "deterministic_stub",
+                    "analysis_mode": analysis_result.get("analysis_mode", "ai_agent"),
                     "findings_count": len(findings),
                     "auto_fix_request_count": len(fix_requests),
+                    "thread_id": run.thread_id,
                 },
             )
         except Exception as exc:  # noqa: BLE001
+            logger.exception(f"Review analysis failed for run {run_id}")
             await session.rollback()
             return await self.run_service.fail_run(
                 session=session,
@@ -199,12 +225,100 @@ class CodeReviewAnalyzerService:
                 },
             )
 
+    async def _perform_ai_analysis(
+        self,
+        *,
+        session: AsyncSession,
+        run: ReviewRun,
+    ) -> dict[str, Any]:
+        """核心 AI 分析流程：获取 Diff -> 调用 Agent Adapter -> 返回 Findings."""
+        normalized_event = await self._load_normalized_event(session=session, run=run)
+
+        # 1. 获取 SCM 凭证 (Token)
+        # 优先级：环境变量 (测试用) > 数据库 (正式用)
+        token = os.getenv("TEST_GITLAB_TOKEN")
+        user_id = "test-user"  # 默认测试用户
+
+        if not token:
+            # 尝试从数据库获取 Token
+            try:
+                # 这里假设我们使用第一个关联的用户 Token
+                from aegra_api.core.crypto import decrypt_payload
+
+                from app.models.scm_token import ScmToken
+
+                result = await session.execute(
+                    select(ScmToken).where(ScmToken.provider == run.provider).limit(1)
+                )
+                scm_token_record = result.scalar_one_or_none()
+                if scm_token_record:
+                    decrypted = decrypt_payload(
+                        scm_token_record.encrypted_token_payload
+                    )
+                    token = decrypted.get("access_token")
+                    user_id = scm_token_record.user_id
+            except Exception as e:
+                logger.warning(f"Failed to fetch token from store: {e}")
+
+        # 终极 Fallback：如果还是没有（常发生在 Webhook 异步 worker 中）
+        if not token:
+            # 此时应抛出错误，引导用户配置环境变量或数据库记录
+            raise ValueError("No SCM token available for analysis (checked env and DB)")
+
+        # 2. 获取 Diff 内容
+        diff = ""
+        repo_name = normalized_event.get("repository_full_name")
+        mr_iid = normalized_event.get("external_pr_or_mr_id")
+
+        if not repo_name or not mr_iid:
+            logger.warning(f"Missing repo metadata in event: {normalized_event}")
+            return {"status": "success", "findings": [], "analysis_mode": "no_context"}
+
+        if run.provider == "gitlab":
+            diff = await scm_repository_service.get_gitlab_mr_diff(
+                repository=repo_name,
+                mr_iid=int(mr_iid),
+                access_token=token,
+                gitlab_base_url=run.repository_integration.gitlab_base_url,
+            )
+        elif run.provider == "github":
+            diff = await scm_repository_service.get_github_pr_diff(
+                repository=repo_name,
+                pr_number=int(mr_iid),
+                access_token=token,
+            )
+
+        if not diff.strip():
+            logger.info(f"No diff found for MR {mr_iid} in {repo_name}")
+            return {"status": "success", "findings": [], "analysis_mode": "empty_diff"}
+
+        logger.info(f"Analyzing diff (length: {len(diff)} characters)")
+        # 3. 调用 Agent 适配器
+        findings, thread_id = await self.agent_adapter.run_analysis(
+            session=session,
+            diff=diff,
+            user_id=user_id,
+            run_id=run.id,
+            thread_id=run.thread_id,
+        )
+
+        return {
+            "status": "success",
+            "findings": findings,
+            "thread_id": thread_id,
+            "analysis_mode": "ai_agent",
+        }
+
     async def _load_run(self, *, session: AsyncSession, run_id: int) -> ReviewRun:
-        result = await session.scalars(select(ReviewRun))
-        for run in result.all():
-            if run.id == run_id:
-                return run
-        raise ValueError(f"review run {run_id} not found")
+        result = await session.execute(
+            select(ReviewRun)
+            .options(joinedload(ReviewRun.repository_integration))
+            .where(ReviewRun.id == run_id)
+        )
+        run = result.scalar_one_or_none()
+        if not run:
+            raise ValueError(f"review run {run_id} not found")
+        return run
 
     async def _load_repository_config(
         self,
@@ -214,11 +328,13 @@ class CodeReviewAnalyzerService:
     ) -> RepositoryReviewConfig | None:
         if repository_integration_id is None:
             return None
-        result = await session.scalars(select(RepositoryReviewConfig))
-        for config in result.all():
-            if config.repository_integration_id == repository_integration_id:
-                return config
-        return None
+        result = await session.execute(
+            select(RepositoryReviewConfig).where(
+                RepositoryReviewConfig.repository_integration_id
+                == repository_integration_id
+            )
+        )
+        return result.scalar_one_or_none()
 
     async def _load_normalized_event(
         self,
@@ -259,26 +375,7 @@ class CodeReviewAnalyzerService:
                     for item in findings
                 ]
 
-        return [
-            {
-                "severity": "medium",
-                "category": "maintainability",
-                "file_path": "src/app.py",
-                "line_start": 1,
-                "line_end": 1,
-                "title": "Stub code review finding",
-                "body": "Deterministic phase-1 analyzer finding",
-                "rule_id": "stub.review.rule",
-                "metadata": {
-                    "auto_fixable": True,
-                    "provider": normalized_event.get("provider"),
-                    "provider_event_type": normalized_event.get("provider_event_type"),
-                    "repository_identity_key": normalized_event.get(
-                        "repository_identity_key"
-                    ),
-                },
-            }
-        ]
+        return []
 
     def _normalize_finding_spec(
         self,
@@ -295,14 +392,13 @@ class CodeReviewAnalyzerService:
         line_start = value.get("line_start")
         line_end = value.get("line_end")
         title = (
-            str(value.get("title") or "Stub code review finding").strip()
-            or "Stub code review finding"
+            str(value.get("title") or "Code review finding").strip()
+            or "Code review finding"
         )
         body = value.get("body")
         body_text = str(body).strip() if body is not None else None
         rule_id = (
-            str(value.get("rule_id") or "stub.review.rule").strip()
-            or "stub.review.rule"
+            str(value.get("rule_id") or "ai.review.rule").strip() or "ai.review.rule"
         )
         metadata = value.get("metadata")
         if not isinstance(metadata, dict):
@@ -320,7 +416,7 @@ class CodeReviewAnalyzerService:
             "line_start": line_start if isinstance(line_start, int) else 1,
             "line_end": line_end if isinstance(line_end, int) else 1,
             "title": title,
-            "body": body_text or "Deterministic phase-1 analyzer finding",
+            "body": body_text or "AI generated finding",
             "rule_id": rule_id,
             "metadata": metadata,
         }

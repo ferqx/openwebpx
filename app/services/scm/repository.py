@@ -282,6 +282,194 @@ class ScmRepositoryService:
             ]
             return branches
 
+    async def get_github_pr_diff(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        access_token: str,
+    ) -> str:
+        """获取 GitHub PR 的 diff 内容."""
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            try:
+                response = await http_client.get(
+                    f"https://api.github.com/repos/{repository}/pulls/{pr_number}",
+                    headers={
+                        "Accept": "application/vnd.github.v3.diff",
+                        "Authorization": f"Bearer {access_token}",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitHub PR Diff 查询", exc)
+            if response.status_code >= 400:
+                raise HTTPException(
+                    response.status_code,
+                    f"GitHub PR Diff 查询失败: {response.text[:200]}",
+                )
+            return response.text
+
+    async def get_gitlab_mr_diff(
+        self,
+        *,
+        repository: str,
+        mr_iid: int,
+        access_token: str,
+        gitlab_base_url: str | None,
+    ) -> str:
+        """获取 GitLab MR 的 diff 内容."""
+        resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
+        encoded_repo = quote(repository, safe="")
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            try:
+                # GitLab 提供了一个专门的比较接口，或者可以直接获取 raw diff
+                response = await http_client.get(
+                    f"{resolved_base_url}/api/v4/projects/{encoded_repo}/merge_requests/{mr_iid}/diffs",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab MR Diff 查询", exc)
+            if response.status_code >= 400:
+                raise HTTPException(
+                    response.status_code,
+                    f"GitLab MR Diff 查询失败: {response.text[:200]}",
+                )
+
+            diffs = response.json()
+            if not isinstance(diffs, list):
+                return ""
+
+            # 将所有文件的 diff 拼接起来
+            full_diff = []
+            for d in diffs:
+                file_path = d.get("new_path") or d.get("old_path")
+                diff_content = d.get("diff")
+                if file_path and diff_content:
+                    full_diff.append(
+                        f"--- {file_path}\n+++ {file_path}\n{diff_content}"
+                    )
+
+            return "\n".join(full_diff)
+
+    async def post_gitlab_mr_comment(
+        self,
+        *,
+        repository: str,
+        mr_iid: int,
+        body: str,
+        access_token: str,
+        gitlab_base_url: str | None,
+    ) -> dict[str, Any]:
+        """在 GitLab MR 上发表普通评论."""
+        resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
+        encoded_repo = quote(repository, safe="")
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            try:
+                response = await http_client.post(
+                    f"{resolved_base_url}/api/v4/projects/{encoded_repo}/merge_requests/{mr_iid}/notes",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={"body": body},
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab MR 评论发布", exc)
+            if response.status_code >= 400:
+                raise HTTPException(
+                    response.status_code,
+                    f"GitLab MR 评论发布失败: {response.text[:200]}",
+                )
+            return response.json()
+
+    async def list_gitlab_mr_comments(
+        self,
+        *,
+        repository: str,
+        mr_iid: int,
+        access_token: str,
+        gitlab_base_url: str | None,
+    ) -> list[dict[str, Any]]:
+        """获取 GitLab MR 的所有普通评论."""
+        resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
+        encoded_repo = quote(repository, safe="")
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            try:
+                response = await http_client.get(
+                    f"{resolved_base_url}/api/v4/projects/{encoded_repo}/merge_requests/{mr_iid}/notes?sort=desc&per_page=50",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab MR 评论查询", exc)
+            if response.status_code >= 400:
+                return []
+            return response.json()
+
+    async def update_gitlab_mr_comment(
+        self,
+        *,
+        repository: str,
+        mr_iid: int,
+        note_id: int,
+        body: str,
+        access_token: str,
+        gitlab_base_url: str | None,
+    ) -> dict[str, Any]:
+        """更新 GitLab MR 上的已有评论."""
+        resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
+        encoded_repo = quote(repository, safe="")
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            try:
+                response = await http_client.put(
+                    f"{resolved_base_url}/api/v4/projects/{encoded_repo}/merge_requests/{mr_iid}/notes/{note_id}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={"body": body},
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab MR 评论更新", exc)
+            if response.status_code >= 400:
+                raise HTTPException(
+                    response.status_code,
+                    f"GitLab MR 评论更新失败: {response.text[:200]}",
+                )
+            return response.json()
+
+    async def register_gitlab_webhook(
+        self,
+        *,
+        repository: str,
+        webhook_url: str,
+        secret_token: str,
+        access_token: str,
+        gitlab_base_url: str | None,
+    ) -> dict[str, Any]:
+        """为 GitLab 项目注册 Webhook."""
+        resolved_base_url = _normalize_gitlab_base_url(gitlab_base_url)
+        encoded_repo = quote(repository, safe="")
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            try:
+                response = await http_client.post(
+                    f"{resolved_base_url}/api/v4/projects/{encoded_repo}/hooks",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={
+                        "url": webhook_url,
+                        "secret_token": secret_token,
+                        "merge_requests_events": True,
+                        "push_events": True,
+                        "note_events": False,
+                        "enable_ssl_verification": True,
+                    },
+                )
+            except httpx.HTTPError as exc:
+                _raise_upstream_connect_error("GitLab Webhook 注册", exc)
+
+            if response.status_code == 409:
+                return {"message": "Webhook already exists"}
+
+            if response.status_code >= 400:
+                raise HTTPException(
+                    response.status_code,
+                    f"GitLab Webhook 注册失败: {response.text[:200]}",
+                )
+            return response.json()
+
 
 # Global singleton instance
 scm_repository_service = ScmRepositoryService()

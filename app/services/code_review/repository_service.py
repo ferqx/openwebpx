@@ -188,22 +188,10 @@ class CodeReviewRepositoryService:
         self,
         *,
         session: AsyncSession,
-        current_user: Any,
+        _current_user: Any,
     ) -> list[dict[str, Any]]:
-        user_id = _resolve_user_identity(current_user)
         integrations = await self._load_integrations(session)
-        memberships = await self._load_memberships(session)
-
-        visible_ids = {
-            membership.repository_integration_id
-            for membership in memberships
-            if membership.user_id == user_id
-            and membership.repository_integration_id is not None
-        }
-        visible_integrations = [
-            integration for integration in integrations if integration.id in visible_ids
-        ]
-        visible_integrations.sort(key=lambda item: item.id or 0)
+        integrations.sort(key=lambda item: item.id or 0)
         config_by_repository_id = {
             config.repository_integration_id: config
             for config in await self._load_configs(session)
@@ -214,7 +202,7 @@ class CodeReviewRepositoryService:
                 integration,
                 config=config_by_repository_id.get(integration.id),
             )
-            for integration in visible_integrations
+            for integration in integrations
         ]
 
     async def get_repository_config(
@@ -505,8 +493,8 @@ class CodeReviewRepositoryService:
                 membership = RepositoryMembership(
                     repository_integration=integration,
                     user_id=user_id,
-                    role=None,
-                    can_approve_fixes=False,
+                    role="owner",  # 标记为 owner
+                    can_approve_fixes=True,  # 长期方案：同步者默认拥有审批权
                     created_at=now,
                     updated_at=now,
                 )

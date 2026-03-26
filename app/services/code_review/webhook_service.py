@@ -98,7 +98,11 @@ class CodeReviewWebhookService:
             "OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET",
         )
         token_header = headers.get("X-Gitlab-Token")
-        if not verify_gitlab_webhook_token(secret=secret, token_header=token_header):
+
+        # 只有在配置了密钥的情况下才进行验证
+        if secret and not verify_gitlab_webhook_token(
+            secret=secret, token_header=token_header
+        ):
             raise HTTPException(401, "GitLab webhook token invalid")
 
         gitlab_base_url = headers.get("X-Gitlab-Instance")
@@ -121,6 +125,11 @@ class CodeReviewWebhookService:
         session: AsyncSession,
         normalized_event: dict[str, Any],
     ) -> dict[str, Any]:
+        # 防止死循环：如果提交信息中包含 [AI Fix] 标记，则跳过评审
+        commit_message = normalized_event.get("head_commit_message") or ""
+        if "[AI Fix]" in commit_message:
+            return {"ok": True, "skipped": True, "reason": "AI fix commit detected"}
+
         integration = await self._find_repository_integration(
             session=session,
             provider=str(normalized_event["provider"]),
@@ -154,6 +163,14 @@ class CodeReviewWebhookService:
             return self._serialize_run(existing_run, queued=False)
 
         now = datetime.now(UTC)
+
+        # 预先创建一个 Aegra Thread
+        from aegra_api.core.orm import Thread as ThreadORM
+
+        new_thread = ThreadORM()
+        session.add(new_thread)
+        await session.flush()
+
         run = ReviewRun(
             repository_integration_id=integration.id,
             provider=str(normalized_event["provider"]),
@@ -166,6 +183,7 @@ class CodeReviewWebhookService:
             head_branch=normalized_event.get("head_branch"),
             status=ReviewRunStatus.QUEUED,
             idempotency_key=idempotency_key,
+            thread_id=str(new_thread.thread_id),  # 关联 Thread ID
             created_by_event_at=now,
             created_at=now,
             updated_at=now,

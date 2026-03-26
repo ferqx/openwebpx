@@ -68,13 +68,11 @@ export const getLatestTimelineEvent = (events: CodeReviewTimelineEvent[]) => {
 
 type PortalCodeReviewSidebarProps = {
   run: CodeReviewRunDetail;
-  onPublishRun: (runId: number) => void | Promise<void>;
   onContinueFix: (run: CodeReviewRunDetail) => void | Promise<void>;
   onApproveFixRequest: (fixRequestId: number, runId: number) => void | Promise<void>;
   onRejectFixRequest: (fixRequestId: number, runId: number) => void | Promise<void>;
   canContinueFix: boolean;
   continueFixHint?: string | null;
-  publishingRunIds?: Record<number, true>;
   approvingFixRequestIds?: Record<number, true>;
   rejectingFixRequestIds?: Record<number, true>;
   layout?: 'full' | 'compact' | 'timeline';
@@ -99,13 +97,11 @@ const getFixRequestStatusMeta = (status: CodeReviewFixRequest['status']) => {
 
 export function PortalCodeReviewSidebar({
   run,
-  onPublishRun,
   onContinueFix,
   onApproveFixRequest,
   onRejectFixRequest,
   canContinueFix,
   continueFixHint,
-  publishingRunIds = {},
   approvingFixRequestIds = {},
   rejectingFixRequestIds = {},
   layout = 'full'
@@ -131,40 +127,29 @@ export function PortalCodeReviewSidebar({
       <div className="space-y-4">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
           <div className="flex flex-1 items-center gap-2">
-            <Badge variant="outline" className={statusMeta.className}>
+            <Badge variant="outline" className={`${statusMeta.className} h-5 px-2 text-[11px]`}>
               {statusMeta.label}
             </Badge>
-            <Badge variant="outline" className={modeMeta.className}>
+            <Badge variant="outline" className={`${modeMeta.className} h-5 px-2 text-[11px]`}>
               {modeMeta.label}
             </Badge>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          {showContinueFix ? (
             <Button
               type="button"
               size="sm"
-              disabled={run.status !== 'completed' || Boolean(publishingRunIds[run.id])}
-              onClick={() => void onPublishRun(run.id)}
+              disabled={!canContinueFix}
+              onClick={() => void onContinueFix(run)}
             >
-              Publish
+              继续修复
             </Button>
-            {showContinueFix ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={!canContinueFix}
-                onClick={() => void onContinueFix(run)}
-              >
-                继续修复
-              </Button>
-            ) : null}
-          </div>
+          ) : null}
         </div>
 
         {pendingFixRequests.length > 0 ? (
           <div className="space-y-3">
             <p className="text-xs font-medium text-amber-700">待处理修复请求 ({pendingFixRequests.length})</p>
-            <div className="grid gap-3 sm:grid-cols-2">
+            <div className="rounded-xl border bg-card">
               {pendingFixRequests.map((fixRequest) => {
                 const finding = fixRequest.review_finding_id
                   ? findingsById.get(fixRequest.review_finding_id)
@@ -174,36 +159,39 @@ export function PortalCodeReviewSidebar({
                 return (
                   <div
                     key={fixRequest.id}
-                    className="flex flex-col justify-between gap-3 rounded-lg border bg-amber-50/50 p-3"
+                    className="flex flex-col gap-3 border-b px-4 py-3 last:border-b-0 lg:flex-row lg:items-center lg:justify-between"
                   >
-                    <div className="space-y-1">
+                    <div className="min-w-0 space-y-1">
                       <p className="line-clamp-1 text-sm font-medium text-foreground">
                         {finding?.title ?? `修复请求 #${fixRequest.id}`}
                       </p>
-                      <p className="line-clamp-1 text-[10px] text-muted-foreground">
-                        {finding?.file_path ?? '未关联文件'}
-                      </p>
+                      <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                        <span className="line-clamp-1">
+                          {finding?.file_path ?? '未关联文件'}
+                        </span>
+                        <span>·</span>
+                        <span>Fix #{fixRequest.id}</span>
+                      </div>
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex gap-2 lg:w-auto">
                       <Button
                         type="button"
                         variant="outline"
                         size="sm"
-                        className="h-8 flex-1 bg-background text-xs"
-                        disabled={isApproving || isRejecting}
-                        onClick={() => void onApproveFixRequest(fixRequest.id, run.id)}
-                      >
-                        Approve
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        className="h-8 flex-1 bg-background text-xs"
+                        className="h-8 flex-1 bg-background text-xs lg:flex-none"
                         disabled={isApproving || isRejecting}
                         onClick={() => void onRejectFixRequest(fixRequest.id, run.id)}
                       >
-                        Reject
+                        {isRejecting ? '处理中...' : '暂不执行'}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="h-8 flex-1 text-xs lg:flex-none"
+                        disabled={isApproving || isRejecting}
+                        onClick={() => void onApproveFixRequest(fixRequest.id, run.id)}
+                      >
+                        {isApproving ? '处理中...' : '批准执行'}
                       </Button>
                     </div>
                   </div>
@@ -337,18 +325,9 @@ export function PortalCodeReviewSidebar({
               </p>
             </div>
           ) : null}
-          <Button
-            type="button"
-            className="w-full"
-            disabled={run.status !== 'completed' || Boolean(publishingRunIds[run.id])}
-            onClick={() => void onPublishRun(run.id)}
-          >
-            Publish
-          </Button>
           {showContinueFix ? (
             <Button
               type="button"
-              variant="outline"
               className="w-full"
               disabled={!canContinueFix}
               onClick={() => void onContinueFix(run)}
@@ -380,11 +359,11 @@ export function PortalCodeReviewSidebar({
                     <div className="grid grid-cols-2 gap-2">
                       <Button
                         type="button"
-                        variant="outline"
+                        variant="default"
                         disabled={isApproving || isRejecting}
                         onClick={() => void onApproveFixRequest(fixRequest.id, run.id)}
                       >
-                        Approve
+                        {isApproving ? '处理中...' : '批准执行'}
                       </Button>
                       <Button
                         type="button"
@@ -392,7 +371,7 @@ export function PortalCodeReviewSidebar({
                         disabled={isApproving || isRejecting}
                         onClick={() => void onRejectFixRequest(fixRequest.id, run.id)}
                       >
-                        Reject
+                        {isRejecting ? '处理中...' : '暂不执行'}
                       </Button>
                     </div>
                   </div>
