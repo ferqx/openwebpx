@@ -1,14 +1,12 @@
 import { PortalCodeReviewContinueFixDialog } from '@/business/portal/portal-code-review-continue-fix-dialog';
 import { PortalCodeReviewDetail } from '@/business/portal/portal-code-review-detail';
-import { PortalHeader } from '@/business/portal/portal-header';
 import { getReviewModeMeta, getReviewStatusMeta } from '@/business/portal/portal-code-review-run-card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
+import { Separator } from '@/components/ui/separator';
 import { usePortalCodeReviewContinuation } from '@/hooks/use-portal-code-review-continuation';
 import { resolvePortalCodeReviewMode, usePortalCodeReviewState } from '@/hooks/use-portal-code-review-state';
 import { mapThreadToTaskItem } from '@/lib/tasks';
-import { useAuth } from '@/provider/auth';
 import { useThreads } from '@/provider/thread';
 import { ArrowLeft } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
@@ -16,7 +14,6 @@ import { useNavigate, useParams } from 'react-router-dom';
 
 export function ReviewDetailPage() {
   const navigate = useNavigate();
-  const { logout } = useAuth();
   const { id } = useParams();
   const reviewId = Number(id);
   const { threads, getThreads } = useThreads();
@@ -66,65 +63,38 @@ export function ReviewDetailPage() {
 
   return (
     <main className="relative h-full overflow-auto bg-background">
-      <div className="relative px-4 pb-8 md:px-8">
-        <div className="sticky top-0 z-10 space-y-4 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-          <PortalHeader
-            onLogoClick={() => navigate('/')}
-            onSettingsClick={() => navigate('/settings?tab=code-review')}
-            onLogout={() => logout()}
-            showSettingsButton={false}
-          />
-        </div>
-
-        <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 pt-4">
-          <section className="space-y-3">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-8 w-fit px-2 text-muted-foreground"
-              onClick={handleBack}
-            >
-              <ArrowLeft className="size-4" />
-              返回代码审查
-            </Button>
-
-            <div className="space-y-1">
-              <h1 className="text-xl font-semibold tracking-tight text-foreground">
-                代码审查详情
-              </h1>
-              <p className="text-sm text-muted-foreground">
-                先看审查结果，再决定是否修复。
-              </p>
-            </div>
-          </section>
-
-          <section>
-            <Card>
-              <CardContent className="flex flex-col gap-3 p-4">
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="space-y-1">
-                    <div className="text-sm font-medium text-foreground">当前审查</div>
-                    <div className="text-sm font-medium text-foreground">
-                      {run?.repository?.full_name ?? '正在加载仓库信息'}
-                    </div>
-                  </div>
-                  {statusMeta ? (
-                    <Badge variant="outline" className={`${statusMeta.className} h-5 px-2 text-[11px]`}>
-                      {statusMeta.label}
-                    </Badge>
-                  ) : null}
+      <header className="sticky top-0 z-10 border-b bg-background/95 backdrop-blur">
+        <div className="flex w-full flex-col gap-2 px-4 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-lg"
+                aria-label="返回代码审查"
+                onClick={handleBack}
+              >
+                <ArrowLeft className="size-5" />
+              </Button>
+              <Separator orientation="vertical" />
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <p className="truncate text-sm font-medium">当前审查</p>
+                  <span className="text-muted-foreground">·</span>
+                  <p className="truncate text-sm text-muted-foreground">
+                    {run?.repository?.full_name ?? '正在加载仓库信息'}
+                  </p>
                 </div>
-                <div className="flex flex-wrap items-center gap-2 text-[13px] text-muted-foreground">
-                  {modeMeta ? (
-                    <Badge variant="outline" className={`${modeMeta.className} h-5 px-2 text-[11px]`}>
-                      {modeMeta.label}
-                    </Badge>
-                  ) : null}
-                  {run?.provider ? <span>{run.provider.toUpperCase()}</span> : null}
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] text-muted-foreground">
                   <span>Review #{run?.id ?? '--'}</span>
                   <span>·</span>
                   <span>MR/PR #{run?.external_pr_or_mr_id ?? '--'}</span>
+                  {run?.provider ? (
+                    <>
+                      <span>·</span>
+                      <span>{run.provider.toUpperCase()}</span>
+                    </>
+                  ) : null}
                   <span>·</span>
                   <span>{run?.findings.length ?? 0} 条发现</span>
                   <span>·</span>
@@ -134,7 +104,7 @@ export function ReviewDetailPage() {
                     <Button
                       type="button"
                       variant="link"
-                      className="h-auto px-0 text-[13px]"
+                      className="h-auto px-0 text-[13px] text-muted-foreground"
                       onClick={() => handleOpenThread(run.thread_id!)}
                     >
                       已关联线程
@@ -143,10 +113,26 @@ export function ReviewDetailPage() {
                     <span>未关联线程</span>
                   )}
                 </div>
-              </CardContent>
-            </Card>
-          </section>
+              </div>
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2 pt-0.5">
+              {statusMeta ? (
+                <Badge variant="outline" className={`${statusMeta.className} h-5 px-2 text-[11px]`}>
+                  {statusMeta.label}
+                </Badge>
+              ) : null}
+              {modeMeta ? (
+                <Badge variant="outline" className={`${modeMeta.className} h-5 px-2 text-[11px]`}>
+                  {modeMeta.label}
+                </Badge>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </header>
 
+      <div className="relative px-4 pb-8 pt-4 md:px-8 md:pt-6">
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-4">
           <PortalCodeReviewDetail
             run={run}
             selectedRunId={Number.isFinite(reviewId) && reviewId > 0 ? reviewId : null}

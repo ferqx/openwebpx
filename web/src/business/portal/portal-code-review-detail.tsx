@@ -164,10 +164,10 @@ export function PortalCodeReviewDetail({
   const pendingFixCount = run.fix_requests.filter(r => r.status === 'pending_approval').length;
 
   return (
-    <div className="flex h-full flex-col space-y-4 pb-6">
-      <Tabs defaultValue="findings" className="w-full flex-1">
-        <div className="mb-4 flex items-center justify-between">
-          <TabsList className="grid w-full max-w-[320px] grid-cols-2">
+    <div className="flex h-full flex-col space-y-3 pb-6">
+      <Tabs defaultValue="findings" className="w-full flex-1 gap-1.5">
+        <div className="mb-3 flex items-center justify-between">
+          <TabsList className="grid h-9 w-full max-w-[320px] grid-cols-2">
             <TabsTrigger value="findings" className="flex items-center gap-1.5 text-xs sm:text-sm">
               <LayoutList className="size-3.5" />
               评审报告 ({run.findings.length})
@@ -192,10 +192,15 @@ export function PortalCodeReviewDetail({
         </TabsContent>
 
         <TabsContent value="fixes" className="mt-0 focus-visible:ring-0">
-          <div className="rounded-xl border bg-card p-4">
-            <div className="mb-4 space-y-1">
-              <h3 className="text-base font-semibold">修复队列</h3>
-              <p className="text-sm text-muted-foreground">在这里处理待审批修复。</p>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between rounded-xl border bg-card/70 px-3 py-2.5">
+              <div className="space-y-0.5">
+                <h3 className="text-sm font-semibold">待处理修复</h3>
+                <p className="text-xs text-muted-foreground">先处理审批，再决定是否继续修复。</p>
+              </div>
+              <span className="text-xs text-muted-foreground">
+                {run.fix_requests.length} 项
+              </span>
             </div>
 
             <PortalCodeReviewSidebar
@@ -207,11 +212,11 @@ export function PortalCodeReviewDetail({
               continueFixHint={continueFixHint}
               approvingFixRequestIds={approvingFixRequestIds}
               rejectingFixRequestIds={rejectingFixRequestIds}
-              layout="compact" // 这里 Sidebar 内部逻辑会自动渲染待审批列表
+              layout="compact"
             />
 
             {run.fix_requests.length === 0 && (
-              <div className="flex flex-col items-center justify-center py-10 text-center">
+              <div className="flex flex-col items-center justify-center rounded-xl border bg-card px-6 py-8 text-center">
                 <div className="rounded-full bg-muted p-3">
                   <ClipboardList className="size-6 text-muted-foreground" />
                 </div>

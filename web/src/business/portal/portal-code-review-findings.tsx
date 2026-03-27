@@ -80,46 +80,39 @@ export function PortalCodeReviewFindings({
   }, [fileQuery, findings, severityFilter]);
 
   return (
-    <div className="space-y-4">
-      <div className="rounded-xl border bg-card p-3">
-        <div className="flex flex-col gap-3">
-          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-            <span>筛选结果</span>
-            <span>显示 {sortedFindings.length} / {findings.length}</span>
-          </div>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-            <div className="flex-1">
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  id="finding-search"
-                  aria-label="搜索文件路径"
-                  className="h-9 pl-9 text-sm"
-                  placeholder="搜索文件路径"
-                  value={fileQuery}
-                  onChange={(event) => setFileQuery(event.target.value)}
-                />
-              </div>
-            </div>
-            <div className="flex shrink-0 gap-2">
-              <Select
-                value={severityFilter}
-                onValueChange={(value) =>
-                  setSeverityFilter(value as FindingSeverityFilter)
-                }
-              >
-                <SelectTrigger aria-label="筛选级别" className="h-9 w-24 text-sm" size="sm">
-                  <SelectValue placeholder="级别" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">全部级别</SelectItem>
-                  <SelectItem value="high">高</SelectItem>
-                  <SelectItem value="medium">中</SelectItem>
-                  <SelectItem value="low">低</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
+    <div className="space-y-3">
+      <div className="flex flex-col gap-2 rounded-xl border bg-card/70 p-2.5 sm:flex-row sm:items-center">
+        <div className="relative flex-1">
+          <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            id="finding-search"
+            aria-label="搜索文件路径"
+            className="h-9 border-0 bg-background pl-9 text-sm shadow-none"
+            placeholder="搜索文件路径"
+            value={fileQuery}
+            onChange={(event) => setFileQuery(event.target.value)}
+          />
+        </div>
+        <div className="flex items-center gap-2 sm:justify-end">
+          <span className="min-w-fit text-xs text-muted-foreground">
+            {sortedFindings.length} / {findings.length}
+          </span>
+          <Select
+            value={severityFilter}
+            onValueChange={(value) =>
+              setSeverityFilter(value as FindingSeverityFilter)
+            }
+          >
+            <SelectTrigger aria-label="筛选级别" className="h-9 w-32 bg-background text-sm" size="sm">
+              <SelectValue placeholder="级别" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部级别</SelectItem>
+              <SelectItem value="high">高</SelectItem>
+              <SelectItem value="medium">中</SelectItem>
+              <SelectItem value="low">低</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
       </div>
 
@@ -131,7 +124,7 @@ export function PortalCodeReviewFindings({
         </Card>
       ) : (
         <Accordion
-          className="space-y-3"
+          className="space-y-2"
           type="single"
           collapsible
           defaultValue={sortedFindings[0]?.id ? `finding-${sortedFindings[0].id}` : undefined}
@@ -151,33 +144,31 @@ export function PortalCodeReviewFindings({
                 value={itemKey}
                 className="overflow-hidden rounded-xl border bg-card px-4"
               >
-                <AccordionTrigger className="cursor-pointer py-3 hover:no-underline">
-                  <div className="min-w-0 flex-1 space-y-2">
-                    <div className="flex flex-wrap items-center gap-2">
+                <AccordionTrigger className="cursor-pointer py-2 hover:no-underline">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex items-center gap-2 text-left">
                       <Badge
                         variant="outline"
-                        className={`${getFindingSeverityClassName(finding.severity)} h-5 px-2 text-[11px]`}
+                        className={`${getFindingSeverityClassName(finding.severity)} h-5 shrink-0 px-2 text-[11px]`}
                       >
                         {finding.severity}
                       </Badge>
+                      <p className="line-clamp-1 flex-1 text-sm font-medium text-foreground">
+                        {finding.title}
+                      </p>
                       {finding.can_auto_fix ? (
-                        <Badge variant="outline" className="h-5 px-2 text-[11px]">可自动修复</Badge>
+                        <Badge variant="outline" className="h-5 shrink-0 px-2 text-[11px]">可自动修复</Badge>
                       ) : null}
                       {findingStatusById[finding.id] ? (
-                        <Badge variant="outline" className="h-5 px-2 text-[11px]">
+                        <Badge variant="outline" className="h-5 shrink-0 px-2 text-[11px]">
                           {findingStatusById[finding.id]}
                         </Badge>
                       ) : null}
                     </div>
-                    <div className="space-y-1 text-left">
-                      <p className="text-sm font-medium text-foreground">
-                        {finding.title}
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        {finding.file_path ?? '未知文件'}
-                        {lineRange ? ` : ${lineRange}` : ''}
-                      </p>
-                    </div>
+                    <p className="line-clamp-1 text-xs text-muted-foreground">
+                      {finding.file_path ?? '未知文件'}
+                      {lineRange ? ` : ${lineRange}` : ''}
+                    </p>
                   </div>
                 </AccordionTrigger>
                 <AccordionContent>

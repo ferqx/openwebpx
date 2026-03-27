@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { readFile } from 'node:fs/promises';
 import { PortalCodeReviewDetail } from '../../../src/business/portal/portal-code-review-detail.tsx';
 import {
   getLatestTimelineEvent,
@@ -97,6 +98,14 @@ test('PortalCodeReviewDetail renders findings and timeline for selected run', ()
   assert.match(markup, /Unsanitized value/);
   assert.match(markup, /评审报告/);
   assert.match(markup, /修复建议/);
+  assert.match(markup, /搜索文件路径/);
+  assert.match(markup, /1 \/ 1/);
+  assert.match(markup, /py-2 hover:no-underline/);
+  assert.match(markup, /space-y-1"/);
+  assert.match(markup, /flex items-center gap-2 text-left/);
+  assert.match(markup, /line-clamp-1 flex-1 text-sm font-medium/);
+  assert.match(markup, /line-clamp-1 text-xs text-muted-foreground/);
+  assert.doesNotMatch(markup, /筛选结果/);
   assert.doesNotMatch(markup, /运行信息/);
   assert.doesNotMatch(markup, /同步审查结果/);
   assert.doesNotMatch(markup, /返回列表|返回结果列表|查看关联线程/);
@@ -153,6 +162,29 @@ test('PortalCodeReviewDetail surfaces pending fix count in tab label', () => {
 
   assert.match(markup, /修复建议/);
   assert.match(markup, />1</);
+});
+
+test('PortalCodeReviewDetail keeps fixes tab header lightweight in source', async () => {
+  const source = await readFile(
+    new URL('../../../src/business/portal/portal-code-review-detail.tsx', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(source, /bg-card\/70/);
+  assert.match(source, /待处理修复/);
+  assert.doesNotMatch(source, /修复队列/);
+  assert.doesNotMatch(source, /在这里处理待审批修复/);
+});
+
+test('PortalCodeReviewSidebar compact layout keeps fixes area dense in source', async () => {
+  const source = await readFile(
+    new URL('../../../src/business/portal/portal-code-review-sidebar.tsx', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(source, /space-y-3/);
+  assert.match(source, /gap-3 sm:flex-row sm:items-center/);
+  assert.match(source, /gap-2\.5/);
 });
 
 test('PortalCodeReviewDetail renders approved fixes as queued copy', () => {

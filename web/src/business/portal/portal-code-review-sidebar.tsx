@@ -124,8 +124,8 @@ export function PortalCodeReviewSidebar({
 
   if (layout === 'compact') {
     return (
-      <div className="space-y-4">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+      <div className="space-y-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
           <div className="flex flex-1 items-center gap-2">
             <Badge variant="outline" className={`${statusMeta.className} h-5 px-2 text-[11px]`}>
               {statusMeta.label}
@@ -147,7 +147,7 @@ export function PortalCodeReviewSidebar({
         </div>
 
         {pendingFixRequests.length > 0 ? (
-          <div className="space-y-3">
+          <div className="space-y-2.5">
             <p className="text-xs font-medium text-amber-700">待处理修复请求 ({pendingFixRequests.length})</p>
             <div className="rounded-xl border bg-card">
               {pendingFixRequests.map((fixRequest) => {
@@ -159,7 +159,7 @@ export function PortalCodeReviewSidebar({
                 return (
                   <div
                     key={fixRequest.id}
-                    className="flex flex-col gap-3 border-b px-4 py-3 last:border-b-0 lg:flex-row lg:items-center lg:justify-between"
+                    className="flex flex-col gap-2.5 border-b px-4 py-2.5 last:border-b-0 lg:flex-row lg:items-center lg:justify-between"
                   >
                     <div className="min-w-0 space-y-1">
                       <p className="line-clamp-1 text-sm font-medium text-foreground">
