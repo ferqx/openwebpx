@@ -57,7 +57,7 @@ export function LoginPage() {
           <div className="flex items-center justify-center">
             <AppLogo />
           </div>
-          <CardTitle className="text-center text-2xl">登录 OpenWebPx</CardTitle>
+          <CardTitle className="text-center text-2xl">登录 sandbox-agent</CardTitle>
         </CardHeader>
         <CardContent>
           <form className="space-y-4" onSubmit={handleSubmit}>

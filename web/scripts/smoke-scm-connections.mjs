@@ -15,10 +15,10 @@ const parseOptions = () => {
     index += 1;
   }
 
-  const apiBaseUrl = (optionMap.get('--api-base-url') ?? process.env.OPENWEBPX_API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '');
-  const token = optionMap.get('--token') ?? process.env.OPENWEBPX_AUTH_TOKEN ?? '';
+  const apiBaseUrl = (optionMap.get('--api-base-url') ?? process.env.SANDBOX_AGENT_API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '');
+  const token = optionMap.get('--token') ?? process.env.SANDBOX_AGENT_AUTH_TOKEN ?? '';
   if (!token.trim()) {
-    throw new Error('缺少 token。请通过 --token 或 OPENWEBPX_AUTH_TOKEN 传入。');
+    throw new Error('缺少 token。请通过 --token 或 SANDBOX_AGENT_AUTH_TOKEN 传入。');
   }
 
   return {

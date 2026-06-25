@@ -1,4 +1,4 @@
-# OpenWebPX 架构概览
+# sandbox-agent 架构概览
 
 本项目 (Aegra) 采用全栈分离的 Monorepo 架构。
 

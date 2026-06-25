@@ -8,11 +8,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 async def restore_scm_tokens():
     load_dotenv()
-    db_user = os.getenv("POSTGRES_USER", "openwebpx")
-    db_pass = os.getenv("POSTGRES_PASSWORD", "openwebpx_secret")
+    db_user = os.getenv("POSTGRES_USER", "sandbox_agent")
+    db_pass = os.getenv("POSTGRES_PASSWORD", "sandbox_agent_secret")
     db_host = os.getenv("POSTGRES_HOST", "localhost")
     db_port = os.getenv("POSTGRES_PORT", "5432")
-    db_name = os.getenv("POSTGRES_DB", "openwebpx")
+    db_name = os.getenv("POSTGRES_DB", "sandbox_agent")
 
     db_url = f"postgresql+asyncpg://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 

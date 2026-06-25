@@ -697,7 +697,7 @@ def test_docker_unavailable_message_mentions_group_add_on_permission_denied() ->
 def test_build_web_sandbox_middleware_uses_stop_delay_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS", "600")
+    monkeypatch.setenv("SANDBOX_AGENT_CONTAINER_STOP_DELAY_SECONDS", "600")
 
     middleware = build_web_sandbox_docker_middleware()
 

@@ -18,18 +18,18 @@ if TYPE_CHECKING:
 def _build_scm_token_cipher() -> Fernet:
     jwt_secret = (
         os.getenv("AUTH_JWT_SECRET", "").strip()
-        or "openwebpx-dev-secret-change-me-please-use-env-in-production"
+        or "sandbox-agent-dev-secret-change-me-please-use-env-in-production"
     )
-    derived = sha256(f"openwebpx-scm-token::{jwt_secret}".encode()).digest()
+    derived = sha256(f"sandbox-agent-scm-token::{jwt_secret}".encode()).digest()
     return Fernet(urlsafe_b64encode(derived))
 
 
 def _build_scm_state_signing_key() -> bytes:
     jwt_secret = (
         os.getenv("AUTH_JWT_SECRET", "").strip()
-        or "openwebpx-dev-secret-change-me-please-use-env-in-production"
+        or "sandbox-agent-dev-secret-change-me-please-use-env-in-production"
     )
-    return sha256(f"openwebpx-scm-state::{jwt_secret}".encode()).digest()
+    return sha256(f"sandbox-agent-scm-state::{jwt_secret}".encode()).digest()
 
 
 def _b64url_encode(data: bytes) -> str:

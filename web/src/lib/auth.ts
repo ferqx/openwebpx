@@ -14,7 +14,7 @@ export type LoginResponse = {
   user: AuthUser;
 };
 
-const AUTH_TOKEN_KEY = 'openwebpx:auth-token';
+const AUTH_TOKEN_KEY = 'sandbox-agent:auth-token';
 
 export const getStoredAuthToken = () => {
   if (typeof window === 'undefined') return '';

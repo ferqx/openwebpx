@@ -61,7 +61,7 @@ export function RegisterPage() {
           <div className="flex items-center justify-center">
             <AppLogo />
           </div>
-          <CardTitle className="text-center text-2xl">注册 OpenWebPx 账号</CardTitle>
+          <CardTitle className="text-center text-2xl">注册 sandbox-agent 账号</CardTitle>
         </CardHeader>
         <CardContent>
           <form className="space-y-4" onSubmit={handleSubmit}>

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "openwebpx"
+name = "sandbox-agent"
 version = "0.1.0"
 description = "A high-compatibility, self-hosted LangGraph server. Built to be a drop-in replacement for LangGraph Platform, compatible with both Aegra and langgraph-cli."
 readme = "README.md"
@@ -17,7 +17,7 @@ keywords = [
     "postgresql",
     "langchain",
     "agent-protocol",
-    "openwebpx",
+    "sandbox-agent",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

@@ -44,7 +44,7 @@ except ModuleNotFoundError:
 
 
 def _resolve_model_max_tokens() -> int:
-    raw_value = os.getenv("OPENWEBPX_BUILD_APP_AGENT_V3_MAX_TOKENS", "").strip()
+    raw_value = os.getenv("SANDBOX_AGENT_BUILD_APP_AGENT_V3_MAX_TOKENS", "").strip()
     if not raw_value:
         return 4000
     try:
@@ -55,7 +55,7 @@ def _resolve_model_max_tokens() -> int:
 
 
 def _think_tool_enabled() -> bool:
-    raw_value = os.getenv("OPENWEBPX_BUILD_APP_AGENT_V3_THINK_TOOL", "").strip()
+    raw_value = os.getenv("SANDBOX_AGENT_BUILD_APP_AGENT_V3_THINK_TOOL", "").strip()
     if not raw_value:
         return False
     return raw_value.lower() in {"1", "true", "yes", "on"}

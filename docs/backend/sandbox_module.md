@@ -1,7 +1,7 @@
 # 隔离沙箱模块 (Sandbox)
 
 ## 简介
-隔离沙箱模块（主要实现在 `middleware/docker.py` 和 `app/services/docker_runtime.py`）是 OpenWebPX 的核心运行环境管理层。它通过为每一个 LangGraph 线程绑定一个独立的 Docker 容器，确保了代码执行的安全隔离和运行时环境的持久化，实现了“一个对话一个工作区”的无缝体验。
+隔离沙箱模块（主要实现在 `middleware/docker.py` 和 `app/services/docker_runtime.py`）是 sandbox-agent 的核心运行环境管理层。它通过为每一个 LangGraph 线程绑定一个独立的 Docker 容器，确保了代码执行的安全隔离和运行时环境的持久化，实现了“一个对话一个工作区”的无缝体验。
 
 ## 功能详情
 - **Thread-to-Container 映射**: 系统自动为每个 `thread_id` 维护并持久化一个唯一的 `container_id`。只要线程未删除，跨会话的代码修改和环境状态都会在对应容器中保留。

@@ -1,4 +1,4 @@
-# OpenWebPX-UI Agent 协作协议 (AGENTS.md)
+# sandbox-agent Agent 协作协议 (AGENTS.md)
 
 本协议是 AI 协作者进入本项目的**唯一最高准则**。
 

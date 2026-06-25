@@ -1,4 +1,4 @@
-# OpenWebPX-UI Development (CLAUDE.md)
+# sandbox-agent Development (CLAUDE.md)
 
 This file provides local development context. For global collaboration rules, refer to [AGENTS.md](AGENTS.md).
 

@@ -1,4 +1,4 @@
-# OpenWebPX Full-Stack Monorepo (CLAUDE.md)
+# sandbox-agent Full-Stack Monorepo (CLAUDE.md)
 
 This file provides local development context. For global collaboration rules, refer to [AGENTS.md](AGENTS.md).
 

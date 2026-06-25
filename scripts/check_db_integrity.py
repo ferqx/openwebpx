@@ -10,7 +10,7 @@ async def main():
     load_dotenv()
     db_url = os.getenv(
         "DATABASE_URL",
-        "postgresql+asyncpg://openwebpx:openwebpx_secret@localhost:5432/openwebpx",
+        "postgresql+asyncpg://sandbox_agent:sandbox_agent_secret@localhost:5432/sandbox_agent",
     )
     engine = create_async_engine(db_url)
     async with engine.connect() as conn:

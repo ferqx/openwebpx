@@ -114,13 +114,13 @@ def real_integration_container(
         working_dir="/workspace",
         environment={
             "SHELL": "/bin/bash",
-            "BASH_ENV": "/etc/profile.d/openwebpx-scm.sh",
+            "BASH_ENV": "/etc/profile.d/sandbox-agent-scm.sh",
         },
         labels={
-            "openwebpx.test": "docker-backend-integration",
-            "openwebpx.cleanup": "true",
+            "sandbox-agent.test": "docker-backend-integration",
+            "sandbox-agent.cleanup": "true",
         },
-        name=f"openwebpx-test-{uuid.uuid4().hex[:8]}",
+        name=f"sandbox-agent-test-{uuid.uuid4().hex[:8]}",
     )
 
     def _cleanup() -> None:
@@ -349,8 +349,8 @@ def test_execute_blocks_gh_when_token_not_injected() -> None:
 
 
 @pytest.mark.skipif(
-    os.getenv("OPENWEBPX_RUN_DOCKER_INTEGRATION") != "1",
-    reason="Set OPENWEBPX_RUN_DOCKER_INTEGRATION=1 to run real Docker integration checks.",
+    os.getenv("SANDBOX_AGENT_RUN_DOCKER_INTEGRATION") != "1",
+    reason="Set SANDBOX_AGENT_RUN_DOCKER_INTEGRATION=1 to run real Docker integration checks.",
 )
 def test_execute_sees_refreshed_repo_runtime_env_in_real_container(
     real_integration_container: tuple[docker.DockerClient, Container],

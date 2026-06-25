@@ -126,7 +126,7 @@ def test_build_repository_context_prompt_respects_token_budget(
             encoding="utf-8",
         )
 
-    monkeypatch.setenv("OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_TOKENS", "120")
+    monkeypatch.setenv("SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_TOKENS", "120")
     prompt = build_repository_context_prompt(tmp_path)
 
     assert prompt is not None
@@ -148,11 +148,11 @@ def test_build_repository_context_prompt_respects_section_budgets(
             encoding="utf-8",
         )
 
-    monkeypatch.setenv("OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_TOKENS", "180")
+    monkeypatch.setenv("SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_TOKENS", "180")
     monkeypatch.setenv(
-        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_SIGNATURE_MAX_TOKENS", "120"
+        "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_SIGNATURE_MAX_TOKENS", "120"
     )
-    monkeypatch.setenv("OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_TREE_MAX_TOKENS", "40")
+    monkeypatch.setenv("SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_TREE_MAX_TOKENS", "40")
 
     prompt = build_repository_context_prompt(tmp_path)
 

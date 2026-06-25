@@ -1,22 +1,22 @@
 <p align="center">
-  <img src="docs/images/banner.png" alt="OpenWebPX banner" />
+  <img src="docs/images/banner.png" alt="sandbox-agent banner" />
 </p>
 
-<h1 align="center">OpenWebPX</h1>
+<h1 align="center">sandbox-agent</h1>
 
 <p align="center">
   <strong>Self-hosted Code Agent Infrastructure with Cloud Sandboxing.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ferqx/openwebpx/stargazers"><img src="https://img.shields.io/github/stars/ferqx/openwebpx" alt="GitHub stars"></a>
-  <a href="https://github.com/ferqx/openwebpx/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ferqx/openwebpx" alt="License"></a>
-  <a href="https://github.com/ferqx/openwebpx/issues"><img src="https://img.shields.io/github/issues/ferqx/openwebpx" alt="Issues"></a>
+  <a href="https://github.com/ferqx/sandbox-agent/stargazers"><img src="https://img.shields.io/github/stars/ferqx/sandbox-agent" alt="GitHub stars"></a>
+  <a href="https://github.com/ferqx/sandbox-agent/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ferqx/sandbox-agent" alt="License"></a>
+  <a href="https://github.com/ferqx/sandbox-agent/issues"><img src="https://img.shields.io/github/issues/ferqx/sandbox-agent" alt="Issues"></a>
 </p>
 
 ---
 
-**OpenWebPX** is a specialized, production-ready infrastructure for building and deploying **AI Code Agents**. It provides enterprise-grade **Cloud Sandboxing** capabilities, allowing agents to safely execute code, manage repositories, and perform complex development tasks in isolated, thread-bound environments.
+**sandbox-agent** is a specialized, production-ready infrastructure for building and deploying **AI Code Agents**. It provides enterprise-grade **Cloud Sandboxing** capabilities, allowing agents to safely execute code, manage repositories, and perform complex development tasks in isolated, thread-bound environments.
 
 **Dual Compatibility:** [LangGraph CLI](https://github.com/langchain-ai/langgraph-cli) | [Agent Chat UI](https://github.com/langchain-ai/agent-chat-ui) | [LangGraph Studio](https://github.com/langchain-ai/langgraph-studio) | [Aegra Ecosystem](https://github.com/ibbybuilds/aegra)
 
@@ -37,7 +37,7 @@ Access the API docs at [http://localhost:8000/docs](http://localhost:8000/docs).
 
 ## 🔥 Core Philosophy: The Code Agent Sandbox
 
-OpenWebPX transforms the standard LangGraph server into a powerful development environment for AI.
+sandbox-agent transforms the standard LangGraph server into a powerful development environment for AI.
 
 | Capability | Enterprise Cloud Sandbox | Description |
 |:--|:--|:--|
@@ -68,5 +68,5 @@ OpenWebPX transforms the standard LangGraph server into a powerful development e
 Apache 2.0 - see [LICENSE](LICENSE).
 
 <p align="center">
-  <strong>⭐ Star OpenWebPX if it helps you build AI Code Agents on your own terms ⭐</strong>
+  <strong>⭐ Star sandbox-agent if it helps you build AI Code Agents on your own terms ⭐</strong>
 </p>

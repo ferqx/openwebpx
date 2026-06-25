@@ -6,7 +6,7 @@ import {
   persistScmOAuthResult
 } from '@/lib/scm';
 
-const SCM_CALLBACK_STATUS_KEY_PREFIX = 'openwebpx:scm-oauth-callback';
+const SCM_CALLBACK_STATUS_KEY_PREFIX = 'sandbox-agent:scm-oauth-callback';
 
 export function ScmOauthCallbackPage() {
   const search = useMemo(

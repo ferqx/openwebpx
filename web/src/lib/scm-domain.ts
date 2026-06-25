@@ -2,8 +2,8 @@ import { type PortalScmSource } from '@/business/portal/types';
 import { ScmRequestError, type ScmConnection, type ScmProvider } from '@/lib/scm';
 
 export const SCM_ENTERPRISE_BASE_URLS_STORAGE_KEY =
-  'openwebpx:scm-enterprise-base-urls';
-export const SCM_PROVIDER_HINTS_STORAGE_KEY = 'openwebpx:scm-provider-hints';
+  'sandbox-agent:scm-enterprise-base-urls';
+export const SCM_PROVIDER_HINTS_STORAGE_KEY = 'sandbox-agent:scm-provider-hints';
 
 export const normalizeGitlabBaseUrl = (value: string) => {
   const trimmed = value.trim();

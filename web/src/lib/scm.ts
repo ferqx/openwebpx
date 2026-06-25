@@ -31,8 +31,8 @@ type FetchBranchesOptions = ScmApiOptions & {
   repository: string;
 };
 
-const SCM_OAUTH_PENDING_STORAGE_KEY = 'openwebpx:scm-oauth-pending';
-const SCM_OAUTH_RESULT_STORAGE_KEY = 'openwebpx:scm-oauth-result';
+const SCM_OAUTH_PENDING_STORAGE_KEY = 'sandbox-agent:scm-oauth-pending';
+const SCM_OAUTH_RESULT_STORAGE_KEY = 'sandbox-agent:scm-oauth-result';
 
 export type ScmOauthResult = {
   ok: boolean;

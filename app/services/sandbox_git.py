@@ -25,16 +25,16 @@ if TYPE_CHECKING:
     from aegra_api.models.auth import User
 
 DEFAULT_TASK_GRAPH_ID = os.getenv(
-    "OPENWEBPX_DEFAULT_TASK_GRAPH_ID", "build_app_agent_v3"
+    "SANDBOX_AGENT_DEFAULT_TASK_GRAPH_ID", "build_app_agent_v3"
 )
 COMMIT_MESSAGE_MODEL_PROVIDER = os.getenv(
-    "OPENWEBPX_COMMIT_MESSAGE_MODEL_PROVIDER", "openai"
+    "SANDBOX_AGENT_COMMIT_MESSAGE_MODEL_PROVIDER", "openai"
 )
 COMMIT_MESSAGE_MODEL_NAME = os.getenv(
-    "OPENWEBPX_COMMIT_MESSAGE_MODEL_NAME", "deepseek-chat"
+    "SANDBOX_AGENT_COMMIT_MESSAGE_MODEL_NAME", "deepseek-chat"
 )
 _raw_git_diff_default_max_chars = os.getenv(
-    "OPENWEBPX_GIT_DIFF_DEFAULT_MAX_CHARS", "0"
+    "SANDBOX_AGENT_GIT_DIFF_DEFAULT_MAX_CHARS", "0"
 ).strip()
 try:
     GIT_DIFF_DEFAULT_MAX_CHARS = int(_raw_git_diff_default_max_chars)

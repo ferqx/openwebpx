@@ -86,7 +86,7 @@ logger = logging.getLogger(__name__)
 
 
 def _debug_print(message: str) -> None:
-    if os.getenv("OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_DEBUG", "").strip() not in {
+    if os.getenv("SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_DEBUG", "").strip() not in {
         "1",
         "true",
         "TRUE",
@@ -126,7 +126,7 @@ def _read_section_budget_env(name: str, default: int, max_tokens: int) -> int:
 
 def _should_disable_tiktoken() -> bool:
     return os.getenv(
-        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_DISABLE_TIKTOKEN",
+        "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_DISABLE_TIKTOKEN",
         "",
     ).strip() in {"1", "true", "TRUE", "yes", "YES"}
 
@@ -159,7 +159,7 @@ def _count_tokens(text: str) -> int:
 
 
 def _default_root() -> Path:
-    raw_root = os.getenv("OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_ROOT", "").strip()
+    raw_root = os.getenv("SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_ROOT", "").strip()
     if raw_root:
         return Path(raw_root).resolve()
     return Path.cwd().resolve()
@@ -628,15 +628,15 @@ def build_repository_context_prompt(root: Path | None = None) -> str | None:
         _debug_print(f"local repository context root invalid: {root_path}")
         return None
     max_tokens = _read_positive_int_env(
-        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_TOKENS", 3000
+        "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_TOKENS", 3000
     )
     signature_budget = _read_section_budget_env(
-        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_SIGNATURE_MAX_TOKENS",
+        "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_SIGNATURE_MAX_TOKENS",
         2000,
         max_tokens,
     )
     tree_budget = _read_section_budget_env(
-        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_TREE_MAX_TOKENS",
+        "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_TREE_MAX_TOKENS",
         max(1, max_tokens - signature_budget),
         max_tokens,
     )
@@ -644,10 +644,10 @@ def build_repository_context_prompt(root: Path | None = None) -> str | None:
     tree_lines = _render_tree(
         root_path,
         max_depth=_read_positive_int_env(
-            "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_DEPTH", 4
+            "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_DEPTH", 4
         ),
         max_entries=_read_positive_int_env(
-            "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_TREE_ENTRIES", 160
+            "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_TREE_ENTRIES", 160
         ),
     )
     if not tree_lines:
@@ -657,10 +657,10 @@ def build_repository_context_prompt(root: Path | None = None) -> str | None:
     signature_lines = _collect_signature_lines(
         root_path,
         max_files=_read_positive_int_env(
-            "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_SIGNATURE_FILES", 40
+            "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_SIGNATURE_FILES", 40
         ),
         max_symbols_per_file=_read_positive_int_env(
-            "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_SYMBOLS_PER_FILE", 8
+            "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_SYMBOLS_PER_FILE", 8
         ),
     )
 
@@ -737,15 +737,15 @@ def build_repository_context_prompt_from_backend(
         return None
 
     max_tokens = _read_positive_int_env(
-        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_TOKENS", 3000
+        "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_TOKENS", 3000
     )
     signature_budget = _read_section_budget_env(
-        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_SIGNATURE_MAX_TOKENS",
+        "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_SIGNATURE_MAX_TOKENS",
         2000,
         max_tokens,
     )
     tree_budget = _read_section_budget_env(
-        "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_TREE_MAX_TOKENS",
+        "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_TREE_MAX_TOKENS",
         max(1, max_tokens - signature_budget),
         max_tokens,
     )
@@ -753,10 +753,10 @@ def build_repository_context_prompt_from_backend(
         root_name="workspace",
         relative_paths=relative_paths,
         max_depth=_read_positive_int_env(
-            "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_DEPTH", 4
+            "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_DEPTH", 4
         ),
         max_entries=_read_positive_int_env(
-            "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_TREE_ENTRIES", 160
+            "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_TREE_ENTRIES", 160
         ),
     )
     if not tree_lines:
@@ -766,10 +766,10 @@ def build_repository_context_prompt_from_backend(
         backend=backend,
         relative_paths=source_paths,
         max_files=_read_positive_int_env(
-            "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_SIGNATURE_FILES", 40
+            "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_SIGNATURE_FILES", 40
         ),
         max_symbols_per_file=_read_positive_int_env(
-            "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_MAX_SYMBOLS_PER_FILE", 8
+            "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_MAX_SYMBOLS_PER_FILE", 8
         ),
     )
 
@@ -842,7 +842,7 @@ class RepositoryContextPromptBuilder:
         )
         self.cache_ttl_seconds = (
             _read_non_negative_float_env(
-                "OPENWEBPX_BUILD_APP_AGENT_V3_CONTEXT_CACHE_TTL_SECONDS",
+                "SANDBOX_AGENT_BUILD_APP_AGENT_V3_CONTEXT_CACHE_TTL_SECONDS",
                 5.0,
             )
             if cache_ttl_seconds is None

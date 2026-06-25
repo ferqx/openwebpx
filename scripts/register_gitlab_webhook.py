@@ -27,7 +27,7 @@ async def register_webhook():
 
     # 验签密钥，如果没有设就用默认的
     secret = os.getenv("GITLAB_WEBHOOK_SECRET") or os.getenv(
-        "OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET", "openwebpx_test_secret"
+        "SANDBOX_AGENT_CODE_REVIEW_WEBHOOK_SECRET", "sandbox_agent_test_secret"
     )
 
     if not token or not project_path:

@@ -18,7 +18,7 @@ export async function doMockLogin(page: Page, redirectPath: string = '/') {
 
   // 2. Inject token
   await page.addInitScript((token) => {
-    window.localStorage.setItem('openwebpx:auth-token', token);
+    window.localStorage.setItem('sandbox-agent:auth-token', token);
   }, REAL_AUTH_TOKEN);
 
   // 3. Navigate to target - THIS STARTS THE APP
@@ -26,7 +26,7 @@ export async function doMockLogin(page: Page, redirectPath: string = '/') {
 
   // 4. Ensure token is set in the session
   await page.evaluate((token) => {
-    window.localStorage.setItem('openwebpx:auth-token', token);
+    window.localStorage.setItem('sandbox-agent:auth-token', token);
   }, REAL_AUTH_TOKEN);
 
   await page.waitForLoadState('domcontentloaded');

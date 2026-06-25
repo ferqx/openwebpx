@@ -29,7 +29,7 @@ Phase 1 implements a backend-first code review platform in `app/services/code_re
 - Fix approval is membership-gated. Approve requires `ReviewRun.thread_id`, keeps queued work on that same thread, and only dispatches the next fix when the thread is idle.
 - Approved fixes are appended onto the existing task thread through Aegra `create_run` instead of creating a separate fix thread.
 - The in-process queue worker serializes approved fixes FIFO per `thread_id`. `approved` means queued, `running` means the corresponding Aegra run has been dispatched.
-- Runner callbacks are authenticated with `OPENWEBPX_CODE_REVIEW_FIX_RUNNER_SECRET` or `CODE_REVIEW_FIX_RUNNER_SECRET`, and update requests to `completed` or `failed`.
+- Runner callbacks are authenticated with `SANDBOX_AGENT_CODE_REVIEW_FIX_RUNNER_SECRET` or `CODE_REVIEW_FIX_RUNNER_SECRET`, and update requests to `completed` or `failed`.
 - Publish is a stub contract only. `POST /api/code-review/runs/{id}/publish` requires a visible `completed` run, records publish timeline attempts, and returns a deterministic success payload without provider-side comments.
 
 ## Data Model Notes
@@ -42,8 +42,8 @@ Phase 1 implements a backend-first code review platform in `app/services/code_re
 ## Environment Secrets
 - `GITHUB_WEBHOOK_SECRET`
 - `GITLAB_WEBHOOK_SECRET`
-- `OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET`
-- `OPENWEBPX_CODE_REVIEW_FIX_RUNNER_SECRET`
+- `SANDBOX_AGENT_CODE_REVIEW_WEBHOOK_SECRET`
+- `SANDBOX_AGENT_CODE_REVIEW_FIX_RUNNER_SECRET`
 - `CODE_REVIEW_FIX_RUNNER_SECRET`
 
 ## Intentionally Stubbed

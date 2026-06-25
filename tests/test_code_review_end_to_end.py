@@ -269,8 +269,8 @@ async def test_code_review_happy_path_webhook_analysis_fix_and_callback(
     )
 
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "github-secret")
-    monkeypatch.setenv("OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET", "shared-secret")
-    monkeypatch.setenv("OPENWEBPX_CODE_REVIEW_FIX_RUNNER_SECRET", "runner-secret")
+    monkeypatch.setenv("SANDBOX_AGENT_CODE_REVIEW_WEBHOOK_SECRET", "shared-secret")
+    monkeypatch.setenv("SANDBOX_AGENT_CODE_REVIEW_FIX_RUNNER_SECRET", "runner-secret")
     scheduled_run_ids: list[int] = []
 
     def fake_schedule_background_analysis(*, run_id: int) -> None:
@@ -355,7 +355,7 @@ async def test_code_review_happy_path_webhook_analysis_fix_and_callback(
                     "status": "completed",
                     "result_payload": {"summary": "ok"},
                 },
-                headers={"X-Openwebpx-Fix-Runner-Secret": "runner-secret"},
+                headers={"X-Sandbox-Agent-Fix-Runner-Secret": "runner-secret"},
             )
             assert callback_response.status_code == 200
             callback_payload = callback_response.json()
@@ -380,7 +380,7 @@ async def test_code_review_happy_path_webhook_analysis_fix_and_callback(
                     "status": "completed",
                     "result_payload": {"summary": "ok"},
                 },
-                headers={"X-Openwebpx-Fix-Runner-Secret": "runner-secret"},
+                headers={"X-Sandbox-Agent-Fix-Runner-Secret": "runner-secret"},
             )
             assert duplicate_callback.status_code == 200
             assert (
@@ -469,7 +469,7 @@ def test_code_review_fix_runner_callback_rejects_bad_secret(
     )
     session.fix_requests.append(fix_request)
 
-    monkeypatch.setenv("OPENWEBPX_CODE_REVIEW_FIX_RUNNER_SECRET", "runner-secret")
+    monkeypatch.setenv("SANDBOX_AGENT_CODE_REVIEW_FIX_RUNNER_SECRET", "runner-secret")
     app.dependency_overrides[get_db] = _override_db(session)
     try:
         with TestClient(app) as client:
@@ -480,7 +480,7 @@ def test_code_review_fix_runner_callback_rejects_bad_secret(
                     "status": "completed",
                     "result_payload": {"summary": "ok"},
                 },
-                headers={"X-Openwebpx-Fix-Runner-Secret": "wrong-secret"},
+                headers={"X-Sandbox-Agent-Fix-Runner-Secret": "wrong-secret"},
             )
             assert response.status_code == 401
             assert fix_request.status == ReviewFixRequestStatus.RUNNING

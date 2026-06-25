@@ -62,7 +62,7 @@ class CodeReviewWebhookService:
     ) -> dict[str, Any]:
         secret = _load_env_secret(
             "GITHUB_WEBHOOK_SECRET",
-            "OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET",
+            "SANDBOX_AGENT_CODE_REVIEW_WEBHOOK_SECRET",
         )
         signature_header = headers.get("X-Hub-Signature-256")
         if not verify_github_webhook_signature(
@@ -95,7 +95,7 @@ class CodeReviewWebhookService:
     ) -> dict[str, Any]:
         secret = _load_env_secret(
             "GITLAB_WEBHOOK_SECRET",
-            "OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET",
+            "SANDBOX_AGENT_CODE_REVIEW_WEBHOOK_SECRET",
         )
         token_header = headers.get("X-Gitlab-Token")
 

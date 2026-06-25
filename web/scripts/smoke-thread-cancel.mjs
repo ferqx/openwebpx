@@ -15,12 +15,12 @@ const parseOptions = () => {
     index += 1;
   }
 
-  const apiBaseUrl = (optionMap.get('--api-base-url') ?? process.env.OPENWEBPX_API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '');
-  const token = optionMap.get('--token') ?? process.env.OPENWEBPX_AUTH_TOKEN ?? '';
+  const apiBaseUrl = (optionMap.get('--api-base-url') ?? process.env.SANDBOX_AGENT_API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '');
+  const token = optionMap.get('--token') ?? process.env.SANDBOX_AGENT_AUTH_TOKEN ?? '';
   const threadId = optionMap.get('--thread-id') ?? '';
   const action = optionMap.get('--action') ?? 'interrupt';
 
-  if (!token.trim()) throw new Error('缺少 token。请通过 --token 或 OPENWEBPX_AUTH_TOKEN 传入。');
+  if (!token.trim()) throw new Error('缺少 token。请通过 --token 或 SANDBOX_AGENT_AUTH_TOKEN 传入。');
   if (!threadId.trim()) throw new Error('缺少 thread id。请通过 --thread-id 传入。');
   if (action !== 'cancel' && action !== 'interrupt') {
     throw new Error('action 仅支持 cancel 或 interrupt。');

@@ -58,11 +58,11 @@ async def reject_fix_request(
 @router.post("/fix-runner/callback")
 async def fix_runner_callback(
     payload: FixRunnerCallbackRequest,
-    x_openwebpx_fix_runner_secret: str | None = Header(default=None),
+    x_sandbox_agent_fix_runner_secret: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     return await code_review_fix_service.handle_runner_callback(
         session=db,
         payload=payload.model_dump(),
-        callback_secret=x_openwebpx_fix_runner_secret,
+        callback_secret=x_sandbox_agent_fix_runner_secret,
     )

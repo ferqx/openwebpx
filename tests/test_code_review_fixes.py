@@ -145,7 +145,7 @@ def _make_test_app():
 def _set_fix_runner_secret(
     monkeypatch: pytest.MonkeyPatch, secret: str = "runner-secret"
 ) -> None:
-    monkeypatch.setenv("OPENWEBPX_CODE_REVIEW_FIX_RUNNER_SECRET", secret)
+    monkeypatch.setenv("SANDBOX_AGENT_CODE_REVIEW_FIX_RUNNER_SECRET", secret)
 
 
 def _seed_integration(
@@ -1147,7 +1147,7 @@ async def test_runner_callback_updates_terminal_state_and_is_idempotent(
             first_response = client.post(
                 "/api/code-review/fix-runner/callback",
                 json=callback_payload,
-                headers={"X-OpenWebPX-Fix-Runner-Secret": "runner-secret"},
+                headers={"X-Sandbox-Agent-Fix-Runner-Secret": "runner-secret"},
             )
             assert first_response.status_code == 200
             first_payload = first_response.json()
@@ -1166,7 +1166,7 @@ async def test_runner_callback_updates_terminal_state_and_is_idempotent(
             second_response = client.post(
                 "/api/code-review/fix-runner/callback",
                 json=callback_payload,
-                headers={"X-OpenWebPX-Fix-Runner-Secret": "runner-secret"},
+                headers={"X-Sandbox-Agent-Fix-Runner-Secret": "runner-secret"},
             )
             assert second_response.status_code == 200
             assert second_response.json()["status"] == terminal_status

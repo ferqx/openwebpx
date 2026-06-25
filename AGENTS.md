@@ -1,4 +1,4 @@
-# OpenWebPX 全栈协作协议 (AGENTS.md)
+# sandbox-agent 全栈协作协议 (AGENTS.md)
 
 本协议是 AI 协作者在本项目（Aegra）中工作的**唯一最高准则**。本项目已合并为 Monorepo，包含后端 (`app/`, `graphs/`) 与前端 (`web/`)，采用全栈分离的部署架构。
 

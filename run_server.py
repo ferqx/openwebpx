@@ -60,7 +60,7 @@ def main():
     logger.info(f"🔐 Auth Type: {settings.app.AUTH_TYPE}")
     logger.info(f"🗄️  Database: {settings.db.database_url}")
 
-    logger.info("🚀 Starting OpenWebPX API...")
+    logger.info("🚀 Starting sandbox-agent API...")
     logger.info(f"📍 Server will be available at: http://localhost:{port}")
     logger.info(f"📊 API docs will be available at: http://localhost:{port}/docs")
     logger.info("🧪 Test with: python test_sdk_integration.py")

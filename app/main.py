@@ -36,7 +36,7 @@ from app.routers.telemetry import router as telemetry_router
 logger = logging.getLogger(__name__)
 
 USE_SQLALCHEMY_NULLPOOL = os.getenv(
-    "OPENWEBPX_SQLALCHEMY_USE_NULLPOOL", "true"
+    "SANDBOX_AGENT_SQLALCHEMY_USE_NULLPOOL", "true"
 ).strip().lower() not in {"0", "false", "no"}
 
 

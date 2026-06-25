@@ -16,10 +16,10 @@ class AppSettings:
     def debug(self) -> bool:
         return aegra_settings.db.DB_ECHO_LOG
 
-    # 可以在这里定义 openwebpx 专属的配置
+    # sandbox-agent specific configuration
     @property
     def telemetry_enabled(self) -> bool:
-        return os.getenv("OPENWEBPX_TELEMETRY_ENABLED", "true").lower() == "true"
+        return os.getenv("SANDBOX_AGENT_TELEMETRY_ENABLED", "true").lower() == "true"
 
 
 settings = AppSettings()

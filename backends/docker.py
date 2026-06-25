@@ -36,7 +36,7 @@ _GLAB_RE = re.compile(r"\bglab\b", re.IGNORECASE)
 _GH_RE = re.compile(r"\bgh\b", re.IGNORECASE)
 _GLAB_MR_CREATE_RE = re.compile(r"\bglab\s+mr\s+create\b", re.IGNORECASE)
 _EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-_SCM_BASH_ENV = "/etc/profile.d/openwebpx-scm.sh"
+_SCM_BASH_ENV = "/etc/profile.d/sandbox-agent-scm.sh"
 _GITLAB_MR_REST_HINT = (
     "create GitLab merge requests via REST API with "
     "`Authorization: Bearer $GITLAB_TOKEN`, for example "
@@ -57,14 +57,14 @@ def _docker_unavailable_message(exc: DockerException) -> str:
     if permission_denied:
         guidance = (
             " The Docker socket is present but this process cannot access it. If "
-            "OpenWebPX is running inside Docker, add the service container to the "
+            "sandbox-agent is running inside Docker, add the service container to the "
             "host Docker socket group, for example via group_add with "
             "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock), and keep "
             "DOCKER_HOST=unix:///var/run/docker.sock."
         )
     elif not socket_exists:
         guidance = (
-            " If OpenWebPX is running inside Docker, mount /var/run/docker.sock into "
+            " If sandbox-agent is running inside Docker, mount /var/run/docker.sock into "
             "the service container and set DOCKER_HOST=unix:///var/run/docker.sock. "
             "Otherwise ensure Docker is installed and the daemon is running on the host."
         )
@@ -287,7 +287,7 @@ class DockerBackend(BaseSandbox):
         ):
             return (
                 "SCM authorization unavailable for GitLab CLI command. "
-                "Please re-authorize GitLab integration in OpenWebPX; "
+                "Please re-authorize GitLab integration in sandbox-agent; "
                 "do not run `glab auth login` in sandbox."
             )
         if _GH_RE.search(command) and not (
@@ -295,7 +295,7 @@ class DockerBackend(BaseSandbox):
         ):
             return (
                 "SCM authorization unavailable for GitHub CLI command. "
-                "Please re-authorize GitHub integration in OpenWebPX; "
+                "Please re-authorize GitHub integration in sandbox-agent; "
                 "do not run `gh auth login` in sandbox."
             )
         return None

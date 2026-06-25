@@ -5,7 +5,7 @@ description: 全栈文档管理与 Agent 协议守护者。负责维护 AGENTS.m
 
 # 全栈 doc-manager 技能
 
-本技能专门用于维护 OpenWebPX Monorepo 的全栈文档体系与开发协议。
+本技能专门用于维护 sandbox-agent Monorepo 的全栈文档体系与开发协议。
 
 ## 1. 触发场景
 - **全栈特性开发后**: 必须更新 `docs/changelogs/YYYY-MM-DD.md`，包含后端 API 变动与前端接入逻辑。

@@ -14,10 +14,10 @@ export function AppLogo({
       onClick={onClick}
     >
       <span className="bg-foreground text-background flex size-6 items-center justify-center rounded-md text-[11px] font-semibold">
-        OW
+        SA
       </span>
       <span className="font-semibold tracking-tight text-foreground">
-        OpenWebPX
+        sandbox-agent
       </span>
     </span>
   );

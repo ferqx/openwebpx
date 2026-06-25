@@ -13,7 +13,7 @@ def simulate_webhook():
 
     target_url = "http://localhost:8000/api/code-review/webhooks/gitlab"
     secret = os.getenv("GITLAB_WEBHOOK_SECRET") or os.getenv(
-        "OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET"
+        "SANDBOX_AGENT_CODE_REVIEW_WEBHOOK_SECRET"
     )
     project_path = os.getenv("TEST_GITLAB_PROJECT", "group/project")
     mr_iid = os.getenv("TEST_GITLAB_MR_IID", "1")

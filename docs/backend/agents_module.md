@@ -1,7 +1,7 @@
 # AI 智能体模块 (Agents)
 
 ## 简介
-AI 智能体模块是 OpenWebPX 的大脑，基于 LangGraph 构建。该模块定义了一系列具备状态管理、工具调用和中间件能力的图模型。核心智能体 `build_app_agent_v3`（位于 `graphs/build_app_agent_v3/`）专门用于处理应用构建、代码补丁生成及运行时自愈等复杂工程任务。
+AI 智能体模块是 sandbox-agent 的大脑，基于 LangGraph 构建。该模块定义了一系列具备状态管理、工具调用和中间件能力的图模型。核心智能体 `build_app_agent_v3`（位于 `graphs/build_app_agent_v3/`）专门用于处理应用构建、代码补丁生成及运行时自愈等复杂工程任务。
 
 ## 功能详情
 - **build_app_agent_v3**:

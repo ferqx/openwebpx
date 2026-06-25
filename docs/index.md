@@ -1,6 +1,6 @@
-# OpenWebPX 工程文档
+# sandbox-agent 工程文档
 
-欢迎来到 OpenWebPX 项目文档。这是一个高度兼容、自托管的 LangGraph 服务端实现，旨在为 AI 智能体提供安全、受控的沙箱环境和强大的代码处理能力。
+欢迎来到 sandbox-agent 项目文档。这是一个高度兼容、自托管的 LangGraph 服务端实现，旨在为 AI 智能体提供安全、受控的沙箱环境和强大的代码处理能力。
 
 ## 核心模块
 - [AI 智能体 (Agents)](agents_module.md): 智能体逻辑、补丁协议、**性能评测与遥测**。

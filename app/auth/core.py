@@ -658,7 +658,7 @@ def _jwt_secret() -> str:
     if secret:
         return secret
     # 本地开发默认值，生产环境请务必设置 AUTH_JWT_SECRET
-    return "openwebpx-dev-secret-change-me-please-use-env-in-production"
+    return "sandbox-agent-dev-secret-change-me-please-use-env-in-production"
 
 
 def _jwt_algorithm() -> str:

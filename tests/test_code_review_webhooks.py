@@ -344,7 +344,7 @@ def _set_webhook_secrets(
 ) -> None:
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", github)
     monkeypatch.setenv("GITLAB_WEBHOOK_SECRET", gitlab)
-    monkeypatch.setenv("OPENWEBPX_CODE_REVIEW_WEBHOOK_SECRET", "shared-secret")
+    monkeypatch.setenv("SANDBOX_AGENT_CODE_REVIEW_WEBHOOK_SECRET", "shared-secret")
 
 
 @pytest.mark.asyncio

@@ -88,7 +88,7 @@ test('OAuth session state management', () => {
     returnTo: '/home',
     gitlabBaseUrl: undefined
   };
-  global.sessionStorage.setItem('openwebpx:scm-oauth-pending', JSON.stringify(state));
+  global.sessionStorage.setItem('sandbox-agent:scm-oauth-pending', JSON.stringify(state));
 
   assert.deepEqual(getScmOAuthSessionState(), state);
 

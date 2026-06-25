@@ -9,7 +9,7 @@ import {
 
 // Mock localStorage
 const mockStorage = new Map<string, string>();
-const AUTH_TOKEN_KEY = 'openwebpx:auth-token';
+const AUTH_TOKEN_KEY = 'sandbox-agent:auth-token';
 
 test.beforeEach(() => {
   mockStorage.clear();

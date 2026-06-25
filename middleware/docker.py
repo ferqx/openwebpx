@@ -73,26 +73,26 @@ DEFAULT_WEB_SANDBOX_IMAGE = "sandbox-agent:latest"
 DEFAULT_WEB_SANDBOX_CONTAINER_PORT = 3000
 DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS = 30 * 60
 _EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-_SCM_BASH_ENV = "/etc/profile.d/openwebpx-scm.sh"
+_SCM_BASH_ENV = "/etc/profile.d/sandbox-agent-scm.sh"
 _RUNTIME_DIR = "/root/.agent-runtime"
 
 
 def _resolve_stop_delay_seconds_from_env() -> float:
-    raw_value = os.getenv("OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS", "").strip()
+    raw_value = os.getenv("SANDBOX_AGENT_CONTAINER_STOP_DELAY_SECONDS", "").strip()
     if not raw_value:
         return float(DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS)
     try:
         parsed = float(raw_value)
     except ValueError:
         logger.warning(
-            "Invalid OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS=%r, fallback to %s",
+            "Invalid SANDBOX_AGENT_CONTAINER_STOP_DELAY_SECONDS=%r, fallback to %s",
             raw_value,
             DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS,
         )
         return float(DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS)
     if parsed < 0:
         logger.warning(
-            "Negative OPENWEBPX_CONTAINER_STOP_DELAY_SECONDS=%r, fallback to %s",
+            "Negative SANDBOX_AGENT_CONTAINER_STOP_DELAY_SECONDS=%r, fallback to %s",
             raw_value,
             DEFAULT_WEB_SANDBOX_STOP_DELAY_SECONDS,
         )
@@ -111,14 +111,14 @@ def _docker_unavailable_message(exc: DockerException) -> str:
     if permission_denied:
         guidance = (
             " The Docker socket is present but this process cannot access it. If "
-            "OpenWebPX is running inside Docker, add the service container to the "
+            "sandbox-agent is running inside Docker, add the service container to the "
             "host Docker socket group, for example via group_add with "
             "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock), and keep "
             "DOCKER_HOST=unix:///var/run/docker.sock."
         )
     elif not socket_exists:
         guidance = (
-            " If OpenWebPX is running inside Docker, mount /var/run/docker.sock into "
+            " If sandbox-agent is running inside Docker, mount /var/run/docker.sock into "
             "the service container and set DOCKER_HOST=unix:///var/run/docker.sock. "
             "Otherwise ensure Docker is installed and the daemon is running on the host."
         )
@@ -310,12 +310,12 @@ class DockerMiddleware(AgentMiddleware):
             "set -e; "
             f'ENV_FILE="{_SCM_BASH_ENV}"; '
             f"WORKDIR={shlex.quote(self.workdir)}; "
-            f'WORKSPACE_ENV_FILE="{_RUNTIME_DIR}/openwebpx-scm.sh"; '
+            f'WORKSPACE_ENV_FILE="{_RUNTIME_DIR}/sandbox-agent-scm.sh"; '
             'BASHRC_FILE="/root/.bashrc"; '
             'BASH_PROFILE_FILE="/root/.bash_profile"; '
             f'mkdir -p /etc/profile.d "{_RUNTIME_DIR}"; '
             "cat > \"$ENV_FILE\" <<'EOF'\n"
-            "# OpenWebPX SCM runtime env\n"
+            "# sandbox-agent SCM runtime env\n"
             'export SCM_TOKEN="${SCM_TOKEN-}"\n'
             'export GITLAB_TOKEN="${GITLAB_TOKEN-}"\n'
             'export GLAB_TOKEN="${GLAB_TOKEN-}"\n'
@@ -328,12 +328,12 @@ class DockerMiddleware(AgentMiddleware):
             'chmod 600 "$ENV_FILE"; '
             'cp "$ENV_FILE" "$WORKSPACE_ENV_FILE"; '
             'chmod 600 "$WORKSPACE_ENV_FILE"; '
-            'grep -q "openwebpx-scm.sh" "$BASHRC_FILE" 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> "$BASHRC_FILE"; '
+            'grep -q "sandbox-agent-scm.sh" "$BASHRC_FILE" 2>/dev/null || echo ". /etc/profile.d/sandbox-agent-scm.sh" >> "$BASHRC_FILE"; '
             'chmod 600 "$BASHRC_FILE"; '
             'grep -q ".bashrc" "$BASH_PROFILE_FILE" 2>/dev/null || echo "[ -f /root/.bashrc ] && . /root/.bashrc" >> "$BASH_PROFILE_FILE"; '
             'chmod 600 "$BASH_PROFILE_FILE"; '
-            'grep -q "openwebpx-scm.sh" /root/.profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /root/.profile; '
-            'grep -q "openwebpx-scm.sh" /etc/profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /etc/profile'
+            'grep -q "sandbox-agent-scm.sh" /root/.profile 2>/dev/null || echo ". /etc/profile.d/sandbox-agent-scm.sh" >> /root/.profile; '
+            'grep -q "sandbox-agent-scm.sh" /etc/profile 2>/dev/null || echo ". /etc/profile.d/sandbox-agent-scm.sh" >> /etc/profile'
         )
         code, output = self._exec(
             container,
@@ -662,10 +662,10 @@ class DockerMiddleware(AgentMiddleware):
     ) -> tuple[bool, str | None]:
         """在仓库同步后初始化 git 身份与凭据，供后续原生 git 命令直接使用。"""
         provider = str(binding.get("provider") or "").strip().lower()
-        git_name = str(binding.get("git_name") or "").strip() or "OpenWebPX Agent"
+        git_name = str(binding.get("git_name") or "").strip() or "sandbox-agent Agent"
         git_email = str(binding.get("git_email") or "").strip().lower()
         if not git_email:
-            git_email = "openwebpx-agent@users.noreply.local"
+            git_email = "sandbox-agent@users.noreply.local"
 
         if provider == "gitlab":
             from app.routers.scm import _normalize_gitlab_base_url
@@ -684,7 +684,7 @@ class DockerMiddleware(AgentMiddleware):
             f"WORKDIR={workdir_q}; "
             f'CRED_FILE="{_RUNTIME_DIR}/.git-credentials"; '
             f'ENV_FILE="{_SCM_BASH_ENV}"; '
-            f'WORKSPACE_ENV_FILE="{_RUNTIME_DIR}/openwebpx-scm.sh"; '
+            f'WORKSPACE_ENV_FILE="{_RUNTIME_DIR}/sandbox-agent-scm.sh"; '
             'BASHRC_FILE="/root/.bashrc"; '
             'BASH_PROFILE_FILE="/root/.bash_profile"; '
             f'mkdir -p "{_RUNTIME_DIR}"; '
@@ -708,11 +708,11 @@ class DockerMiddleware(AgentMiddleware):
             'chmod 600 "$ENV_FILE"; '
             'cp "$ENV_FILE" "$WORKSPACE_ENV_FILE"; '
             'chmod 600 "$WORKSPACE_ENV_FILE"; '
-            'grep -q "openwebpx-scm.sh" "$BASHRC_FILE" 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> "$BASHRC_FILE"; '
+            'grep -q "sandbox-agent-scm.sh" "$BASHRC_FILE" 2>/dev/null || echo ". /etc/profile.d/sandbox-agent-scm.sh" >> "$BASHRC_FILE"; '
             'chmod 600 "$BASHRC_FILE"; '
             'grep -q ".bashrc" "$BASH_PROFILE_FILE" 2>/dev/null || echo "[ -f /root/.bashrc ] && . /root/.bashrc" >> "$BASH_PROFILE_FILE"; '
             'chmod 600 "$BASH_PROFILE_FILE"; '
-            'grep -q "openwebpx-scm.sh" /root/.profile 2>/dev/null || echo ". /etc/profile.d/openwebpx-scm.sh" >> /root/.profile; '
+            'grep -q "sandbox-agent-scm.sh" /root/.profile 2>/dev/null || echo ". /etc/profile.d/sandbox-agent-scm.sh" >> /root/.profile; '
         )
         code, output = self._exec(
             container,

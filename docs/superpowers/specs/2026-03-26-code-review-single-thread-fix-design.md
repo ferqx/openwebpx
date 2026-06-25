@@ -98,7 +98,7 @@ The thread becomes a serialized work queue:
 
 ## File-Level Design
 
-### [web/src/hooks/use-portal-code-review-continuation.ts](/Users/chenchao/Code/ai/openwebpx/web/src/hooks/use-portal-code-review-continuation.ts)
+### web/src/hooks/use-portal-code-review-continuation.ts
 
 - Remove dependency on repository-based task matching for continuation.
 - Replace task-option derivation with direct resolution of the run's bound thread:
@@ -108,12 +108,12 @@ The thread becomes a serialized work queue:
 - `canContinueCodeReviewFix` should depend on `selectedRun.thread_id`, not on candidate options.
 - Update hint text to reflect the single-thread rule.
 
-### [web/src/business/portal/portal-code-review-continue-fix-dialog.tsx](/Users/chenchao/Code/ai/openwebpx/web/src/business/portal/portal-code-review-continue-fix-dialog.tsx)
+### web/src/business/portal/portal-code-review-continue-fix-dialog.tsx
 
 - Remove thread-selection UI or make it read-only with the bound thread shown as contextual info only.
 - Keep instruction editing and prompt-template behavior unchanged.
 
-### [web/src/pages/review-detail.tsx](/Users/chenchao/Code/ai/openwebpx/web/src/pages/review-detail.tsx)
+### web/src/pages/review-detail.tsx
 
 - No route change is required.
 - The existing "查看关联线程" behavior remains.
@@ -131,8 +131,8 @@ The backend must turn approved fixes into "append message to thread" work instea
 
 Likely touch points:
 
-- [app/services/code_review/fix_service.py](/Users/chenchao/Code/ai/openwebpx/app/services/code_review/fix_service.py)
-- [app/services/code_review/fix_runner.py](/Users/chenchao/Code/ai/openwebpx/app/services/code_review/fix_runner.py)
+- app/services/code_review/fix_service.py
+- app/services/code_review/fix_runner.py
 - existing Aegra-backed thread/run integration paths
 
 ## Error Handling

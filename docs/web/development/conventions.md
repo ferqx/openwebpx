@@ -1,6 +1,6 @@
 # 开发规范与技术约束 (Conventions)
 
-本文件详细记录了 OpenWebPX UI 项目的架构约束与编码标准，作为 `AGENTS.md` 协议的补充。
+本文件详细记录了 sandbox-agent UI 项目的架构约束与编码标准，作为 `AGENTS.md` 协议的补充。
 
 ## 1. 架构与路由约束
 - **Provider 依赖顺序**: `ThreadProvider` -> `StreamProvider` -> `SidebarProvider`。

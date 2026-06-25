@@ -320,7 +320,7 @@ class CodeReviewFixService:
 
     def _ensure_runner_callback_secret(self, *, callback_secret: str | None) -> None:
         expected_secret = (
-            os.getenv("OPENWEBPX_CODE_REVIEW_FIX_RUNNER_SECRET")
+            os.getenv("SANDBOX_AGENT_CODE_REVIEW_FIX_RUNNER_SECRET")
             or os.getenv("CODE_REVIEW_FIX_RUNNER_SECRET")
             or ""
         ).strip()
